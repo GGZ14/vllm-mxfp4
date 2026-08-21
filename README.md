@@ -5,7 +5,7 @@ ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom k
 this card, plus RDNA4-tuned GEMM / attention / all-reduce paths and a dynamic MTP draft controller, so you
 don't have to build the stack yourself.
 
-> **Status: super early dev (v0.5.8). Experimental.** Everything here was built and measured on three exact
+> **Status: super early dev (v0.5.10). Experimental.** Everything here was built and measured on three exact
 > setups: **Qwen3.6-27B-FP8**, **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8), and
 > **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), all with fp8 (or bf16/`auto`) KV
 > cache on two R9700 GPUs (tensor parallel). Other models, non-FP8 weights, single or

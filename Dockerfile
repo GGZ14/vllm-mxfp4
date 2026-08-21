@@ -188,7 +188,7 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd \
 # every process, otherwise it enumerates 0 devices and platform detection fails.
 COPY radiance_amdsmi.py radiance_amdsmi.pth \
      radiance_kernels.py radiance_vit_attn.py radiance_allreduce.py \
-     radiance_draft.py radiance_draft_gpu.py radiance_router.py ${SP}/
+     radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_router.py ${SP}/
 COPY fp8-configs/ ${SP}/vllm/model_executor/layers/quantization/utils/configs/
 COPY moe-configs/ ${SP}/vllm/model_executor/layers/fused_moe/configs/
 

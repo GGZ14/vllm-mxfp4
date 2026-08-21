@@ -10,7 +10,7 @@
 # this file, e.g.:  MAX_NUM_SEQS=16 MAX_MODEL_LEN=32768 docker compose up -d
 services:
   vllm:
-    image: ${IMAGE:-vllm-radiance:0.5.8}
+    image: ${IMAGE:-vllm-radiance:0.5.10}
     container_name: vllm-radiance
     restart: unless-stopped
     command:
@@ -22,9 +22,12 @@ services:
       - --max-num-seqs=${MAX_NUM_SEQS:-8}
       - --max-model-len=${MAX_MODEL_LEN:-200000}
       - --gpu-memory-utilization=${GPU_UTIL:-0.97}
-      # chunk size that works well at long context (chunked prefill). MTP also forces
-      # max_num_scheduled_tokens=2048, so this just makes it explicit.
-      - --max-num-batched-tokens=${MAX_NUM_BATCHED_TOKENS:-2048}
+      # Prefill chunk size. 4096 measured +2.2% prefill at 16K context and +3.8% at 64K against
+      # 2560 on this box, lossless, at the cost of ~130 MiB of activation per card.
+      # KEEP IN SYNC with RADIANCE_AR_MAX_KB below: the all-reduce message a prefill chunk sends is
+      # max-num-batched-tokens * hidden_size * 2 bytes, and a message over that cap silently falls
+      # back to RCCL, which measures 2.3x slower than the custom kernel at this size.
+      - --max-num-batched-tokens=${MAX_NUM_BATCHED_TOKENS:-4096}
       - --kv-cache-dtype=fp8
       - --attention-backend=ROCM_AITER_UNIFIED_ATTN
       # Automatic prefix caching (APC) for shared prefixes (system prompts, RAG / agentic context).
@@ -44,6 +47,34 @@ services:
       # by confidence, so 8 is the ceiling not a fixed cost. nspec=16 is an option for more verbatim
       # upside (editing/RAG) but needs GPU_UTIL=0.90 to stay safe at 8 concurrent sequences (else CUDA OOM).
       - '--speculative-config={"method":"mtp","num_speculative_tokens":${MTP_NSPEC:-8},"attention_backend":"ROCM_AITER_UNIFIED_ATTN","disable_padded_drafter_batch":true}'
+      # CUDA-graph capture sizes. vLLM defaults to a ladder that runs to 144, but the largest decode
+      # batch this serve can ever reach is max_num_seqs * (num_speculative_tokens + 1) = 8 * 9 = 72,
+      # so every captured size above 72 is a graph that can never be replayed. Trimming the ladder
+      # gives that memory back to the KV cache and costs nothing at run time.
+      # KEEP IN SYNC: if MAX_NUM_SEQS or MTP_NSPEC changes, recompute the ceiling and this list.
+      # KV cache size in bytes. Strongly recommended on 0.5.x: vLLM 0.26's memory profiler measures
+      # its own headroom through torch, which under-reports free VRAM, so auto-sizing silently leaves
+      # ~2-3 GiB per card unallocated. On this box that was 184,224 tokens (29%) versus the 0.25 stack
+      # on identical config. To derive the value for YOUR hardware and model:
+      #   1. start once with this line commented out
+      #   2. read the startup line "Actual usage is ... Current kv cache memory in use is N GiB"
+      #   3. read TRUE free VRAM from the driver, NOT from torch:
+      #        cat /sys/class/drm/card0/device/mem_info_vram_{used,total}
+      #      (a fresh python + torch process creates its own ~1.9 GiB HIP context and hides that much)
+      #   4. set this to (N + true_free - ~0.4 GiB of margin), in bytes
+      #   5. sample free VRAM repeatedly DURING an 8-stream run and during a large prefill, not once
+      #      after it: it keeps falling for ~40 s as the engine warms up, and a single early reading
+      #      overstates the margin badly. Aim to settle no lower than ~250 MiB.
+      # vLLM's own "to fully utilize gpu memory" suggestion is itself ~1 GiB short, for the same reason.
+      # Beware idle free VRAM: most of what the caching allocator holds reserved-but-unallocated gets
+      # reused under load, so it is not headroom. Raising the pin by the idle figure will not give you
+      # that much back -- size it by the real allocation you removed.
+      # This PINS the pool: while set, the KV size stops responding to other memory changes, so comment
+      # it out first whenever you measure anything memory-related.
+      # - --kv-cache-memory=15989735424   # 14.89 GiB, measured for Qwen3.8-27B-FP8 + TP2 on 2x R9700 32GB
+      #                                   # -> 660,336 KV tokens, 5.16x concurrency, 296 MiB free under
+      #                                   # load. Re-derive whenever max-num-batched-tokens changes.
+      - '--compilation-config={"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72]}'
       # disable_padded_drafter_batch (above) is incompatible with async scheduling; vLLM would
       # otherwise auto-enable async then disable it with a runtime warning. Turn it off explicitly.
       - --no-async-scheduling
@@ -80,6 +111,10 @@ services:
       # fp8 all-reduce payload for large (prefill) messages; baked ON. Not bit-identical to RCCL;
       # set "0" for the exact bf16 all-reduce.
       RADIANCE_AR_QUANT: "1"
+      # Cap for the custom all-reduce; larger messages fall back to RCCL. Sized to fit one prefill
+      # chunk (4096 * 5120 * 2 = 40 MiB). Costs 2x this in IPC scratch per rank, so raise it to fit
+      # the chunk and no further.
+      RADIANCE_AR_MAX_KB: "${RADIANCE_AR_MAX_KB:-49152}"
       # optional NUMA pinning of the vLLM fleet to the GPU-local node(s). Off by default (no-op on
       # single-node hosts). Set "auto" to detect, or explicit nodes (e.g. "0" / "0,1"). Requires the
       # SYS_NICE cap above. Equivalent to passing --numa-bind in command:.
@@ -89,8 +124,18 @@ services:
       # free-win n-grams; the schedule caps serial MTP forwards by batch size. Set DYNAMIC_DRAFT="0" to
       # disable (byte-identical stock MTP). The two knobs below are the only tunables.
       RADIANCE_DYNAMIC_DRAFT: "1"
-      RADIANCE_DRAFT_SCHEDULE: "1:8,2:7,4:6,8:5,16:4"
-      RADIANCE_DRAFT_TAU: "0.35"
+      # Re-tuned 2026-08-20 on real text (the old harness generated random word soup, which
+      # inflated acceptance and hid this). Capping the deep tail is worth +3.4% tok/s at one
+      # stream and +1.6% at eight, with lower time per step at both: the draft positions it
+      # removes were running at ~5% marginal acceptance against a ~7% break-even. Removing the
+      # caps entirely ("1:8,2:8,4:8,8:8") measures -7.5% at eight streams, so they do bind.
+      RADIANCE_DRAFT_SCHEDULE: "${RADIANCE_DRAFT_SCHEDULE:-1:8,2:7,4:6,8:5,16:4}"
+      RADIANCE_DRAFT_TAU: "${RADIANCE_DRAFT_TAU:-0.28}"
+      # 2-bit draft head instead of the 4-bit default: +3.2% tokens/s single-stream with drafting
+      # acceptance unchanged, and it matches the exact bf16 argmax on every one of 8192 real draft
+      # inputs where the 4-bit head deviates on 22. Opt-in because it is a larger change than a
+      # tuning knob. MUST be declared here to be settable: compose only forwards declared vars.
+      RADIANCE_FAST_DRAFT: "${RADIANCE_FAST_DRAFT:-0}"
       # custom bf16 MoE-gate GEMM for the n in [6,16] band rocBLAS serves poorly (fine-grained MoE,
       # e.g. Qwen3.6-35B-A3B). Baked ON; inert for models whose gate is not [256,2048]. Set "0" for rocBLAS.
       RADIANCE_MOE_ROUTER: "1"

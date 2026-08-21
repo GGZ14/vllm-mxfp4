@@ -2,7 +2,7 @@
 
 vLLM inference server for the AMD Radeon AI PRO R9700 (gfx1201 / RDNA4). Bundles a working ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom kernels needed to run vLLM on this card, so you don't have to build the stack yourself.
 
-> **Status: super early dev (v0.5.8). Experimental.**
+> **Status: super early dev (v0.5.10). Experimental.**
 > This is a very early build. The performance numbers here come from three exact configurations: Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8 (fine-grained MoE), and Gemma-4-31B-it-FP8 (block-fp8), all with fp8 KV cache on two R9700 GPUs (tensor parallel); bf16 / `auto` KV also works (see below). Other models, non-FP8 weights, single or 3+ GPUs, and non-R9700 hardware are untested. Expect rough edges, breaking changes between versions, and things that just don't work yet. Not production hardened. Use at your own risk.
 
 ## Tested so far
@@ -67,8 +67,10 @@ runs on the AITER unified path, and the vision tower on the image's own Triton f
 | Env var | Default | What it does |
 |---|---|---|
 | `RADIANCE_PRESHUFFLE` | `1` | preshuffled AITER FP8 blockscale GEMM |
-| `RADIANCE_ATTN_TUNE` | `1` | RDNA4 attention tiling, gain grows with context length |
+| `RADIANCE_ATTN_TUNE` | `1` | RDNA4 attention geometry for the decode (split-KV) and prefill kernels: the split-KV count is derived from the batch shape rather than inherited from a heuristic sized for a different tile, and the query block is widened when the speculative verify batch fills it. Measured 1.0-1.96x on the decode attention kernel across depths 4K-128K and batches 1-8, with no shape slower. Gain grows with context length. |
 | `RADIANCE_GDN_WMMA` | `1` | for hybrid gated-delta-net (linear-attention) models, runs the KKt gram on the fp16 matrix cores (WMMA) instead of an fp32 scalar path. RDNA4 has no fp32 matrix-core path, so the stock kernel is both slow to run and very slow to compile (dominates cold start); the WMMA path is far faster on both. fp16 matches the precision of the TF32 path these models run on NVIDIA. A no-op for pure-transformer models. |
+| `RADIANCE_FAST_DRAFT` | 0 | **2-bit MTP draft head with an exact rerank.** Off by default, in which case the drafter uses the stock bf16 head that vLLM already shares with the target model. Set to 1 and the head is stored as int2 with an asymmetric per-(row, group-of-128) scale, 0.167 GiB/rank instead of 1.18: the coarse pass emits the best 8 candidates of each 64-wide block for free, and the top 32 are rescored exactly against the bf16 weight. Measured on the BetterBench prompt corpus, **+16.6% tokens/s single-stream and +12.5% at 8 concurrent**, with drafting acceptance unchanged. It is also *exact*: on 8192 real draft-head inputs the reranked token matches the bf16 argmax on every row. This cannot change what the model emits, because the draft head only chooses which tokens are *proposed* and the target verifies every one of them with its own untouched bf16 head. |
+| (always on) | | **Shard-local draft confidence.** The draft controller needs two numbers per row, the drafted token id and its top-1 softmax probability. Both are recovered from per-rank partial reductions plus a cross-rank logsumexp, exchanging three floats per row instead of all-gathering the full vocabulary logit row on every draft slot. Exact, not an approximation. Tensor-parallel only. |
 | `RADIANCE_VIT_FLASH` | `1` | native head_dim-72 flash-attention for the multimodal vision encoder (ViT). On RDNA4 the vendor flash kernels (CK / AITER) have no device code and torch SDPA runs a non-tiled path; this kernel handles the vision tower's odd head dim without padding and runs ~1.5-2x faster. Only used when serving a vision model; no effect for text-only. Per-image / windowed attention is preserved. |
 | `RADIANCE_FAST_REDUCE` | `1` | custom PCIe peer-to-peer all-reduce for TP=2, byte-identical to RCCL, falls back to RCCL if P2P is unavailable |
 | `RADIANCE_AR_MAX_KB` | `32768` | size gate for the P2P all-reduce, in KB (32768 = 32 MB); messages above it use RCCL |
@@ -83,6 +85,29 @@ runs on the AITER unified path, and the vision tower on the image's own Triton f
 | `RADIANCE_BWTEST_TIMEOUT` | `150` | seconds to bound the sweep, in case it stalls on an unusual topology |
 | `RADIANCE_NUMA_BIND` | unset (off) | NUMA pinning for multi-node hosts; see below. Same as `--numa-bind`, which wins if both are given |
 | `RADIANCE_BANNER_PLAIN` | `0` | set `1` for a startup banner without ANSI colour (log scrapers, CI). `NO_COLOR` does the same |
+
+> **Also new in 0.5.10 - prefill chunking and draft depth.** `--max-num-batched-tokens` moves
+2560 -> 4096 (+2.2% prefill at 16K context, +3.8% at 64K); `RADIANCE_AR_MAX_KB` must rise with it,
+because a chunk's all-reduce is `max-num-batched-tokens * hidden * 2` bytes and anything over that
+cap silently falls back to RCCL, which is 2.3x slower here. The dynamic drafter's per-batch depth
+caps were re-tuned on real text, `1:8,2:7,4:6,8:5` -> `1:6,2:6,4:5,8:4`: **+3.4% tokens/s
+single-stream and +1.6% at eight concurrent**, with lower time per engine step at both. The draft
+positions this removes were running at roughly 5% marginal acceptance against a ~7% break-even.
+
+> **New in 0.5.10 - the draft head.** `RADIANCE_FAST_DRAFT=1` replaces the drafter's bf16 head with
+a 2-bit one behind an exact rerank: **+16.6% tokens/s single-stream and +12.5% at 8 concurrent** on
+the BetterBench prompt corpus, drafting acceptance unchanged, and the reranked draft token matches
+the bf16 argmax on all 8192 real inputs tested. Fewer bits is not what makes it pay: a first version
+at group 64 measured *slower* than a 4-bit head, because halving the group doubles the per-group
+accumulator work, which is the dominant non-memory term. Group 128, quarter-split packing, and
+building the bf16 value with one shift and mask instead of an integer conversion took the kernel
+781 -> 350 us. Candidate width matters in a less obvious way: candidates are selected per block, so
+with one candidate per block a winner sharing a block with a stronger token can never be rescored *at
+any rerank depth* -- 2 bits needs 8 per block where 4 bits was fine with 1. The draft policy is tuned
+for it (tau 0.28 with `1:8,2:7,4:6,8:5`), since a cheaper draft step lowers the marginal acceptance a
+draft position must clear and moves the optimum deeper.
+
+> **New in 0.5.10 - decode path.** Four changes to the speculative decode path, measured against 0.5.8 on Qwen3.8-27B-FP8 with identical flags and matched seeds: **+21% output tokens/s and -20% time per engine step at 8 concurrent streams** (with drafting acceptance matched), and **-21% step time single-stream at 64K context**. Prefill is unchanged. Three are the tuning entries above; the fourth was a bug. AITER exposes its `unified_attention` module under two names and executes it once per name, so there are two module objects with independent globals. Patching only one left roughly one attention call per engine step running AITER's stock configuration at 5596us instead of 277us, about 8.9% of all GPU time in a decode step. Every alias is now patched. The startup log reports how many it found: it must say `attn tuned-config override installed on 2 module aliases`.
 
 > **Fixed in 0.5.7 — tensor-parallel GPU hang under sustained load (multi-GPU only).** Builds 0.5.0 through 0.5.5-pre could hang a GPU during long agentic sessions: both cards pegged at 100% utilisation while drawing a fraction of their power cap, the driver then reporting `HW Exception ... GPU Hang`, the engine dying on an RPC timeout and the container restarting. **The cause was a dependency mismatch, not a kernel bug.** vLLM 0.26.0 pins `torch == 2.11.0`, and this image's build strips torch/torchvision pins (via vLLM's own `use_existing_torch.py`, which exists so pip does not refetch them) — earlier 0.5.x builds then compiled against torch 2.13 / triton 3.7.1 / torchvision 0.28, a combination upstream never tests. The pinned trio (torch 2.11.0, triton 3.6.0, torchvision 0.24.1) is restored, and the hang is gone under the workload that reproduced it. Single-GPU serves were never affected, and nothing is disabled: speculative drafting and the fp8 all-reduce both remain on by default. If you build your own image, take the versions upstream pins — they are not free choices on this architecture.
 
@@ -127,7 +152,7 @@ docker run --rm -it \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
   -e TRITON_CACHE_DIR=/cache/triton -e AITER_ROOT_DIR=/cache/aiter \
   -e TRITON_CACHE_AUTOTUNING=1 \
-  stilldeadcode/vllm-radiance:0.5.8 \
+  stilldeadcode/vllm-radiance:0.5.10 \
     /models/YourOrg/Your-Model-FP8 \
     --served-model-name my-model \
     --quantization fp8 --kv-cache-dtype fp8 \
@@ -153,7 +178,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```yaml
 services:
   vllm:
-    image: stilldeadcode/vllm-radiance:0.5.8
+    image: stilldeadcode/vllm-radiance:0.5.10
     restart: unless-stopped
     command:
       - /models/YourOrg/Your-Model-FP8
