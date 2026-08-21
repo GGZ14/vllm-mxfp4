@@ -29,6 +29,7 @@
 #include <pybind11/pybind11.h>
 #include <cstdint>
 #include <stdexcept>
+#include <cstdlib>
 namespace py = pybind11;
 
 typedef float floatx8 __attribute__((ext_vector_type(8)));
@@ -218,25 +219,35 @@ __global__ __launch_bounds__(NWAVE * 32) void radiance_mxfp4_fp8_gemm(
 // TM=4 won at EVERY production shape and batch size -- a taller tile buys more A reuse per weight
 // read. It also removed the large-M cliff the earlier hand-written BM=128 version had.
 #define TM 4
-#define TN 2
 #define WM 4
 #define WN 2
 #define NWAVE (WM * WN)
 #define NTHREADS (NWAVE * 32)
 #define BMF (WM * TM * 16)
-#define BNF (WN * TN * 16)
+#define BNF_OF(tn) (WN * (tn) * 16)
+#define BNF BNF_OF(2)
 
+// TN is templated because the winner depends on M. Widening the N tile (TN=4 -> BNF=128) amortises
+// the A-tile staging, which an ablation prices at 24% of runtime -- A is BMF*BK = 16 KB per K-slab
+// against W's 2 KB, and with BNF=64 it is re-staged across twice as many column blocks. Measured on
+// gate_up 17408x5120, tight A/B, 10 alternations with no overlap between the distributions:
+//   M=8192 +10.0%  M=6144 +9.7%  M=4096 +8.5%  M=3072 +6.9%
+//   M=2048 +1.3%   M=1536 -1.6%  M=1024 -4.2%  M=512 -8.8%
+// Below the crossover the wide tile cannot fill: it halves the block count in N while BMF still
+// masks most of a short M. Hence TN=4 only from M >= 2048; RADIANCE_MXFP4_TN4_MIN_M overrides.
+template <int TN>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
     const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K) {
   __shared__ unsigned char sA[BMF * ASTR];
-  __shared__ unsigned char sW[BNF * WSTR];
+  __shared__ unsigned char sW[WN * TN * 16 * WSTR];
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / WN, wn = wave % WN;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
-  const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF;
+  constexpr int BNF_T = WN * TN * 16;
+  const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF_T;
 
   floatx8 acc[TM][TN];
 #pragma unroll
@@ -258,7 +269,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
     }
     // ---- W tile: BN*BK/2 packed bytes, 8 B per thread per iteration -> 16 e4m3 bytes ----
 #pragma unroll
-    for (int off = 0; off < BNF * BK / 2; off += NTHREADS * 8) {
+    for (int off = 0; off < BNF_T * BK / 2; off += NTHREADS * 8) {
       const int idx = off + tid * 8;
       const int r = idx / (BK / 2), c = idx % (BK / 2), gn = n0 + r;
       unsigned long long packed = 0ull;
@@ -340,11 +351,26 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
   // the tuned folded kernel wins at every shape measured, so it is the default whenever the
   // per-row reference exponent is available
   if (wref) {
-    dim3 fblock(NTHREADS), fgrid((N + BNF - 1) / BNF, (M + BMF - 1) / BMF);
-    hipLaunchKernelGGL(radiance_mxfp4_fp8_gemm_folded, fgrid, fblock, 0, (hipStream_t)stream,
-                       (const unsigned char *)a, (const unsigned char *)w,
-                       (const unsigned char *)ws, (const unsigned char *)wref,
-                       (const float *)as, (__bf16 *)c, M, N, K);
+    static const int tn4_min_m = [] {
+      const char *e = getenv("RADIANCE_MXFP4_TN4_MIN_M");
+      return e ? atoi(e) : 2048;
+    }();
+    dim3 fblock(NTHREADS);
+    if (M >= tn4_min_m) {
+      constexpr int B4 = BNF_OF(4);
+      dim3 fgrid((N + B4 - 1) / B4, (M + BMF - 1) / BMF);
+      hipLaunchKernelGGL(radiance_mxfp4_fp8_gemm_folded<4>, fgrid, fblock, 0, (hipStream_t)stream,
+                         (const unsigned char *)a, (const unsigned char *)w,
+                         (const unsigned char *)ws, (const unsigned char *)wref,
+                         (const float *)as, (__bf16 *)c, M, N, K);
+    } else {
+      constexpr int B2 = BNF_OF(2);
+      dim3 fgrid((N + B2 - 1) / B2, (M + BMF - 1) / BMF);
+      hipLaunchKernelGGL(radiance_mxfp4_fp8_gemm_folded<2>, fgrid, fblock, 0, (hipStream_t)stream,
+                         (const unsigned char *)a, (const unsigned char *)w,
+                         (const unsigned char *)ws, (const unsigned char *)wref,
+                         (const float *)as, (__bf16 *)c, M, N, K);
+    }
   } else
     hipLaunchKernelGGL(radiance_mxfp4_fp8_gemm, grid, block, 0, (hipStream_t)stream,
                        (const unsigned char *)a, (const unsigned char *)w,
