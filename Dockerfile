@@ -188,9 +188,13 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd \
 # every process, otherwise it enumerates 0 devices and platform detection fails.
 COPY radiance_amdsmi.py radiance_amdsmi.pth \
      radiance_kernels.py radiance_vit_attn.py radiance_allreduce.py \
-     radiance_draft.py radiance_draft_gpu.py radiance_router.py ${SP}/
+     radiance_draft.py radiance_draft_gpu.py radiance_router.py radiance_mxfp4.py ${SP}/
 COPY fp8-configs/ ${SP}/vllm/model_executor/layers/quantization/utils/configs/
 COPY moe-configs/ ${SP}/vllm/model_executor/layers/fused_moe/configs/
+# mxfp4-configs: aiter ships GEMM-AFP4WFP4 tiles for gfx950/gfx1250 only, and its gfx1250
+# bands set matrix_instr_nonkdim=32 for M>=64, which gfx1201 (WMMA 16x16x16 only) cannot
+# lower. These pin 16 across every band. Used only when RADIANCE_MXFP4=1.
+COPY mxfp4-configs/ ${SP}/aiter/ops/triton/configs/gemm/
 
 # --- gfx1201 fixes and tuned-kernel patches ---
 # Each patch edits a vLLM (or aiter/triton) source file in place and checks for source drift before
@@ -201,7 +205,7 @@ RUN set -eu; cd /opt/patches; \
     for p in patch_gfx1201 patch_radiance_dispatch patch_router_gemm patch_unified_attention_lds \
              patch_gdn_wmma patch_preshuffle patch_radiance_fusion install_radiance_hooks \
              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
-             patch_dynamo_metrics; do \
+             patch_dynamo_metrics patch_quark_mxfp4; do \
       echo "== applying $p =="; python "$p.py"; \
     done; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
@@ -209,9 +213,10 @@ RUN set -eu; cd /opt/patches; \
 # --- gfx1201 HIP kernels, compiled from source ---
 # router_gemm: bf16 MoE-gate GEMM. radiance_ar_ext: bf16 P2P all-reduce. radiance_ar_quant_ext:
 # fp8-payload all-reduce, built with -ffp-contract=off (otherwise the two TP ranks diverge by ~1 ULP).
-COPY router_gemm.hip radiance_ar_ext.hip radiance_ar_quant_ext.hip /opt/patches/
+COPY router_gemm.hip radiance_ar_ext.hip radiance_ar_quant_ext.hip radiance_mxfp4_fp8.hip /opt/patches/
 RUN INC=$(python -m pybind11 --includes); B="-O3 -std=c++17 -fPIC -shared --offload-arch=${GFX_ARCH} -Wno-unused-result"; \
     hipcc $B -DTEMPORAL $INC /opt/patches/router_gemm.hip        -o ${SP}/router_gemm.so && \
+    hipcc $B $INC /opt/patches/radiance_mxfp4_fp8.hip -o ${SP}/radiance_mxfp4_fp8.so && \
     hipcc $B              $INC /opt/patches/radiance_ar_ext.hip   -o ${SP}/radiance_ar_ext.so && \
     hipcc $B -ffp-contract=off $INC /opt/patches/radiance_ar_quant_ext.hip -o ${SP}/radiance_ar_quant_ext.so && \
     test -f ${SP}/router_gemm.so && test -f ${SP}/radiance_ar_ext.so && test -f ${SP}/radiance_ar_quant_ext.so && \
