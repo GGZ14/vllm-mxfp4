@@ -2,7 +2,7 @@
 
 vLLM inference server for the AMD Radeon AI PRO R9700 (gfx1201 / RDNA4). Bundles a working ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom kernels needed to run vLLM on this card, so you don't have to build the stack yourself.
 
-> **Status: super early dev (v0.5.10). Experimental.**
+> **Status: super early dev (v0.5.11). Experimental.**
 > This is a very early build. The performance numbers here come from three exact configurations: Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8 (fine-grained MoE), and Gemma-4-31B-it-FP8 (block-fp8), all with fp8 KV cache on two R9700 GPUs (tensor parallel); bf16 / `auto` KV also works (see below). Other models, non-FP8 weights, single or 3+ GPUs, and non-R9700 hardware are untested. Expect rough edges, breaking changes between versions, and things that just don't work yet. Not production hardened. Use at your own risk.
 
 ## Tested so far
@@ -74,8 +74,8 @@ runs on the AITER unified path, and the vision tower on the image's own Triton f
 | `RADIANCE_VIT_FLASH` | `1` | native head_dim-72 flash-attention for the multimodal vision encoder (ViT). On RDNA4 the vendor flash kernels (CK / AITER) have no device code and torch SDPA runs a non-tiled path; this kernel handles the vision tower's odd head dim without padding and runs ~1.5-2x faster. Only used when serving a vision model; no effect for text-only. Per-image / windowed attention is preserved. |
 | `RADIANCE_FAST_REDUCE` | `1` | custom PCIe peer-to-peer all-reduce for TP=2, byte-identical to RCCL, falls back to RCCL if P2P is unavailable |
 | `RADIANCE_AR_MAX_KB` | `32768` | size gate for the P2P all-reduce, in KB (32768 = 32 MB); messages above it use RCCL |
-| `RADIANCE_AR_QUANT` | `1` | quantize the all-reduce payload to block-scaled fp8 (e4m3) for large messages, halving the PCIe bytes. Speeds up prefill; leaves decode untouched. NOT bit-identical to RCCL (it is quantized). On by default; set `0` for the exact bf16 all-reduce. |
-| `RADIANCE_AR_QUANT_MIN_KB` | `128` | when `RADIANCE_AR_QUANT=1`, only messages at least this large take the fp8 path; smaller ones keep the exact bf16 all-reduce (fp8 only pays off once the transfer is bandwidth-bound) |
+| `RADIANCE_AR_QUANT` | `1` | compress the all-reduce payload for large messages: each group of 64 is rotated by a Walsh-Hadamard, scaled by its own amplitude and stored in 6 uniform bits, so a message costs 6.25/16 of its bf16 size. Speeds up prefill, leaves decode untouched. NOT bit-identical to RCCL (it is quantized), though the two TP ranks stay bit-identical to each other. On by default; set `0` for the exact bf16 all-reduce. |
+| `RADIANCE_AR_QUANT_MIN_KB` | `128` | when `RADIANCE_AR_QUANT=1`, only messages at least this large take the compressed path; smaller ones keep the exact bf16 all-reduce (compression only pays off once the transfer is bandwidth-bound) |
 | `RADIANCE_FUSE_RMS_QUANT` | `1` | folds group-FP8 quant into the RMSNorm epilogue |
 | `RADIANCE_DYNAMIC_DRAFT` | `1` | **dynamic** MTP draft depth: per request, a per-slot confidence gate decides how deep to draft (up to `num_speculative_tokens`) and whether to take a verbatim n-gram continuation (deep on high-acceptance content like code and JSON, shallow on prose; see "Speculative decoding" below). Lossless. Needs `--speculative-config method=mtp`. |
 | `RADIANCE_DRAFT_SCHEDULE` | `1:8,2:7,4:6,8:5,16:4` | `bs:max_depth` pairs (carry-forward): caps how many serial MTP forwards run at each batch size, so drafting stays deep single-stream and shallower at concurrency. The free n-gram tail is unaffected. |
@@ -85,6 +85,15 @@ runs on the AITER unified path, and the vision tower on the image's own Triton f
 | `RADIANCE_BWTEST_TIMEOUT` | `150` | seconds to bound the sweep, in case it stalls on an unusual topology |
 | `RADIANCE_NUMA_BIND` | unset (off) | NUMA pinning for multi-node hosts; see below. Same as `--numa-bind`, which wins if both are given |
 | `RADIANCE_BANNER_PLAIN` | `0` | set `1` for a startup banner without ANSI colour (log scrapers, CI). `NO_COLOR` does the same |
+
+> **New in 0.5.11 - all-reduce payload.** The compressed all-reduce (`RADIANCE_AR_QUANT=1`) now
+sends a rotated 6-bit payload instead of block-scaled fp8. Each group of 64 elements is rotated by a
+Walsh-Hadamard, scaled by its own amplitude and stored in 6 uniform bits. The rotation removes the
+outlier channel, which is what makes 6 uniform bits enough - and once the range problem is gone, a
+float format is spending exponent bits on range it no longer needs. Net: 24% fewer PCIe bytes at
+slightly better accuracy, **+7.2% prefill throughput at 16K context and +3.5% at 32K** against the
+fp8 payload it replaces, with decode unchanged. The two tensor-parallel ranks remain bit-identical
+to each other. Set `RADIANCE_AR_QUANT=0` for the exact bf16 all-reduce, which is unchanged.
 
 > **Also new in 0.5.10 - prefill chunking and draft depth.** `--max-num-batched-tokens` moves
 2560 -> 4096 (+2.2% prefill at 16K context, +3.8% at 64K); `RADIANCE_AR_MAX_KB` must rise with it,
@@ -109,7 +118,7 @@ draft position must clear and moves the optimum deeper.
 
 > **New in 0.5.10 - decode path.** Four changes to the speculative decode path, measured against 0.5.8 on Qwen3.8-27B-FP8 with identical flags and matched seeds: **+21% output tokens/s and -20% time per engine step at 8 concurrent streams** (with drafting acceptance matched), and **-21% step time single-stream at 64K context**. Prefill is unchanged. Three are the tuning entries above; the fourth was a bug. AITER exposes its `unified_attention` module under two names and executes it once per name, so there are two module objects with independent globals. Patching only one left roughly one attention call per engine step running AITER's stock configuration at 5596us instead of 277us, about 8.9% of all GPU time in a decode step. Every alias is now patched. The startup log reports how many it found: it must say `attn tuned-config override installed on 2 module aliases`.
 
-> **Fixed in 0.5.7 — tensor-parallel GPU hang under sustained load (multi-GPU only).** Builds 0.5.0 through 0.5.5-pre could hang a GPU during long agentic sessions: both cards pegged at 100% utilisation while drawing a fraction of their power cap, the driver then reporting `HW Exception ... GPU Hang`, the engine dying on an RPC timeout and the container restarting. **The cause was a dependency mismatch, not a kernel bug.** vLLM 0.26.0 pins `torch == 2.11.0`, and this image's build strips torch/torchvision pins (via vLLM's own `use_existing_torch.py`, which exists so pip does not refetch them) — earlier 0.5.x builds then compiled against torch 2.13 / triton 3.7.1 / torchvision 0.28, a combination upstream never tests. The pinned trio (torch 2.11.0, triton 3.6.0, torchvision 0.24.1) is restored, and the hang is gone under the workload that reproduced it. Single-GPU serves were never affected, and nothing is disabled: speculative drafting and the fp8 all-reduce both remain on by default. If you build your own image, take the versions upstream pins — they are not free choices on this architecture.
+> **Fixed in 0.5.7 — tensor-parallel GPU hang under sustained load (multi-GPU only).** Builds 0.5.0 through 0.5.5-pre could hang a GPU during long agentic sessions: both cards pegged at 100% utilisation while drawing a fraction of their power cap, the driver then reporting `HW Exception ... GPU Hang`, the engine dying on an RPC timeout and the container restarting. **The cause was a dependency mismatch, not a kernel bug.** vLLM 0.26.0 pins `torch == 2.11.0`, and this image's build strips torch/torchvision pins (via vLLM's own `use_existing_torch.py`, which exists so pip does not refetch them) — earlier 0.5.x builds then compiled against torch 2.13 / triton 3.7.1 / torchvision 0.28, a combination upstream never tests. The pinned trio (torch 2.11.0, triton 3.6.0, torchvision 0.24.1) is restored, and the hang is gone under the workload that reproduced it. Single-GPU serves were never affected, and nothing is disabled: speculative drafting and the compressed all-reduce both remain on by default. If you build your own image, take the versions upstream pins — they are not free choices on this architecture.
 
 All of these are baked ON in the image. Set `RADIANCE_DYNAMIC_DRAFT=0` to turn draft control off (`RADIANCE_AR_MAX_KB`, `RADIANCE_DRAFT_SCHEDULE`, and `RADIANCE_DRAFT_TAU` are values, not toggles). `RADIANCE_DYNAMIC_DRAFT` only does anything when speculative decoding is enabled; it is lossless (it changes only *how many* tokens are drafted and whether they come from MTP or a verbatim copy of earlier text, never what the model verifies).
 
@@ -152,7 +161,7 @@ docker run --rm -it \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
   -e TRITON_CACHE_DIR=/cache/triton -e AITER_ROOT_DIR=/cache/aiter \
   -e TRITON_CACHE_AUTOTUNING=1 \
-  stilldeadcode/vllm-radiance:0.5.10 \
+  stilldeadcode/vllm-radiance:0.5.11 \
     /models/YourOrg/Your-Model-FP8 \
     --served-model-name my-model \
     --quantization fp8 --kv-cache-dtype fp8 \
@@ -178,7 +187,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```yaml
 services:
   vllm:
-    image: stilldeadcode/vllm-radiance:0.5.10
+    image: stilldeadcode/vllm-radiance:0.5.11
     restart: unless-stopped
     command:
       - /models/YourOrg/Your-Model-FP8

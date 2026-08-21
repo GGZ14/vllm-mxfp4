@@ -10,7 +10,7 @@
 # this file, e.g.:  MAX_NUM_SEQS=16 MAX_MODEL_LEN=32768 docker compose up -d
 services:
   vllm:
-    image: ${IMAGE:-vllm-radiance:0.5.10}
+    image: ${IMAGE:-vllm-radiance:0.5.11}
     container_name: vllm-radiance
     restart: unless-stopped
     command:
@@ -108,7 +108,7 @@ services:
       # native head_dim-72 flash attention for the vision encoder (multimodal). ~1.5-2x vs SDPA on
       # RDNA4; only used when serving vision (no effect under --language-model-only). Default 1.
       RADIANCE_VIT_FLASH: "1"
-      # fp8 all-reduce payload for large (prefill) messages; baked ON. Not bit-identical to RCCL;
+      # compressed all-reduce payload for large (prefill) messages; baked ON. Not bit-identical to RCCL;
       # set "0" for the exact bf16 all-reduce.
       RADIANCE_AR_QUANT: "1"
       # Cap for the custom all-reduce; larger messages fall back to RCCL. Sized to fit one prefill

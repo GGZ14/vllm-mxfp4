@@ -5,7 +5,7 @@ ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom k
 this card, plus RDNA4-tuned GEMM / attention / all-reduce paths and a dynamic MTP draft controller, so you
 don't have to build the stack yourself.
 
-> **Status: super early dev (v0.5.10). Experimental.** Everything here was built and measured on three exact
+> **Status: super early dev (v0.5.11). Experimental.** Everything here was built and measured on three exact
 > setups: **Qwen3.6-27B-FP8**, **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8), and
 > **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), all with fp8 (or bf16/`auto`) KV
 > cache on two R9700 GPUs (tensor parallel). Other models, non-FP8 weights, single or
@@ -30,7 +30,7 @@ torchvision, AITER, and vLLM for `PYTORCH_ROCM_ARCH=gfx1201` against the officia
 base (digest-pinned) and leaves the wheels in `/wheels` (it also builds `rocm-bandwidth-test` for the startup
 sweep). **rocmprune** (`prune_rocm.sh`) cuts the 19 GB ROCm tree down to this one GPU architecture.
 **assemble** installs the wheels, applies the RDNA4 correctness patches, and compiles the
-custom HIP kernels (`router_gemm.hip`, `radiance_ar_ext.hip`, `radiance_ar_quant_ext.hip`) with the image's own
+custom HIP kernels (`router_gemm.hip`, `radiance_ar_ext.hip`, `radiance_ar_pack_ext.hip`) with the image's own
 `hipcc`. **final** is the release image: a clean `ubuntu:24.04` that receives only the pruned ROCm tree, the
 venv, and the entrypoint, so neither the build toolchain nor the wheels ever reach the published image. No
 prebuilt component wheels, no rotating wheel indexes, and no checked-in binaries go into the image. It is a
@@ -107,7 +107,7 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
 - **RDNA4-tuned kernels**: preshuffled FP8 blockscale GEMM, unified-attention tiling (fp8 + bf16/`auto` KV,
   plus a head-size-keyed long-context prefill config for models with large attention heads such as Gemma's
   head-512 global layers), fused RMSNorm+quant, an fp16 matrix-core (WMMA) gated-delta-net path, a TP=2 P2P
-  one-shot all-reduce (optional fp8 payload), and a native head_dim-72 ViT flash kernel for multimodal
+  one-shot all-reduce (optional compressed payload), and a native head_dim-72 ViT flash kernel for multimodal
   vision encoders.
 - **Fine-grained MoE support** (e.g. Qwen3.6-35B-A3B): RDNA4-tuned fused-MoE Triton configs (always on;
   removes the stock config's `M>=96` cliff for a lower prefill TTFT, lossless), plus a custom bf16 MoE-gate
@@ -130,7 +130,7 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
 
 Flat build context: the runtime Python modules (`radiance_*.py`), the `patch_*.py` fixes, the `fp8-configs/`
 and `moe-configs/` GEMM configs, the HIP kernel sources (`router_gemm.hip`, `radiance_ar_ext.hip`,
-`radiance_ar_quant_ext.hip`), the chat template, `Dockerfile`, and `docker-compose.yml` all live at the repo
+`radiance_ar_pack_ext.hip`), the chat template, `Dockerfile`, and `docker-compose.yml` all live at the repo
 root so `docker build .` works directly. `prune_rocm.sh` is the ROCm slimming step (it self-checks: the
 arch's own kernels must survive and hipcc must still link a HIP shared object, since AITER JITs at runtime). The `Makefile` is a side tool for rebuilding a single HIP kernel
 against the image's toolchain during development; the image build compiles them itself.

@@ -36,14 +36,14 @@ BASE_FLAGS = -O3 -std=c++17 -fPIC -shared --offload-arch=$(GFX_ARCH) -Wno-unused
 # swapped between the two tensor-parallel ranks, each rank fuses a different multiply and the
 # ranks disagree by ~1 ULP on a few elements — breaking the replicated-state invariant. The
 # bf16 all-reduce is a plain sum (no products) and does not need this flag.
-radiance_ar_quant_ext.so: EXTRA_FLAGS = -ffp-contract=off
+radiance_ar_pack_ext.so: EXTRA_FLAGS = -ffp-contract=off
 
 # Kernel extensions with source in this repo (all are baked into the image and enabled by default).
 # router_gemm needs -DTEMPORAL, matching how the Dockerfile compiles it.
 router_gemm.so: EXTRA_FLAGS = -DTEMPORAL
 KERNELS := radiance_ar_ext.so router_gemm.so
-ifneq ($(wildcard radiance_ar_quant_ext.hip),)
-KERNELS += radiance_ar_quant_ext.so
+ifneq ($(wildcard radiance_ar_pack_ext.hip),)
+KERNELS += radiance_ar_pack_ext.so
 endif
 
 .DEFAULT_GOAL := all

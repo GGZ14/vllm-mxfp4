@@ -5,7 +5,9 @@ Mirrors vLLM's CustomAllreduce (ca_comm) interface, so it slots into CudaCommuni
 existing size-gated dispatch. should_custom_ar returns True only for small messages in the win band;
 larger or other messages fall through to RCCL.
 
-Kernel: radiance_ar_ext (pybind11 + HIP .so), PUSH model. Each rank writes its input into the peer's
+Kernels: radiance_ar_ext (exact bf16) and radiance_ar_pack_ext (rotated 6-bit payload, used for
+large messages when RADIANCE_AR_QUANT=1). Both are pybind11 + HIP .so and share the same scratch,
+flags and seq counters. PUSH model. Each rank writes its input into the peer's
 IPC scratch, then reduces (local input + peer data now in my scratch) into out. Only scratch and flags
 are IPC-shared; input/output stay local, so no cudagraph buffer registration is needed. cudagraph-safe:
 the sequence number is a device-resident counter the kernel increments (a host-passed seq would freeze
@@ -15,8 +17,8 @@ chunk and drives its own flag handshake, spreading the push across CUs (PCIe) an
 Env:
   RADIANCE_FAST_REDUCE (1)     1 = install the kernel on the TP group, 0 = RCCL
   RADIANCE_AR_MAX_KB (32768)   messages up to this size use the kernel; larger fall back to RCCL
-  RADIANCE_AR_QUANT (1)        1 = quantize the payload to block-scaled fp8 (e4m3) for large messages
-  RADIANCE_AR_QUANT_MIN_KB (128) fp8 only for messages >= this size (smaller stay on the bf16 kernel)
+  RADIANCE_AR_QUANT (1)        1 = compress the payload (rotated 6-bit, group-scaled) for large messages
+  RADIANCE_AR_QUANT_MIN_KB (128) compression only for messages >= this size (smaller stay on the bf16 kernel)
 """
 import os
 import sys
@@ -98,24 +100,32 @@ class RadianceAllreduce:
              f"finegrained={fine_used} drain={self.drain} acq={self.acq} nt={self.nt} "
              f"nb={self.min_nb}..{self.max_nb})")
 
-        # Optional fp8 payload path (RADIANCE_AR_QUANT). Additive; shares this class's scratch,
-        # flags and seq counters. Only large (bandwidth-bound) messages take it; smaller ones keep
-        # the exact bf16 kernel above. On by default; set 0 for the exact (RCCL-identical) bf16 path.
+        # Optional compressed payload path (RADIANCE_AR_QUANT). Additive; shares this class's
+        # scratch, flags and seq counters. Only large (bandwidth-bound) messages take it; smaller
+        # ones keep the exact bf16 kernel above. On by default; set 0 for the exact
+        # (RCCL-identical) bf16 path.
         self.ar_quant = os.environ.get("RADIANCE_AR_QUANT", "1") == "1"
         self.quant_min_bytes = int(os.environ.get("RADIANCE_AR_QUANT_MIN_KB", "128")) * 1024
-        self.qnt = 1024        # threads/block for the fp8 push (tuned; saturates PCIe)
-        self.qmax_nb = 48      # block cap for the fp8 path (tuned)
+        self.qnt = 1024        # threads/block for the compressed push (wire-bound; not sensitive)
+        self.qmax_nb = 48      # block cap for the compressed path
         self._qext = None
         self._qgroup = 0
+        self._locpk = None
         if self.ar_quant:
             try:
-                import radiance_ar_quant_ext as qext
+                import radiance_ar_pack_ext as qext
                 self._qext = qext
                 self._qgroup = int(qext.GROUP)
-                _log(f"AR_QUANT ON (fp8 payload; min={self.quant_min_bytes // 1024}KB "
-                     f"group={self._qgroup} nt={self.qnt} max_nb={self.qmax_nb})")
+                # This rank's half, kept so the reduce folds exactly the bytes it sent. Same
+                # scale_off split as the peer scratch. Held on the instance for a stable address
+                # under cudagraph replay.
+                loc_bytes = self.max_bytes // 2 + self.max_bytes // 32 + 4096
+                self._locpk = torch.empty(loc_bytes, dtype=torch.uint8, device=self.device)
+                _log(f"AR_QUANT ON (rotated {int(qext.BITS)}-bit packed payload; "
+                     f"min={self.quant_min_bytes // 1024}KB group={self._qgroup} "
+                     f"nt={self.qnt} max_nb={self.qmax_nb} local={loc_bytes >> 20}MB)")
             except Exception as e:
-                _log(f"AR_QUANT disabled: radiance_ar_quant_ext import failed ({e!r})")
+                _log(f"AR_QUANT disabled: radiance_ar_pack_ext import failed ({e!r})")
                 self.ar_quant = False
 
     def _alloc(self, nbytes, fine):
@@ -156,7 +166,7 @@ class RadianceAllreduce:
         return nb
 
     def _quant_ok(self, inp: torch.Tensor) -> bool:
-        # fp8 path only for large (bandwidth-bound) bf16/fp16 messages that tile the scale group.
+        # compressed path only for large (bandwidth-bound) bf16/fp16 messages that tile the group.
         if not self.ar_quant or self._qext is None:
             return False
         if inp.dtype not in (torch.bfloat16, torch.float16):
@@ -181,9 +191,10 @@ class RadianceAllreduce:
         nbytes = inp.numel() * inp.element_size()
         stream = torch.cuda.current_stream().cuda_stream
         if self._quant_ok(inp):
-            self._qext.all_reduce_fp8(
+            self._qext.all_reduce_pack(
                 self._peer_scratch, self._scratch, self._peer_flags, self._flags,
-                self._seq.data_ptr(), self.max_bytes, self.max_bytes // 2,
+                self._seq.data_ptr(), self._locpk.data_ptr(),
+                self.max_bytes, self.max_bytes // 2,
                 inp.data_ptr(), out.data_ptr(), inp.numel(),
                 _DTYPE_CODE[inp.dtype], stream, self._nblocks_q(nbytes), self.qnt,
                 self.drain, self.acq,

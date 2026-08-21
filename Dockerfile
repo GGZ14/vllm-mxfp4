@@ -207,14 +207,15 @@ RUN set -eu; cd /opt/patches; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
 
 # --- gfx1201 HIP kernels, compiled from source ---
-# router_gemm: bf16 MoE-gate GEMM. radiance_ar_ext: bf16 P2P all-reduce. radiance_ar_quant_ext:
-# fp8-payload all-reduce, built with -ffp-contract=off (otherwise the two TP ranks diverge by ~1 ULP).
-COPY router_gemm.hip radiance_ar_ext.hip radiance_ar_quant_ext.hip /opt/patches/
+# router_gemm: bf16 MoE-gate GEMM. radiance_ar_ext: bf16 P2P all-reduce. radiance_ar_pack_ext:
+# compressed-payload all-reduce (rotated 6-bit), built with -ffp-contract=off (otherwise the two TP
+# ranks fuse different products in the reduce and diverge by ~1 ULP).
+COPY router_gemm.hip radiance_ar_ext.hip radiance_ar_pack_ext.hip radiance_ar_pack.h /opt/patches/
 RUN INC=$(python -m pybind11 --includes); B="-O3 -std=c++17 -fPIC -shared --offload-arch=${GFX_ARCH} -Wno-unused-result"; \
     hipcc $B -DTEMPORAL $INC /opt/patches/router_gemm.hip        -o ${SP}/router_gemm.so && \
     hipcc $B              $INC /opt/patches/radiance_ar_ext.hip   -o ${SP}/radiance_ar_ext.so && \
-    hipcc $B -ffp-contract=off $INC /opt/patches/radiance_ar_quant_ext.hip -o ${SP}/radiance_ar_quant_ext.so && \
-    test -f ${SP}/router_gemm.so && test -f ${SP}/radiance_ar_ext.so && test -f ${SP}/radiance_ar_quant_ext.so && \
+    hipcc $B -ffp-contract=off $INC /opt/patches/radiance_ar_pack_ext.hip -o ${SP}/radiance_ar_pack_ext.so && \
+    test -f ${SP}/router_gemm.so && test -f ${SP}/radiance_ar_ext.so && test -f ${SP}/radiance_ar_pack_ext.so && \
     echo "radiance HIP kernels built"
 
 # --- strip debug symbols from the installed extensions (worth ~1 GB) ---
@@ -287,7 +288,7 @@ ENV RADIANCE_PRESHUFFLE=1 RADIANCE_ATTN_TUNE=1 RADIANCE_FUSE_RMS_QUANT=1 \
 # package metadata. The radiance kernels are imported after torch, which is what loads libamdhip64.
 RUN WANT_VLLM=${VLLM_VERSION} WANT_AITER=${AITER_VERSION} \
     python -c 'import os, torch, vllm._C, amdsmi, importlib.metadata as m; \
-import radiance_ar_ext, radiance_ar_quant_ext, router_gemm; \
+import radiance_ar_ext, radiance_ar_pack_ext, router_gemm; \
 v, a = m.version("vllm"), m.version("amd-aiter"); \
 assert v.startswith(os.environ["WANT_VLLM"]), "vllm wheel reports " + v + ", built tag is " + os.environ["WANT_VLLM"]; \
 assert a.startswith(os.environ["WANT_AITER"]), "aiter wheel reports " + a + ", built tag is " + os.environ["WANT_AITER"]; \
