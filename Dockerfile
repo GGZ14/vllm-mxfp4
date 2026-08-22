@@ -205,7 +205,7 @@ RUN set -eu; cd /opt/patches; \
     for p in patch_gfx1201 patch_radiance_dispatch patch_router_gemm patch_unified_attention_lds \
              patch_gdn_wmma patch_preshuffle patch_radiance_fusion install_radiance_hooks \
              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
-             patch_dynamo_metrics patch_quark_mxfp4; do \
+             patch_dynamo_metrics patch_quark_mxfp4 patch_qwen3_thinkoff; do \
       echo "== applying $p =="; python "$p.py"; \
     done; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"

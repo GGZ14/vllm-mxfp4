@@ -61,6 +61,18 @@ runs on the AITER unified path, and the vision tower on the image's own Triton f
 - MTP drafter unpadding, so `--speculative-config`'s `disable_padded_drafter_batch:true` works (the single-stream MTP speed path).
 - MTP drafter multimodal mask alignment, so speculative decoding works with image inputs (otherwise the vision-placeholder mask outlives the compacted draft batch and the engine crashes).
 - `torch.compile` telemetry JSON encoding, which otherwise raises `TypeError: Object of type function is not JSON serializable` at startup on this torch version (harmless but alarming: the serve came up anyway).
+- Reasoning-parser/chat-template agreement about whether thinking is on. `Qwen3Parser` decides its
+  start state from `chat_template_kwargs["enable_thinking"]` alone, but templates in the wild also
+  disable thinking — i.e. pre-close `<think></think>` in the *prompt* — for
+  `reasoning_effort` in `{none, off}` and for `auto_disable_thinking_with_tools` with tools present.
+  The parser only ever sees the *output*, so a pre-closed block leaves no `</think>` to find and the
+  whole response is filed as reasoning: **`content` comes back `null` and the answer hides in
+  `reasoning`**. Measured on Qwen3.8-27B with froggeric v22.3: 50/50 requests at
+  `reasoning_effort: "off"` returned empty content. The patch mirrors the template's own decision
+  from the same kwargs, before `qwen3_config()` consumes it, so the streaming path (same
+  `initial_state`) is fixed too. Not covered: the inline `<|think_off|>` message tag, which lives in
+  the message list `__init__` never receives — pass `enable_thinking: false` or
+  `reasoning_effort: "off"` instead.
 
 ## Custom kernels and tuning (on by default, env-gated)
 
