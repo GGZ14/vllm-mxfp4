@@ -1,4 +1,4 @@
-# Example serve for Qwen3.6-27B-FP8 on dual R9700 (gfx1201), managed by docker compose.
+# Example serve for Qwen3.8-27B-FP8 on dual R9700 (gfx1201), managed by docker compose.
 # Launch from this directory:
 #     docker compose up -d          # start (detached); poll `docker compose logs -f`
 #     docker compose down           # stop + remove
@@ -10,12 +10,12 @@
 # this file, e.g.:  MAX_NUM_SEQS=16 MAX_MODEL_LEN=32768 docker compose up -d
 services:
   vllm:
-    image: ${IMAGE:-vllm-radiance:0.5.11}
+    image: ${IMAGE:-vllm-radiance:0.7.4}
     container_name: vllm-radiance
     restart: unless-stopped
     command:
-      - /models/Qwen/Qwen3.6-27B-FP8
-      - --served-model-name=qwen3.6-27b
+      - /models/Qwen/Qwen3.8-27B-FP8
+      - --served-model-name=qwen3.8-27b
       - --quantization=fp8
       - --tensor-parallel-size=${TP:-2}
       # --- defaults: 8 concurrent seqs, 200K ctx/seq ---
@@ -24,7 +24,7 @@ services:
       - --gpu-memory-utilization=${GPU_UTIL:-0.97}
       # Prefill chunk size. 4096 measured +2.2% prefill at 16K context and +3.8% at 64K against
       # 2560 on this box, lossless, at the cost of ~130 MiB of activation per card.
-      # KEEP IN SYNC with RADIANCE_AR_MAX_KB below: the all-reduce message a prefill chunk sends is
+      # The all-reduce message a prefill chunk sends is
       # max-num-batched-tokens * hidden_size * 2 bytes, and a message over that cap silently falls
       # back to RCCL, which measures 2.3x slower than the custom kernel at this size.
       - --max-num-batched-tokens=${MAX_NUM_BATCHED_TOKENS:-4096}
@@ -52,10 +52,10 @@ services:
       # so every captured size above 72 is a graph that can never be replayed. Trimming the ladder
       # gives that memory back to the KV cache and costs nothing at run time.
       # KEEP IN SYNC: if MAX_NUM_SEQS or MTP_NSPEC changes, recompute the ceiling and this list.
-      # KV cache size in bytes. Strongly recommended on 0.5.x: vLLM 0.26's memory profiler measures
-      # its own headroom through torch, which under-reports free VRAM, so auto-sizing silently leaves
-      # ~2-3 GiB per card unallocated. On this box that was 184,224 tokens (29%) versus the 0.25 stack
-      # on identical config. To derive the value for YOUR hardware and model:
+      # KV cache size in bytes. Strongly recommended: vLLM's memory profiler measures its own
+      # headroom through torch, which under-reports free VRAM, so auto-sizing silently leaves
+      # ~2-3 GiB per card unallocated, costing ~29% of KV capacity on an otherwise identical
+      # config. To derive the value for YOUR hardware and model:
       #   1. start once with this line commented out
       #   2. read the startup line "Actual usage is ... Current kv cache memory in use is N GiB"
       #   3. read TRUE free VRAM from the driver, NOT from torch:
@@ -102,19 +102,15 @@ services:
       VLLM_ROCM_USE_AITER_RMSNORM: "0"
       # radiance rms+group-fp8-quant fusion coverage fix (also baked default 1; explicit here).
       RADIANCE_FUSE_RMS_QUANT: "1"
-      # gated-delta-net KKt gram on the fp16 matrix cores (WMMA) instead of the fp32 scalar path;
-      # much faster prefill + cold start on RDNA4. Baked default 1; set "0" for the stock fp32 dot.
-      RADIANCE_GDN_WMMA: "1"
-      # native head_dim-72 flash attention for the vision encoder (multimodal). ~1.5-2x vs SDPA on
-      # RDNA4; only used when serving vision (no effect under --language-model-only). Default 1.
-      RADIANCE_VIT_FLASH: "1"
+      # master switch for the hand-written gfx1201 kernel library: attention, the gated delta net,
+      # vision attention, the all-reduce and the router GEMM. Set "0" and every one of them reverts
+      # to the stock path (also drop --attention-backend=R4D above, which then refuses to start).
+      RADIANCE_USE_R4D: "${RADIANCE_USE_R4D:-1}"
+      # the P2P one-shot all-reduce itself; "0" keeps RCCL. Bit-identical to RCCL either way.
+      RADIANCE_USE_R4D_AR: "${RADIANCE_USE_R4D_AR:-1}"
       # compressed all-reduce payload for large (prefill) messages; baked ON. Not bit-identical to RCCL;
       # set "0" for the exact bf16 all-reduce.
-      RADIANCE_AR_QUANT: "1"
-      # Cap for the custom all-reduce; larger messages fall back to RCCL. Sized to fit one prefill
-      # chunk (4096 * 5120 * 2 = 40 MiB). Costs 2x this in IPC scratch per rank, so raise it to fit
-      # the chunk and no further.
-      RADIANCE_AR_MAX_KB: "${RADIANCE_AR_MAX_KB:-49152}"
+      RADIANCE_USE_R4D_AR_QUANT: "1"
       # optional NUMA pinning of the vLLM fleet to the GPU-local node(s). Off by default (no-op on
       # single-node hosts). Set "auto" to detect, or explicit nodes (e.g. "0" / "0,1"). Requires the
       # SYS_NICE cap above. Equivalent to passing --numa-bind in command:.
@@ -124,11 +120,11 @@ services:
       # free-win n-grams; the schedule caps serial MTP forwards by batch size. Set DYNAMIC_DRAFT="0" to
       # disable (byte-identical stock MTP). The two knobs below are the only tunables.
       RADIANCE_DYNAMIC_DRAFT: "1"
-      # Re-tuned 2026-08-20 on real text (the old harness generated random word soup, which
-      # inflated acceptance and hid this). Capping the deep tail is worth +3.4% tok/s at one
+      # Tuned on natural-language and code prompts; acceptance measured on synthetic random text
+      # is inflated and hides the effect. Capping the deep tail is worth +3.4% tok/s at one
       # stream and +1.6% at eight, with lower time per step at both: the draft positions it
-      # removes were running at ~5% marginal acceptance against a ~7% break-even. Removing the
-      # caps entirely ("1:8,2:8,4:8,8:8") measures -7.5% at eight streams, so they do bind.
+      # removes run at ~5% marginal acceptance against a ~7% break-even. Removing the caps
+      # entirely ("1:8,2:8,4:8,8:8") measures -7.5% at eight streams, so they do bind.
       RADIANCE_DRAFT_SCHEDULE: "${RADIANCE_DRAFT_SCHEDULE:-1:8,2:7,4:6,8:5,16:4}"
       RADIANCE_DRAFT_TAU: "${RADIANCE_DRAFT_TAU:-0.28}"
       # 2-bit draft head instead of the 4-bit default: +3.2% tokens/s single-stream with drafting
@@ -136,9 +132,6 @@ services:
       # inputs where the 4-bit head deviates on 22. Opt-in because it is a larger change than a
       # tuning knob. MUST be declared here to be settable: compose only forwards declared vars.
       RADIANCE_FAST_DRAFT: "${RADIANCE_FAST_DRAFT:-0}"
-      # custom bf16 MoE-gate GEMM for the n in [6,16] band rocBLAS serves poorly (fine-grained MoE,
-      # e.g. Qwen3.6-35B-A3B). Baked ON; inert for models whose gate is not [256,2048]. Set "0" for rocBLAS.
-      RADIANCE_MOE_ROUTER: "1"
       NCCL_PROTO: Simple
       # throttle inductor compile workers to limit peak compile-time RAM (defensive).
       TORCHINDUCTOR_COMPILE_THREADS: "4"
@@ -165,7 +158,7 @@ services:
       - "8000:8000"
     volumes:
       # override any of these via the shell or a .env file (e.g. MODELS=/data/models)
-      - ${MODELS:-./models}:/models:ro           # holds your model at Qwen/Qwen3.6-27B-FP8 (matches command: below)
+      - ${MODELS:-./models}:/models:ro           # holds your model at Qwen/Qwen3.8-27B-FP8 (matches command: below)
       - ${VLLM_CACHE:-./vllm-cache}:/cache        # torch.compile / aiter JIT cache, persist across restarts
       - ${WORK:-.}:/work:ro                        # supplies /work/qwen3.6-enhanced.jinja (this repo directory)
     healthcheck:

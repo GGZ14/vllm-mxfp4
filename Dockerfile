@@ -2,12 +2,12 @@
 # patches and kernels. Single multistage build on the official AMD ROCm image, in four stages:
 #   1. builder    compile torch/triton/torchvision/aiter/vLLM from source into /wheels
 #   2. rocmprune  cut the 19 GB ROCm tree down to this one GPU architecture
-#   3. assemble   install the wheels, apply the patches, compile the HIP kernels
+#   3. assemble   install the wheels, apply the patches, build the R4D kernel library
 #   4. final      the release image: a clean Ubuntu with only the pruned ROCm and the venv
 # No prebuilt component wheels and no checked-in binaries. The release image carries neither the
 # build toolchain nor the wheels, which is most of the reason it is far smaller than the base.
 #
-# stack: torch 2.11.0, triton 3.6.0, torchvision 0.24.1, aiter v0.1.17, vLLM v0.26.0,
+# stack: torch 2.11.0, triton 3.6.0, torchvision 0.24.1, aiter v0.1.17, vLLM v0.27.1,
 # all compiled for PYTORCH_ROCM_ARCH=gfx1201 against the base image's ROCm 7.14.
 ARG ROCM_BASE=rocm/dev-ubuntu-24.04:7.14.0-full@sha256:439edaa8f0c4be4a3728e528f87b8a2ea1f051f34cf10b27caa4bd94f562eda7
 ARG GFX_ARCH=gfx1201
@@ -19,20 +19,39 @@ ARG RELEASE_BASE=ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506
 # Component pins, in one place. Each is both the git tag that gets compiled and the version the
 # resulting wheel reports, so `pip show`, `importlib.metadata`, and the startup banner all agree
 # with what was actually built.
-# torch/triton/torchvision are NOT free choices: vLLM 0.26.0's pyproject pins `torch == 2.11.0`,
-# torch 2.11.0 pins triton 3.6.0, and torchvision 0.24.1 is its matching release. Building against
-# newer ones means running a combination upstream never tests. 0.5.0-0.5.4 did exactly that (torch
-# 2.13 / triton 3.7.1 / torchvision 0.28) because `use_existing_torch.py` strips the pin, and those
-# builds hang the GPU under load where 0.4.0 -- which used this sanctioned trio -- does not.
+# torch/triton/torchvision are NOT free choices, and the number to read is not the one in
+# pyproject.toml. vLLM 0.27.1's build-system asks for `torch == 2.13.0`, but that is the CUDA
+# build: upstream's own ROCm image (docker/Dockerfile.rocm_base) builds PYTORCH_BRANCH=release/2.11
+# with torchvision v0.24.1, and requirements/rocm.txt pins no torch at all. release/2.11 is
+# therefore the combination upstream actually tests on ROCm, unchanged from 0.26.0. torch 2.11.0
+# pins triton 3.6.0. Building against newer ones means running a combination upstream never tests:
+# 0.5.0-0.5.4 did exactly that (torch 2.13 / triton 3.7.1 / torchvision 0.28) because
+# `use_existing_torch.py` strips the pin, and those builds hang the GPU under load where 0.4.0 --
+# which used this sanctioned trio -- does not.
 ARG TORCH_VERSION=2.11.0
 ARG TRITON_VERSION=3.6.0
 ARG TORCHVISION_VERSION=0.24.1
 ARG AITER_VERSION=0.1.17
-ARG VLLM_VERSION=0.26.0
+ARG VLLM_VERSION=0.27.1
+# transformers is pinned here because vLLM does not pin it: requirements/common.txt asks only for
+# `transformers >= 5.5.3`, so an unpinned rebuild silently picks up whatever is newest and the
+# stack changes underneath the build. 5.15.0 made Gemma-4's head_dim a per-layer attribute and
+# turned the global read into AmbiguousGlobalPerLayerAttributeError, which no released vLLM config
+# convertor handles -- a Gemma-4 checkpoint then fails during argument parsing, before a model or
+# an attention backend exists. 5.14.1 is the last release before that change and loads every
+# architecture this image serves.
+ARG TRANSFORMERS_VERSION=5.14.1
 # rocm-bandwidth-test for the startup topology/bandwidth sweep. Pinned to the NEWEST tag that still
 # has a plain CMakeLists: the rocm-7.x tags moved to a cmake framework that demands clang>=19 on PATH
 # plus vendored boost/fmt/curl submodules, none of which this tool needs.
 ARG RBT_VERSION=rocm-6.4.4
+# R4D: the HIP kernel library for this GPU -- attention, gated delta net, all-reduce and a
+# skinny bf16 GEMM. It is a library of gfx1201 kernels rather than a part of this image, so it
+# lives in its own repository and is pinned here like any other component; R4D_REPO exists so a
+# fork or a local mirror can be substituted without editing the build. The tag is asserted against
+# the version the built library reports, so a stale clone fails the build instead of shipping.
+ARG R4D_REPO=https://codeberg.org/StillDeadcode/libr4d.git
+ARG R4D_VERSION=v0.4.0
 
 # =====================================================================================
 # STAGE 1 builder: compile the stack from source into /wheels
@@ -43,7 +62,6 @@ ARG TORCH_VERSION
 ARG TRITON_VERSION
 ARG TORCHVISION_VERSION
 ARG AITER_VERSION
-ARG VLLM_VERSION
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_ROCM_ARCH=${GFX_ARCH} \
     ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
@@ -102,11 +120,14 @@ RUN git clone --recursive --shallow-submodules -b v${AITER_VERSION} https://gith
 
 # --- vLLM, built against the torch above. use_existing_torch strips the torch/torchvision pins so
 #     pip does not try to fetch them; the versions built above ARE the pinned ones, so this is now
-#     just "use what we compiled", not an override.
+#     just "use what was compiled above", not an override.
 #     setuptools-rust is a pyproject build requirement that --no-build-isolation does not install.
 #     VLLM_VERSION_OVERRIDE pins the reported version to the tag: the tree is dirty (use_existing_torch
 #     rewrites the requirements files) and shallow, so setuptools-scm would otherwise stamp the wheel
 #     with a guessed next-release dev version plus the build date. ---
+# ARG at the point of use, not at the top of the stage: an ARG line is a cache-key instruction, so
+# declaring it up there would make a vLLM bump rebuild torch, triton, torchvision and aiter too.
+ARG VLLM_VERSION
 RUN git clone --depth 1 -b v${VLLM_VERSION} https://github.com/vllm-project/vllm.git /src/vllm \
     && cd /src/vllm && python use_existing_torch.py \
     && pip install "setuptools-rust>=1.9.0" \
@@ -152,9 +173,10 @@ FROM ${ROCM_BASE} AS assemble
 ARG GFX_ARCH
 ARG AITER_VERSION
 ARG VLLM_VERSION
+ARG TRANSFORMERS_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.12-venv \
+      python3.12-venv git \
     && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/vllm
@@ -165,12 +187,14 @@ ENV SP=/opt/vllm/lib/python3.12/site-packages
 # --- install the wheels ---
 # torch/triton/vision/aiter with --no-deps so pip does not replace them; vLLM with its pure-python
 # dependencies. amdsmi (the ROCm python bindings the base image ships) is required for vLLM's ROCm
-# platform detection.
+# platform detection. The transformers pin goes in the SAME pip invocation as the vLLM wheel so the
+# resolver sees it as a constraint -- installing it afterwards would first pull the newest release
+# and then downgrade it, leaving both in the layer.
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir -U pip wheel setuptools \
  && pip install --no-cache-dir --no-deps \
       /wheels/torch-*.whl /wheels/triton-*.whl /wheels/torchvision-*.whl /wheels/*aiter-*.whl \
- && pip install --no-cache-dir /wheels/vllm-*.whl \
+ && pip install --no-cache-dir /wheels/vllm-*.whl "transformers==${TRANSFORMERS_VERSION}" \
  && pip install --no-cache-dir /opt/rocm/share/amd_smi pillow pybind11 \
  && rm -rf /wheels /root/.cache
 
@@ -188,40 +212,56 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd \
 # every process, otherwise it enumerates 0 devices and platform detection fails.
 COPY radiance_amdsmi.py radiance_amdsmi.pth \
      radiance_kernels.py radiance_vit_attn.py radiance_allreduce.py \
-     radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_router.py ${SP}/
+     radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_router.py \
+     radiance_r4d_attn.py radiance_gdn.py ${SP}/
 COPY fp8-configs/ ${SP}/vllm/model_executor/layers/quantization/utils/configs/
 COPY moe-configs/ ${SP}/vllm/model_executor/layers/fused_moe/configs/
 
 # --- gfx1201 fixes and tuned-kernel patches ---
 # Each patch edits a vLLM (or aiter/triton) source file in place and checks for source drift before
 # writing. patch_gdn_wmma covers the solve_tril triangular block-inverse only; the gated-delta-net
-# gram cast is handled in 0.26.0 upstream.
+# gram cast is handled upstream since 0.26.0.
+# patch_conv1d_blockn widens the gated-delta-net prefill conv1d channel block to a 16-byte-per-lane
+# access; bit-identical, and it defuses a 2**14-byte row pitch the caller's split() view creates.
+# patch_r4d is the whole libr4d integration in one patch, switchable at run time with
+# RADIANCE_USE_R4D: the R4D attention backend enum, plus the gated-delta-net layer, where a whole
+# step runs in five hand-written kernels (conv+prep+gating+cumsum, the K-gram with its triangular
+# inverse, and the chunked scan on the prefill path; the conv update and the recurrent state
+# update on the decode path), and the FLA chunk path still gets the fused scan for any step shape
+# the layer hook declines. The two patches above tune that FLA path, which is what runs when
+# RADIANCE_USE_R4D=0.
 COPY patch_*.py install_radiance_hooks.py _patchlib.py /opt/patches/
 RUN set -eu; cd /opt/patches; \
     for p in patch_gfx1201 patch_radiance_dispatch patch_router_gemm patch_unified_attention_lds \
              patch_gdn_wmma patch_preshuffle patch_radiance_fusion install_radiance_hooks \
              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
-             patch_dynamo_metrics; do \
+             patch_dynamo_metrics patch_conv1d_blockn patch_r4d; do \
       echo "== applying $p =="; python "$p.py"; \
     done; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
 
-# --- gfx1201 HIP kernels, compiled from source ---
-# router_gemm: bf16 MoE-gate GEMM. radiance_ar_ext: bf16 P2P all-reduce. radiance_ar_pack_ext:
-# compressed-payload all-reduce (rotated 6-bit), built with -ffp-contract=off (otherwise the two TP
-# ranks fuse different products in the reduce and diverge by ~1 ULP).
-COPY router_gemm.hip radiance_ar_ext.hip radiance_ar_pack_ext.hip radiance_ar_pack.h /opt/patches/
-RUN INC=$(python -m pybind11 --includes); B="-O3 -std=c++17 -fPIC -shared --offload-arch=${GFX_ARCH} -Wno-unused-result"; \
-    hipcc $B -DTEMPORAL $INC /opt/patches/router_gemm.hip        -o ${SP}/router_gemm.so && \
-    hipcc $B              $INC /opt/patches/radiance_ar_ext.hip   -o ${SP}/radiance_ar_ext.so && \
-    hipcc $B -ffp-contract=off $INC /opt/patches/radiance_ar_pack_ext.hip -o ${SP}/radiance_ar_pack_ext.so && \
-    test -f ${SP}/router_gemm.so && test -f ${SP}/radiance_ar_ext.so && test -f ${SP}/radiance_ar_pack_ext.so && \
-    echo "radiance HIP kernels built"
+# --- R4D: the gfx1201 kernel library, cloned and compiled from source ---
+# One shared object holding every hand-written kernel this image runs: paged attention (prefill and
+# decode, fp8 or bf16 KV), the fused gated-delta-net prefill scan, the TP=2 P2P all-reduce in both
+# its exact and its 6-bit-packed form, and the MoE router GEMM. Built here rather than in the
+# builder stage because it has to be compiled by the same hipcc the venv loads it against.
+# ARGs are declared at the point of use: they are cache-key instructions, so putting them at the top
+# of the stage would invalidate the wheel install above on every kernel bump.
+ARG R4D_REPO
+ARG R4D_VERSION
+RUN git clone --depth 1 -b ${R4D_VERSION} ${R4D_REPO} /src/libr4d \
+ && cd /src/libr4d && GFX_ARCH=${GFX_ARCH} OUT=${SP}/r4d.so ./build.sh \
+ && WANT=$(echo "${R4D_VERSION}" | sed 's/^v//') \
+ && python -c "import sys, torch, r4d; \
+assert r4d.__version__ == sys.argv[1], 'r4d reports ' + r4d.__version__ + ', pinned tag is ' + sys.argv[1]; \
+print('r4d', r4d.__version__, 'built:'); \
+[print('   ', k['family'], k['name']) for k in r4d.kernels()]" "$WANT" \
+ && rm -rf /src/libr4d
 
 # --- strip debug symbols from the installed extensions (worth ~1 GB) ---
 # These are release builds, but they still carry .debug_* sections that nothing reads at runtime.
-# Our three HIP kernels are excluded: they are tiny and carry device fatbins.
-RUN find /opt/vllm -type f -name '*.so*' ! -name 'radiance_ar*' ! -name 'router_gemm*' \
+# R4D is excluded: it is tiny and carries device fatbins.
+RUN find /opt/vllm -type f -name '*.so*' ! -name 'r4d.so' \
       -exec strip --strip-unneeded {} + 2>/dev/null || true; \
     find /opt/vllm -name '__pycache__' -type d -prune -exec rm -rf {} + || true; \
     echo "extensions stripped"
@@ -236,6 +276,7 @@ FROM ${RELEASE_BASE} AS final
 ARG GFX_ARCH
 ARG AITER_VERSION
 ARG VLLM_VERSION
+ARG TRANSFORMERS_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 # ROCm 7.14 vendors its own libdrm / numa / elf / sqlite / zlib / zstd (the librocm_sysdeps_* set),
 # so the release image needs very little from the distro:
@@ -271,29 +312,36 @@ ENV VIRTUAL_ENV=/opt/vllm \
     SAFETENSORS_FAST_GPU=1 TOKENIZERS_PARALLELISM=false TRITON_CACHE_AUTOTUNING=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# --- radiance feature flags (set any to 0 to fall back to stock). RADIANCE_GDN_WMMA gates the
-#     solve_tril fp16 path. RADIANCE_RUN_BWTEST runs the bandwidth sweep at startup; it is
-#     backgrounded and takes about a second, so it never delays the serve. ---
-ENV RADIANCE_PRESHUFFLE=1 RADIANCE_ATTN_TUNE=1 RADIANCE_FUSE_RMS_QUANT=1 \
-    RADIANCE_GDN_WMMA=1 RADIANCE_VIT_FLASH=1 \
-    RADIANCE_FAST_REDUCE=1 RADIANCE_AR_MAX_KB=32768 RADIANCE_AR_QUANT=1 RADIANCE_AR_QUANT_MIN_KB=128 \
+# --- radiance feature flags (set any to 0 to fall back to stock). RADIANCE_USE_R4D is the master
+#     switch for the hand-written gfx1201 kernel library: 0 takes it out of the picture entirely
+#     (attention, the gated delta net, vision attention, the all-reduce and the router GEMM all
+#     revert to the stock path) without a rebuild. RADIANCE_USE_R4D_AR and its _QUANT variant are
+#     the two all-reduce behaviours worth switching independently, since one is bit-identical to
+#     RCCL and the other is not. RADIANCE_R4D_REPORT prints which kernel each part of the model
+#     resolved to once the worker is up. RADIANCE_RUN_BWTEST runs the bandwidth sweep at startup;
+#     it is backgrounded and takes about a second, so it never delays the serve. ---
+ENV RADIANCE_USE_R4D=1 RADIANCE_R4D_REPORT=1 \
+    RADIANCE_USE_R4D_AR=1 RADIANCE_USE_R4D_AR_QUANT=1 \
+    RADIANCE_PRESHUFFLE=1 RADIANCE_FUSE_RMS_QUANT=1 \
     RADIANCE_DYNAMIC_DRAFT=1 RADIANCE_DRAFT_SCHEDULE=1:8,2:7,4:6,8:5,16:4 RADIANCE_DRAFT_TAU=0.35 \
-    RADIANCE_MOE_ROUTER=1 RADIANCE_RUN_BWTEST=1
+    RADIANCE_RUN_BWTEST=1
 
 # Fail the build if the native stack does not import, or if a wheel reports a version that does not
 # match the source it was built from (a silently mis-stamped wheel is how "aiter 0.0.0" shipped).
 # Running this in the RELEASE stage also proves the allowlist above is complete: a library left
 # behind by the prune or by the slim base shows up here as an ImportError, not in production.
 # Kept GPU-free: no `import aiter` (it runs rocminfo) and no full `import vllm`; versions come from
-# package metadata. The radiance kernels are imported after torch, which is what loads libamdhip64.
-RUN WANT_VLLM=${VLLM_VERSION} WANT_AITER=${AITER_VERSION} \
+# package metadata. R4D is imported after torch, which is what loads libamdhip64.
+RUN WANT_VLLM=${VLLM_VERSION} WANT_AITER=${AITER_VERSION} WANT_TF=${TRANSFORMERS_VERSION} \
     python -c 'import os, torch, vllm._C, amdsmi, importlib.metadata as m; \
-import radiance_ar_ext, radiance_ar_pack_ext, router_gemm; \
-v, a = m.version("vllm"), m.version("amd-aiter"); \
+import r4d; \
+v, a, t = m.version("vllm"), m.version("amd-aiter"), m.version("transformers"); \
 assert v.startswith(os.environ["WANT_VLLM"]), "vllm wheel reports " + v + ", built tag is " + os.environ["WANT_VLLM"]; \
 assert a.startswith(os.environ["WANT_AITER"]), "aiter wheel reports " + a + ", built tag is " + os.environ["WANT_AITER"]; \
+assert t == os.environ["WANT_TF"], "transformers is " + t + ", pinned is " + os.environ["WANT_TF"]; \
 print("stack OK | vllm", v, "| torch", torch.__version__, "| aiter", a, \
-      "| torchvision", m.version("torchvision"), "| triton", m.version("triton"))'
+      "| torchvision", m.version("torchvision"), "| triton", m.version("triton"), \
+      "| transformers", t, "| r4d", r4d.__version__)'
 
 # The release image must still be able to COMPILE. AITER JIT-builds its kernels on first use, as a
 # pybind11 HIP extension, so the shipped image needs hipcc AND the C++ standard headers AND Python.h.
@@ -315,8 +363,11 @@ RUN printf '%s\n' \
  && rm -f /tmp/_jit_probe.hip /tmp/_jit_probe.so \
  && echo "runtime JIT toolchain OK (hipcc + libstdc++ headers + Python.h + pybind11)"
 
-ARG RADIANCE_VERSION=0.5.8
+ARG RADIANCE_VERSION=0.6.2
 ENV RADIANCE_VERSION=${RADIANCE_VERSION}
+# The banner reads this file first: one source of truth for the version, so it reports what was
+# built even when the image is built without --build-arg.
+COPY VERSION /opt/radiance_version
 COPY radiance_preamble.py /opt/radiance_preamble.py
 COPY radiance_entrypoint.sh /opt/radiance_entrypoint.sh
 RUN chmod +x /opt/radiance_entrypoint.sh

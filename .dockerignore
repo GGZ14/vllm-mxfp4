@@ -1,4 +1,4 @@
-# Keep the build context lean — none of this belongs in the image build.
+# Keep the build context lean -- none of this belongs in the image build.
 .git/
 .gitignore
 __pycache__/

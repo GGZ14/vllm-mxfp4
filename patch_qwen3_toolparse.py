@@ -38,10 +38,10 @@ LIB = Path(sysconfig.get_paths()["purelib"])
 
 # ── 1. content-leak fix (abstract_parser.py) ─────────────────────────────────
 F_ABS = LIB / "vllm/parser/abstract_parser.py"
-# 0.26.0 expanded the `else` block: a required/named tool-choice empty-content case now sits between
+# 0.26.0 expanded the `else` block: a required/named tool-choice empty-content case sits between
 # the `# No tool calls.` comment and the `return None, content`, so the old contiguous anchor no
 # longer matches. The anchor targets the tail of that block instead. The leak path (returning raw
-# `content`) is unchanged in 0.26.0, so this fix is still needed.
+# `content`) is unchanged through 0.27.1, so this fix is still needed.
 ABS_ANCHOR = (
     "                if (is_required_tool_choice or is_named_tool_choice) and (\n"
     "                    content is None\n"

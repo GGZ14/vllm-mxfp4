@@ -37,7 +37,7 @@ DYNAMIC = os.environ.get("RADIANCE_DYNAMIC_DRAFT", "1") == "1"
 # deeper than it does when drafting is expensive.
 TAU = float(os.environ.get("RADIANCE_DRAFT_TAU") or "0.28")
 # batch-size MTP-forward ceiling "bs:max_depth,..." (carry-forward). Caps how deep the drafter forwards
-# by running batch size, so we don't do deep serial drafts at concurrency. The per-slot rule still stops
+# by running batch size, so deep serial drafts do not run at concurrency. The per-slot rule still stops
 # earlier within it, and the free n-gram tail is unaffected. Empty string disables the cap.
 SCHEDULE = (os.environ.get("RADIANCE_DRAFT_SCHEDULE") or "1:8,2:7,4:6,8:5,16:4").strip()
 # Runtime state, not a knob: the shard-local draft path (see _local_draft) is always used, and this
@@ -308,7 +308,7 @@ def _prepare_match_gpu(runner):
 
 def _postprocess_gpu(runner, draft):
     """Assemble the final draft from the per-slot decisions. The patched loop already ran only the
-    forwards up to the batch's stop point; here we trim each request to its own stop slot and append the
+    forwards up to the batch's stop point; here each request is trimmed to its own stop slot and given the
     verbatim n-gram tail where it chose one. Returns a ragged list[list[int]] (native draft format), so
     vLLM verifies exactly the tokens the controller kept."""
     import torch

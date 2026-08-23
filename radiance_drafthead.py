@@ -1,50 +1,51 @@
 """2-bit MTP draft head with an exact rerank, behind RADIANCE_FAST_DRAFT.
 
-Off by default. The drafter then uses the stock bf16 head, which vLLM shares with the target model
-(_maybe_share_lm_head does this unconditionally for an MTP drafter, so it costs no extra memory) but
-reads 1.18 GiB/rank on every draft slot and measures ~2002 us per call. RADIANCE_FAST_DRAFT=1
-replaces it with a 2-bit head at ~473 us including the rerank, for 0.167 GiB/rank.
+Off by default, in which case the drafter uses the stock bf16 head that vLLM shares with the target
+model (_maybe_share_lm_head does this unconditionally for an MTP drafter, so it costs no extra
+memory). That head reads 1.18 GiB/rank on every draft slot and measures ~2002 us per call.
+RADIANCE_FAST_DRAFT=1 replaces it with a 2-bit head at ~473 us including the rerank, for 0.167
+GiB/rank.
 
 The head is the largest bandwidth consumer in a decode step: per rank it is x[M,5120] @
-W[5120,124160], it runs once per draft slot -- up to 8 times per engine step -- and it is flat in M
-from 1 to 72, so the only lever is fewer bytes.
+W[5120,124160], it runs once per draft slot (up to 8 times per engine step) and it is flat in M from
+1 to 72, so the only lever is fewer bytes.
 
-Weights are int2 with an asymmetric per-(row, group-of-128) scale. Four things make that pay, and
-none of them is "fewer bits" on its own -- a first version measured 781 us, *slower* than a 4-bit
-head:
+Weights are int2 with an asymmetric per-(row, group-of-128) scale. Four properties make that pay,
+and narrower weights alone is not one of them: at group 64 the same kernel measures 781 us, slower
+than a 4-bit head.
 
-  * **Group 128, not 64.** The per-group scale/zero-point maths on the [BLOCK_M, BLOCK_N]
+  * Group 128, not 64. The per-group scale and zero-point arithmetic on the [BLOCK_M, BLOCK_N]
     accumulator is the dominant non-memory term, so halving the group count halves it: 781 -> 417 us
-    on identical bytes. This was the whole difference between "slower than 4-bit" and "faster".
-  * **Quarter-split packing.** Byte j carries k = j, K/4+j, K/2+j and 3K/4+j, so all four 2-bit
-    planes feed contiguous k ranges and one byte load serves four contiguous dots. A contiguous-4
-    layout (byte j holding k=4j..4j+3, giving one dot per group) looks better and measures 676 us,
-    because four tile rows then share a byte and gather instead of streaming.
-  * **Bit-pattern dequant, hoisted.** 0x3F80 | ((b << (5-2q)) & 0x60) reads as the bf16 value
-    1 + v/4 -- one shift and one mask, no int->float convert and no extract-then-reposition -- and
-    the uint16 conversion is hoisted out of the quarter loop (one per tile, not four). 417 -> 350 us.
-    The 1.0 bias is exact, not an approximation: the dot then returns sum_k x_k + dot(x,v)/4, and the
+    on identical bytes.
+  * Quarter-split packing. Byte j carries k = j, K/4+j, K/2+j and 3K/4+j, so all four 2-bit planes
+    feed contiguous k ranges and one byte load serves four contiguous dots. A contiguous-4 layout
+    (byte j holding k = 4j..4j+3, one dot per group) measures 676 us instead, because four tile rows
+    then share a byte and gather rather than stream.
+  * Bit-pattern dequant, hoisted. 0x3F80 | ((b << (5-2q)) & 0x60) reads as the bf16 value 1 + v/4,
+    one shift and one mask, with no int-to-float convert and no extract-then-reposition; the uint16
+    conversion is hoisted out of the quarter loop, one per tile rather than four. 417 -> 350 us. The
+    1.0 bias is exact rather than an approximation: the dot returns sum_k x_k + dot(x,v)/4, and the
     kernel already holds sum_k x_k per group for the zero point, so the contribution collapses to
-    (4 s)*p - (4 s + z s)*sum_k x_k -- the same two accumulator ops, against premultiplied scales.
-  * **The scale is applied to the accumulator, never to the weight tile.** Dequantising [G, BLOCK_N]
-    elementwise instead costs ~400 us; it is 8x more elements to touch.
+    (4 s)*p - (4 s + z s)*sum_k x_k, the same two accumulator ops against premultiplied scales.
+  * The scale is applied to the accumulator, never to the weight tile. Dequantising [G, BLOCK_N]
+    elementwise costs ~400 us instead, 8x more elements to touch.
 
-Accuracy comes from reranking, not from bits. Each program already holds the maximum of its 64
-columns, so it emits the top KCAND of them for free; the top RERANK of those are then scored exactly
+Accuracy comes from reranking rather than from bits. Each program already holds the maximum of its
+64 columns, so it emits the top KCAND of them for free; the top RERANK of those are scored exactly
 against the bf16 weight (a few hundred KB against the coarse pass's 0.167 GiB) and written back over
-the coarse values. On 8192 real draft-head inputs captured from a live serve this matches the exact
-bf16 argmax on **every row** -- better than a 4-bit head at KCAND=1, which misses 22.
+the coarse values. On 8192 draft-head inputs captured from a live serve this matches the exact bf16
+argmax on every row, against 22 misses for a 4-bit head at KCAND=1.
 
-**KCAND is the lever, not RERANK.** Selection emits the top K of each block, so at K=1 a winner that
-shares a block with a stronger token is never a candidate *at any R* and recall saturates. 2 bits
-needs K=8; 4 bits was fine at K=1. Selecting by block max rather than a token-level topk over the
+KCAND is the lever, not RERANK. Selection emits the top K of each block, so at K=1 a winner that
+shares a block with a stronger token is never a candidate at any R, and recall saturates. 2 bits
+needs K=8; 4 bits is adequate at K=1. Selecting by block max rather than a token-level topk over the
 full row is also the faster choice, 65 us against 105.
 
-Why none of this can move model output: the draft head decides which tokens are *proposed*. The
-target model verifies every proposal with its own untouched bf16 head on a separate LogitsProcessor
-instance, and speculative decoding is distribution-preserving, so a worse draft can only cost
-acceptance -- never a different token. `mtp.fc` is deliberately left alone: the checkpoint lists it
-in modules_to_not_convert alongside the norms, gates, lm_head and embed_tokens, and it is worth only
+Model output cannot move as a result: the draft head decides which tokens are proposed, the target
+model verifies every proposal with its own untouched bf16 head on a separate LogitsProcessor
+instance, and speculative decoding is distribution-preserving, so a worse draft costs acceptance
+rather than a different token. mtp.fc is deliberately left alone: the checkpoint lists it in
+modules_to_not_convert alongside the norms, gates, lm_head and embed_tokens, and it is worth only
 ~0.5% of a decode step.
 """
 import os
@@ -82,10 +83,10 @@ if triton is not None:
         """Top-KC of this block, by successive max-and-mask.
 
         The exact winner is always the maximum of its own block, so block maxima carry the rerank
-        candidates at 1/BLOCK_N the selection width of a token-level top-R -- and a token-level
-        topk over the full row measured 105 us against 65 for this, so the cheap selection is also
-        the fast one. KC matters where R does not: R caps how many candidates are finally rescored,
-        but at KC=1 a winner sharing a block with a stronger token is never a candidate at any R.
+        candidates at 1/BLOCK_N the selection width of a token-level top-R; a token-level topk over
+        the full row measures 105 us against 65 for this, so the cheap selection is also the fast
+        one. KC matters where R does not: R caps how many candidates are finally rescored, but at
+        KC=1 a winner sharing a block with a stronger token is never a candidate at any R.
         """
         masked = tl.where(mask_n[None, :], acc, float("-inf"))
         for c in tl.static_range(KC):
@@ -100,10 +101,10 @@ if triton is not None:
     def _draft_head_int2(X, XS, Wq, S, ZS, Y, BM, BI, K: tl.constexpr, N, stride_wq, stride_s,
                          stride_xs, NBLK, KC: tl.constexpr, G: tl.constexpr,
                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-        """2 bits/weight. Packing splits K into QUARTERS -- byte j carries k = j, K/4+j, K/2+j and
-        3K/4+j -- so all four planes feed contiguous k ranges and one byte load serves four
-        contiguous dots. Group 128 (not 64) is what makes it pay: the per-group accumulator work is
-        the dominant non-memory term, and halving the group count took this kernel 781 -> 417 us."""
+        """2 bits/weight. Packing splits K into quarters, byte j carrying k = j, K/4+j, K/2+j and
+        3K/4+j, so all four planes feed contiguous k ranges and one byte load serves four contiguous
+        dots. Group 128 rather than 64 is what makes it pay: the per-group accumulator work is the
+        dominant non-memory term, and halving the group count moves this kernel 781 -> 417 us."""
         pid = tl.program_id(0)
         offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_m = tl.arange(0, BLOCK_M)

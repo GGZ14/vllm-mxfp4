@@ -32,10 +32,11 @@ def main():
     # A. AITER enablement: vLLM gates AITER on MI3xx; treat gfx12x as capable too.
     apply(
         SP / "vllm/_aiter_ops.py",
-        "        from vllm.platforms.rocm import on_mi3xx\n\n        return on_mi3xx()",
-        "        from vllm.platforms.rocm import on_gfx12x, on_mi3xx\n\n"
-        "        return on_mi3xx() or on_gfx12x()",
-        "on_mi3xx() or on_gfx12x()",
+        "        from vllm.platforms.rocm import get_cdna_version\n\n"
+        "        return get_cdna_version() > 2",
+        "        from vllm.platforms.rocm import get_cdna_version, on_gfx12x\n\n"
+        "        return get_cdna_version() > 2 or on_gfx12x()",
+        "get_cdna_version() > 2 or on_gfx12x()",
         "is_aiter_found_and_supported: allow gfx12x",
     )
     # B. Triton HIPDriver.is_active(): stock gates on torch.cuda.is_available(), which is False in
@@ -52,11 +53,13 @@ def main():
     #    C++/HIP kernel fails to build on RDNA4. Gate to MI3xx; gfx12x uses the native sampler.
     apply(
         SP / "vllm/v1/sample/ops/topk_topp_sampler.py",
-        '            logprobs_mode not in ("processed_logits", "processed_logprobs")\n'
+        "            logprobs_mode not in PROCESSED_LOGPROBS_MODES\n"
         "            and rocm_aiter_ops.is_enabled()\n"
+        "            and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable\n"
         "        ):",
-        '            logprobs_mode not in ("processed_logits", "processed_logprobs")\n'
+        "            logprobs_mode not in PROCESSED_LOGPROBS_MODES\n"
         "            and rocm_aiter_ops.is_enabled()\n"
+        "            and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable\n"
         "            # gfx1201: AITER's sampler C++/HIP kernel fails to build on RDNA4.\n"
         "            # Gate to MI3xx; gfx12x uses the native sampler.\n"
         '            and __import__("vllm.platforms.rocm", fromlist=["on_mi3xx"]).on_mi3xx()\n'

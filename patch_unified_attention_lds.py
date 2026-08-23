@@ -10,11 +10,11 @@ string replacements on the installed site-packages copy of unified_attention.py.
      head_size 512, fp8    KV : 64*512*1*2 + 256 = 65792   (Gemma4's global-attention layers)
    Both selectors now step num_stages, then TILE_SIZE, down until the tile fits. This is a hard
    requirement, not a preference, so it lives in source and applies whether or not the runtime
-   RADIANCE_ATTN_TUNE hook is installed (that hook is a tune and must stay disableable).
+   tuned-config hook is installed (that hook is a tune; this is a correctness clamp).
 
 2. bf16/fp16 (2-byte, incl. --kv-cache-dtype auto) 3D-decode tune. do_bench-optimal at head_size 256:
    TILE 16, warps 4, stages 2, waves 2, reduce warps 4 (warps=4 is the lever: +14% decode, 4-7x
-   prefill). This must be a source patch rather than the RADIANCE_ATTN_TUNE wrapper because that
+   prefill). This must be a source patch rather than part of the tuned-config wrapper because that
    wrapper is bypassed for the bf16 3D path in-serve.
 """
 import sysconfig
