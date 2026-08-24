@@ -117,6 +117,43 @@ band). The native path is **bit-identical to emulation** -- the activation quant
 way -- so it is a speed change with no quality dimension: measured on gate_up 17408x5120, **6.1x at M=16,
 4.7x at M=32, 2.5x at M=64**.
 
+### Known: one gated-delta-net head emits NaN on 0.7.4
+
+On this checkpoint, the input to the 64 `N=5120, K=3072` linears (gated-delta-net `out_proj`,
+attention `o_proj`) contains NaN on **one TP rank**, on an otherwise healthy and coherent serve.
+The count is exactly `M x 128` -- 512 at M=4, 640 at M=5, 2176 at M=17 -- i.e. one whole head of
+the gated-delta-net value path (`head_v` is 128; attention's `head_dim` is 256, so this is not
+attention). It is consistent across every M measured.
+
+This did not happen on 0.5.8, which served the same layers with the same kernel.
+
+It matters because the two MXFP4 activation paths react to it differently. aiter quantizes
+activations to mxfp4, where NaN squashes to a finite code and the damage is contained. The W4A8
+path quantizes to **per-token fp8**, where one NaN makes the row's amax NaN, hence the row scale
+NaN, hence the entire row NaN -- which then propagates through the residual stream and destroys
+the model. `RADIANCE_MXFP4_SANITIZE` (default `1`) zeroes non-finite activations before
+quantizing, which is what makes the W4A8 path usable at all here.
+
+Cost, WikiText-2, 300 chunks x 3000 chars, 208,539 tokens:
+
+| build | PPL | top-1 |
+|---|---|---|
+| 0.5.8 MXFP4 W4A8 (no NaN present) | 8.3335 | 54.18% |
+| 0.7.4, all 304 layers on our kernel + sanitize | **8.4004** | 54.02% |
+| 0.7.4, those 64 layers on aiter instead | 8.4977 | 53.80% |
+
+So sanitizing is the best available handling, not the cause: it is 1.14% better than letting aiter
+serve those layers. The residual +0.80% against 0.5.8 is the NaN itself.
+
+Attribution so far: **not** the W4A8 kernel (verified against exact fp32 across every M, both tile
+paths, N on and off a 64 multiple, exponent spreads to d=60, no out-of-bounds writes, every output
+element written, bit-identical replay of live operands -- and 37x more accurate than aiter at that
+shape, 0.0014 vs 0.053). **Not** R4D attention (8.4048 with AITER attention, unchanged), so the
++47.8% long-context prefill costs nothing in quality. The remaining candidate is the R4D
+gated-delta-net path, which cannot be A/B'd here: `RADIANCE_USE_R4D=0` sends the prefill scan back
+to FLA Triton, which tries to allocate 128 GiB regardless of `--max-num-batched-tokens` or
+`--max-model-len` -- precisely the failure R4D exists to avoid.
+
 **`RADIANCE_MXFP4_MAX_M` is retired** (it was read up to 0.5.8). It handed big batches back to emulation as
 a throughput win on paper; in practice quark's TileLang backend cannot initialise inside a vLLM worker, and
 the branch was specialised into the compile graph during the `max-num-batched-tokens` profile run -- so it

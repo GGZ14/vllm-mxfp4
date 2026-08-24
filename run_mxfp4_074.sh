@@ -91,6 +91,9 @@ GPU_UTIL=${GPU_UTIL:-0.97}
 # themselves. Prefill is unaffected within run-to-run noise. The 0.5.8 baseline also ran 4, so
 # this keeps the comparison honest as well as fast.
 SPEC=${SPEC:-4}
+# Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
+# not against the chunk size, and OOMs at 262144.
+MAXLEN=${MAXLEN:-262144}
 # Batch size above which the W4A8 fp8-WMMA kernel takes over from aiter's W4A4 Triton path.
 # DEFAULT 0 = never fall back; our kernel serves every M.
 #
@@ -154,6 +157,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
   -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-1}" \
+  -e RADIANCE_GDN_PATHS="${RADIANCE_GDN_PATHS:-both}" \
   -e RADIANCE_MXFP4_KERNEL_N="${RADIANCE_MXFP4_KERNEL_N:-}" \
   -e RADIANCE_MXFP4_KERNEL_NK="${RADIANCE_MXFP4_KERNEL_NK:-}" \
   -e RADIANCE_MXFP4_CHECKALL="${RADIANCE_MXFP4_CHECKALL:-}" \
@@ -189,7 +193,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     "$CSNAP" --served-model-name Qwen3.8 Qwen3.6 Qwen3.8-MXFP4 --host 0.0.0.0 --port "$PORT" \
     --kv-cache-dtype fp8 --tensor-parallel-size 2 \
     --gpu-memory-utilization "$GPU_UTIL" \
-    --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
+    --max-model-len "$MAXLEN" --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":true}" \
     --no-async-scheduling $EXTRA \
