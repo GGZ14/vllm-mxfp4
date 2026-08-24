@@ -145,12 +145,13 @@ Cost, WikiText-2, 300 chunks x 3000 chars, 208,539 tokens:
 So sanitizing is the best available handling, not the cause: it is 1.14% better than letting aiter
 serve those layers. The residual +0.80% against 0.5.8 is the NaN itself.
 
-Attribution so far: **not** the W4A8 kernel (verified against exact fp32 across every M, both tile
+Attribution is complete by elimination. **Not** the W4A8 kernel (verified against exact fp32 across every M, both tile
 paths, N on and off a 64 multiple, exponent spreads to d=60, no out-of-bounds writes, every output
 element written, bit-identical replay of live operands -- and 37x more accurate than aiter at that
 shape, 0.0014 vs 0.053). **Not** R4D attention (8.4048 with AITER attention, unchanged), so the
-+47.8% long-context prefill costs nothing in quality. The remaining candidate is the R4D
-gated-delta-net path, which cannot be A/B'd here: `RADIANCE_USE_R4D=0` sends the prefill scan back
++47.7% long-context prefill costs nothing in quality. **Not** the rotated 6-bit all-reduce
+(8.3975 with the exact bf16 payload, a 0.03% difference that matches the historical fp8-vs-exact
+all-reduce spread). That leaves the R4D gated-delta-net path, which cannot be A/B'd here: `RADIANCE_USE_R4D=0` sends the prefill scan back
 to FLA Triton, which tries to allocate 128 GiB regardless of `--max-num-batched-tokens` or
 `--max-model-len` -- precisely the failure R4D exists to avoid.
 
