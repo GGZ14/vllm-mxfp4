@@ -87,7 +87,11 @@ SHADOW_NK = tuple(int(v) for v in _sh.split(":")) if _sh else None
 # That is why the kernel always verified correct and the model was still garbage: the GEMM was
 # faithfully computing on a poisoned row. Zeroing non-finite inputs matches what the mxfp4 path
 # effectively does, and the model is coherent under aiter with the same NaN present.
-SANITIZE_X = os.environ.get("RADIANCE_MXFP4_SANITIZE", "1") == "1"
+# Default OFF since the libr4d GDN overflows are fixed at source (see README). Kept as a safety
+# net for a stock r4d.so, where it is the difference between PPL 8.4004 and 653586 -- but with the
+# patched library it is a pure elementwise cost, and measured quality is BETTER without it
+# (8.3706 fixed/no-sanitize vs 8.4004 stock/sanitize).
+SANITIZE_X = os.environ.get("RADIANCE_MXFP4_SANITIZE", "0") == "1"
 # Diagnostic: report the INPUT activation's health per layer. The exact-reference check derives its
 # reference from x itself, so it cannot tell a correct kernel on corrupt input from a correct one.
 CHECK_X = os.environ.get("RADIANCE_MXFP4_CHECKX", "0") == "1"

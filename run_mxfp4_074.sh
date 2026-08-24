@@ -94,6 +94,9 @@ SPEC=${SPEC:-4}
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
+# Patched libr4d (three GDN exponent-overflow guards). Stock 0.7.4 NaNs the gated-delta-net
+# output on this model; see README. Set R4D_SO= to fall back to the image's stock r4d.so.
+R4D_SO=${R4D_SO:-/home/brian/libr4d-fix}
 # Batch size above which the W4A8 fp8-WMMA kernel takes over from aiter's W4A4 Triton path.
 # DEFAULT 0 = never fall back; our kernel serves every M.
 #
@@ -156,8 +159,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
-  -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-1}" \
+  -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-0}" \
   -e RADIANCE_GDN_PATHS="${RADIANCE_GDN_PATHS:-both}" \
+  -e RADIANCE_GDN_NANTRACE="${RADIANCE_GDN_NANTRACE:-0}" \
   -e RADIANCE_MXFP4_KERNEL_N="${RADIANCE_MXFP4_KERNEL_N:-}" \
   -e RADIANCE_MXFP4_KERNEL_NK="${RADIANCE_MXFP4_KERNEL_NK:-}" \
   -e RADIANCE_MXFP4_CHECKALL="${RADIANCE_MXFP4_CHECKALL:-}" \
@@ -169,6 +173,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -v /home/brian/models:/models \
   -v "$CACHE":/cache \
   -v /home/brian/deadcode-vllm:/patches:z \
+  ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
+  ${R4D_SO:+-e R4D_SO="$R4D_SO"} \
   --entrypoint bash \
   "$IMAGE" -lc '
     set -e
@@ -180,9 +186,15 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-    cp radiance_mxfp4.py "$SP"/
+    cp radiance_mxfp4.py radiance_gdn.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
+    # Optional patched libr4d. R4D_SO points at an r4d.so built from a local libr4d checkout;
+    # the Dockerfile supports the same substitution through R4D_REPO / R4D_VERSION.
+    if [ -n "${R4D_SO:-}" ] && [ -f /r4d/r4d.so ]; then
+      cp /r4d/r4d.so "$SP"/r4d.so
+      echo "[radiance] using patched r4d.so from $R4D_SO"
+    fi
     # Leave /patches before exec. It is a bind mount of the repo, and a stale
     # radiance_mxfp4_fp8.so left there by a `make` shadows the one just compiled into
     # site-packages, because the working directory precedes it on sys.path. That is not a

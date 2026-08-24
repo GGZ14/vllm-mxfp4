@@ -177,6 +177,26 @@ PATHS = os.environ.get("RADIANCE_GDN_PATHS", "both")
 # norm+quant with this norm plus a separate quant would be a regression dressed as a win.
 NORM_FUSE = ALL and os.environ.get("RADIANCE_GDN_NORM", "0") == "1"
 CHECK = os.environ.get("RADIANCE_GDN_CHECK", "0") == "1"
+# Locate the first PREFILL kernel to emit a non-finite value. CHECK above only covers decode, and
+# the NaN this fork sees (exactly one head_v-wide head, one TP rank) appears during prefill.
+NANTRACE = os.environ.get("RADIANCE_GDN_NANTRACE", "0") == "1"
+_nan_seen = set()
+
+
+def _nt(tag, **tensors):
+    if not NANTRACE:
+        return
+    for name, t in tensors.items():
+        if t is None or not torch.is_tensor(t) or not t.is_floating_point():
+            continue
+        n = int((~torch.isfinite(t)).sum().item())
+        if n and (tag, name) not in _nan_seen:
+            _nan_seen.add((tag, name))
+            flat = (~torch.isfinite(t)).reshape(t.shape[0], -1) if t.dim() > 1 else None
+            cols = int(flat.any(0).sum().item()) if flat is not None else -1
+            sys.stderr.write(f"[radiance.gdn.nan] {tag}: {name} shape={tuple(t.shape)} "
+                             f"nonfinite={n} bad_cols={cols}\n")
+            sys.stderr.flush()
 SOFTPLUS_THRESHOLD = 20.0          # FLA's, and the value both kernels are validated against
 _fallbacks = {}
 _seen = set()
@@ -517,7 +537,11 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         mixed_qkv, conv_w, self.conv1d.bias, conv_state,
         md.non_spec_state_indices_tensor, md.has_initial_state, a, b,
         A_log, dt_bias, cu, nseq, tp, H, Hg)
+    _nt("conv_prep.out", q=q, k=k, v=v, g=g, beta=beta)
+    _nt("conv_prep.in", mixed_qkv=mixed_qkv, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+        conv_w=conv_w, conv_state=conv_state)
     A = kkt_solve(k, beta, g, cu, nseq, tp, H, Hg)
+    _nt("kkt_solve.out", A=A)
     initial_state = ssm_state[md.prefill_state_indices]
     initial_state[~md.prefill_has_initial_state, ...] = 0
     o_buf = (core_attn_out[:tp].view(1, tp, H, HEAD_V) if spec_o is None
@@ -528,6 +552,9 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
                         True, cu, None, out=o_buf)
     if out is None:
         raise RuntimeError("radiance_gdn: chunk_scan declined a shape the preamble accepted")
+    _nt("chunk_scan.in", initial_state=initial_state)
+    _nt("chunk_scan.out", o=out[0] if isinstance(out, (tuple, list)) else out,
+        final_state=out[1] if isinstance(out, (tuple, list)) else None)
     ssm_state[md.prefill_state_indices] = out[1].to(ssm_state.dtype)
     if spec_o is not None:
         dst = core_attn_out[:T]
