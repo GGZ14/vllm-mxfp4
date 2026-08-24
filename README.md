@@ -125,13 +125,22 @@ way -- so it is a speed change with no quality dimension: measured on gate_up 17
 #    pins that tag -- so the SHIPPED r4d.so predates the fix. Until deadcode cuts a new tag and
 #    an image that pins it, build from main.
 git clone https://codeberg.org/StillDeadcode/libr4d.git
-cd libr4d && make IMAGE=stilldeadcode/vllm-radiance:0.7.4   # -> libr4d/r4d.so
+cd libr4d
+#    Build inside the image the .so is loaded from -- the extension must be compiled with the
+#    same ROCm/hipcc it links against at runtime. libr4d's own `make IMAGE=...` does this too,
+#    but it shells out to `docker` with no SELinux label, so on a podman or SELinux-enforcing
+#    host invoke the container directly:
+podman run --rm --entrypoint bash -v "$PWD":/work:z -w /work \
+  stilldeadcode/vllm-radiance:0.7.4 -c ./build.sh            # -> libr4d/r4d.so
 cd ..
 
 # 2. Serve. R4D_SO copies that r4d.so over the image's at container start, and this repo's
 #    patches are applied in the same prelude, so no image rebuild is needed.
 R4D_SO=$PWD/libr4d MODELS=$HOME/models ./run_mxfp4_074.sh
 ```
+
+Verified reproducible: a fresh clone of libr4d main built this way produces an `r4d.so` that is
+byte-identical (sha256 `3026297b...`) to the one every number below was measured with.
 
 Skipping step 1 leaves you on the stock kernel, where the W4A8 path is unusable: WikiText-2
 perplexity 653586 against 8.3706. If you must run stock, set `RADIANCE_MXFP4_SANITIZE=1`, which

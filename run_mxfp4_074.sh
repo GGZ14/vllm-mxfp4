@@ -207,8 +207,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     cp radiance_mxfp4.py radiance_gdn.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
-    # Optional patched libr4d. R4D_SO points at an r4d.so built from a local libr4d checkout;
-    # the Dockerfile supports the same substitution through R4D_REPO / R4D_VERSION.
+    # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
+    # it is bind-mounted at /r4d and its r4d.so replaces the one in the image. For an image
+    # rebuild, the Dockerfile supports the same substitution through R4D_REPO / R4D_VERSION.
     if [ -n "${R4D_SO:-}" ] && [ -f /r4d/r4d.so ]; then
       cp /r4d/r4d.so "$SP"/r4d.so
       echo "[radiance] using patched r4d.so from $R4D_SO"
