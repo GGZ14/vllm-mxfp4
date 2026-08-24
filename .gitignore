@@ -5,11 +5,13 @@ __pycache__/
 .env
 models/
 vllm-cache/
-# build outputs: the image compiles its own kernels from the .hip sources, and
+# build outputs: the kernel library is cloned and compiled by the image build, and
 # rocm-bandwidth-test is built in the Dockerfile. A stale local copy must never be
 # mistaken for what the image ships.
 *.so
 rocm-bandwidth-test
+# `make r4d` clones the pinned libr4d tag here for local development.
+libr4d/
 
 # editor / os
 *.swp

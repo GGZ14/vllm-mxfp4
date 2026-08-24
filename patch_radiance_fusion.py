@@ -2,7 +2,7 @@
 """Install the RADIANCE rms_norm + group-fp8-quant fusion coverage fix (gfx1201).
 
 vLLM's RocmAiterRMSNormQuantFusionPass registers the *group* rms+quant patterns
-with only the aiter-quant matcher (match_aiter_quant=True). On gfx1201 our graph
+with only the aiter-quant matcher (match_aiter_quant=True). On gfx1201 the graph
 emits torch.ops._C.per_token_group_fp8_quant (the NATIVE quant op), so the aiter
 matcher matches 0 patterns and the standalone bf16->fp8 group-quant kernels are
 never folded into the rms epilogue. This registers the native (match_aiter_quant
@@ -39,7 +39,7 @@ ANCHOR = (
 
 NEW = (
     "            # --- RADIANCE: rms_norm(+fused_add) + group fp8 quant coverage fix ---\n"
-    "            # Stock registers only the aiter-quant matcher; on gfx1201 our graph\n"
+    "            # Stock registers only the aiter-quant matcher; on gfx1201 the graph\n"
     "            # emits torch.ops._C.per_token_group_fp8_quant (native), so that matches\n"
     "            # 0. Register the native (match_aiter_quant=False) variant too, reusing\n"
     "            # the same is_quant_fp8_enabled duplicate-pattern guard vLLM applies to\n"
