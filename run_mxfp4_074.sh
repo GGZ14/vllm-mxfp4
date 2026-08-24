@@ -105,31 +105,14 @@ SPEC=${SPEC:-4}
 # Set it absurdly high to route everything to aiter -- only useful for bisecting.
 MIN_M=${MIN_M:-16}
 
-# KNOWN GAP -- the one unresolved defect in this port.
+# All 304 linear layers run on the W4A8 kernel. RADIANCE_MXFP4_KERNEL_NK / _PERBLOCK_NK remain as
+# shape-level bisect tools (N:K pairs) but are unset by default.
 #
-# The 64 layers with N=5120, K=3072 (gated-delta-net out_proj and attention o_proj) produce a
-# broken model when served by our kernel, so they are handed to aiter here. Everything else --
-# 240 of 304 layers -- runs on the W4A8 fp8-WMMA kernel.
-#
-# What is established about it, so nobody re-treads this:
-#   * the kernel is NOT wrong. Verified against an exact fp32 reference at that shape for M in
-#     {1..8192}, both the folded and per-block paths, N values that are and are not multiples of
-#     64, exponent spreads to d=60; zero out-of-bounds writes on either side of `out`; every
-#     element of `out` written (NaN-sentinel test); and a bit-identical replay of operands
-#     captured from a live serve.
-#   * it is not ordering: neither a stream sync nor a device-wide sync after the launch fixes it.
-#   * it is not output-buffer lifetime: returning out.clone() does not fix it.
-#   * it is not the all-reduce payload, the compile mode, CUDA graphs, the compile cache, or
-#     nesting scaled_fp8_quant inside the custom op.
-#   * the ONLY thing that makes it coherent is perturbing the allocator (computing a large
-#     reference tensor per call), which points at an interaction with surrounding memory rather
-#     than at the arithmetic.
-#   * aiter serves that shape correctly. An earlier conclusion that aiter was broken there was an
-#     artifact of sampling an activation that already contained NaN.
-#
-# Set RADIANCE_MXFP4_KERNEL_NK= (empty) to put all 304 layers on our kernel and reproduce it.
-: "${RADIANCE_MXFP4_KERNEL_NK:=17408:5120,5120:8704,8192:5120,7168:5120,48:5120}"
-export RADIANCE_MXFP4_KERNEL_NK
+# They existed because the 64 layers at N=5120 K=3072 (gdn out_proj, attention o_proj) produced a
+# broken model, which turned out NOT to be a kernel bug: those layers legitimately receive NaN in
+# their activations -- one whole gated-delta-net head -- and per-token fp8 quantization turns a
+# single NaN into a NaN row scale, poisoning the row. aiter tolerated the same input only because
+# mxfp4 quantization squashes NaN to a finite code. RADIANCE_MXFP4_SANITIZE (default 1) fixes it.
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
 
@@ -167,6 +150,10 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_PUREQUANT="${RADIANCE_MXFP4_PUREQUANT:-0}" \
   -e RADIANCE_MXFP4_SYNC="${RADIANCE_MXFP4_SYNC:-0}" \
   -e RADIANCE_MXFP4_CLONE="${RADIANCE_MXFP4_CLONE:-0}" -e RADIANCE_MXFP4_CHECKX="${RADIANCE_MXFP4_CHECKX:-0}" \
+  -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
+  -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
+  -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
+  -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-1}" \
   -e RADIANCE_MXFP4_KERNEL_N="${RADIANCE_MXFP4_KERNEL_N:-}" \
   -e RADIANCE_MXFP4_KERNEL_NK="${RADIANCE_MXFP4_KERNEL_NK:-}" \
   -e RADIANCE_MXFP4_CHECKALL="${RADIANCE_MXFP4_CHECKALL:-}" \

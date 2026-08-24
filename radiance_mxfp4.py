@@ -62,6 +62,32 @@ FORCE_DEVSYNC = _fs == "2"       # synchronize the whole device -- if this diffe
 # allocated by torch.empty INSIDE the custom op; if returning that buffer is what breaks (lifetime,
 # aliasing, or the allocator reusing it), a clone will be coherent where the original is not.
 CLONE_OUT = os.environ.get("RADIANCE_MXFP4_CLONE", "0") == "1"
+# Allocate `out` inside a padded slab so nothing live sits immediately before or after it. The one
+# thing that makes the N=5120 K=3072 layers coherent is perturbing the allocator, which points at
+# memory adjacency rather than at the arithmetic (the kernel verifies correct against exact fp32,
+# writes every element, and writes nothing out of bounds). If padding fixes it, that is both the
+# diagnosis and the fix. Value is in bf16 elements per side.
+PAD_OUT = int(os.environ.get("RADIANCE_MXFP4_PADOUT", "0"))
+# Shadow check: for one N:K that is being served by AITER (so the model stays healthy and the
+# activations are CLEAN), also compute the layer with our kernel and compare both against exact
+# fp32. Every previous in-situ comparison was made on an activation that already held NaN, so it
+# could not distinguish "our kernel is wrong" from "our kernel faithfully computed on garbage".
+_sh = os.environ.get("RADIANCE_MXFP4_SHADOW", "").strip()
+SHADOW_NK = tuple(int(v) for v in _sh.split(":")) if _sh else None
+# Sanitize non-finite activations before quantizing. NOT optional -- this is the fix for the
+# N=5120 K=3072 layers (gdn out_proj / attention o_proj).
+#
+# Those layers legitimately receive NaN in their input: measured on a HEALTHY, coherent serve,
+# one rank's out_proj input carries 2176 non-finite values at M=17, which is exactly 17 rows x 128
+# columns -- one whole gated-delta-net head. aiter tolerates it because it quantizes activations to
+# mxfp4, and NaN squashes to a finite code. Our path quantizes to per-token fp8, where a single NaN
+# makes the row's amax NaN, hence the scale NaN, hence the entire row NaN -- which then propagates
+# through the residual stream and destroys the model.
+#
+# That is why the kernel always verified correct and the model was still garbage: the GEMM was
+# faithfully computing on a poisoned row. Zeroing non-finite inputs matches what the mxfp4 path
+# effectively does, and the model is coherent under aiter with the same NaN present.
+SANITIZE_X = os.environ.get("RADIANCE_MXFP4_SANITIZE", "1") == "1"
 # Diagnostic: report the INPUT activation's health per layer. The exact-reference check derives its
 # reference from x itself, so it cannot tell a correct kernel on corrupt input from a correct one.
 CHECK_X = os.environ.get("RADIANCE_MXFP4_CHECKX", "0") == "1"
@@ -204,10 +230,48 @@ def mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tens
                              f"N={weight.shape[0]}, w4a8_ok={w4a8_ok})\n")
         # MIN_M <= 0 makes this unreachable: aiter's W4A4 path is measured WRONG on some shapes
         # (N=5120 K=3072 returns ~1/35th of the correct magnitude), so it is not a safe fallback.
-        return torch.ops.vllm.gemm_with_dynamic_quant(x, weight, weight_scale, False,
-                                                      torch.bfloat16)
+        y_aiter = torch.ops.vllm.gemm_with_dynamic_quant(x, weight, weight_scale, False,
+                                                         torch.bfloat16)
+        if SHADOW_NK is not None and (int(weight.shape[0]), int(x.shape[1])) == SHADOW_NK \
+                and x.shape[0] <= 128:
+            k = (int(weight.shape[0]), int(x.shape[1]), int(x.shape[0]))
+            # Skip CUDA-graph capture entirely: those runs use zero activations (where every
+            # kernel trivially agrees, wasting the dedup budget) and, more importantly, ANY .item()
+            # here is a device sync, which is illegal during capture and kills the engine.
+            _capturing = torch.cuda.is_current_stream_capturing()
+            if not _capturing and k not in _dbg_seen and len(_dbg_seen) < 24:
+                if float(x.abs().max().item()) == 0.0:
+                    return y_aiter          # warmup on zeros: nothing to learn
+                _dbg_seen.add(k)
+                try:
+                    from vllm import _custom_ops as _ops
+                    _M, _K = x.shape
+                    _N = weight.shape[0]
+                    _xq, _xs = _ops.scaled_fp8_quant(x, scale=None, use_per_token_if_dynamic=True)
+                    _xs = _xs.view(-1).float().contiguous()
+                    _wref = make_row_ref(weight_scale)           # folded path needs it live
+                    _o = torch.empty((_M, _N), device=x.device, dtype=torch.bfloat16)
+                    _ext.launch(_xq.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(),
+                                _wref.data_ptr(), _xs.data_ptr(), _o.data_ptr(),
+                                _M, _N, _K, torch.cuda.current_stream().cuda_stream)
+                    _ref = _exact_ref(_xq, _xs, weight, weight_scale, _N, _K)
+                    _ro = ((_o.float() - _ref).norm() / _ref.norm().clamp_min(1e-9)).item()
+                    _ra = ((y_aiter.float() - _ref).norm() / _ref.norm().clamp_min(1e-9)).item()
+                    _xf = x.float()
+                    sys.stderr.write(
+                        f"[radiance.mxfp4.shadow] N={_N} K={_K} M={_M} "
+                        f"ours_vs_fp32={_ro:.5f} aiter_vs_fp32={_ra:.5f} "
+                        f"x_nonfin={(~torch.isfinite(_xf)).sum().item()} "
+                        f"|x|={_xf.abs().mean().item():.5f} "
+                        f"{'**OURS WRONG**' if _ro > 0.02 else 'ours ok'}\n")
+                    sys.stderr.flush()
+                except Exception as _e:
+                    sys.stderr.write(f"[radiance.mxfp4.shadow] failed: {_e!r}\n")
+        return y_aiter
     M, K = x.shape
     N = weight.shape[0]
+    if SANITIZE_X:
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     if PURE_QUANT:
         # Pure-torch per-token e4m3 quantization, no vLLM custom op. Diagnostic only: this exists
         # to answer whether calling torch.ops._C.dynamic_scaled_fp8_quant from INSIDE another
@@ -220,7 +284,11 @@ def mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tens
         from vllm import _custom_ops as ops
         x_fp8, x_scale = ops.scaled_fp8_quant(x, scale=None, use_per_token_if_dynamic=True)
         x_scale = x_scale.view(-1).float().contiguous()
-    out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    if PAD_OUT:
+        _slab = torch.empty(M * N + 2 * PAD_OUT, device=x.device, dtype=torch.bfloat16)
+        out = _slab[PAD_OUT:PAD_OUT + M * N].view(M, N)   # view keeps the slab alive
+    else:
+        out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
     _ext.launch(x_fp8.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(),
                 weight_ref.data_ptr() if folded else 0,
                 x_scale.data_ptr(), out.data_ptr(), M, N, K,
