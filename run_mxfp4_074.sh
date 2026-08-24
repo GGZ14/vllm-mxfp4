@@ -47,7 +47,17 @@
 #                      drafter is FP8 and vLLM may be sharing the target's head, in which case
 #                      that bf16 copy -- and the exactness guarantee -- is not what it assumes.
 #
-# Port 8080 is prod's and this needs both GPUs at 0.97, so stop production first:
+# NUMERICS REFERENCE (~/pibench-local/results/ppl/, WikiText-2, --chunks 300 --chars 3000,
+# 208,539 tokens). Reproduce with GPU_UTIL=0.75 and `python3 ~/pibench-local/ppl.py --model
+# Qwen3.8-MXFP4 --tag <tag>`:
+#     8.3317  MXFP4 W4A8, exact bf16 all-reduce
+#     8.3335  MXFP4 W4A8, fp8 all-reduce   <- what 0.5.8 shipped
+#     8.3386  MXFP4 W4A4 (no W4A8), fp8 all-reduce
+# The 6-bit rotated payload replaces the fp8 one and is claimed slightly more accurate, so a
+# healthy 0.7.4 lands at or just under 8.3335. A jump well past it means the rewritten weight-prep
+# path is wrong, not that the all-reduce changed -- the whole AR spread is only 0.02%.
+#
+# Port 8080 is prod's and this needs both GPUs, so stop production first:
 #   systemctl --user stop qwen_vllm_38          restore with: vllm-switch 38
 #
 # WHAT TO CHECK IN THE LOG
@@ -66,6 +76,10 @@ CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-0}
 FAST_DRAFT=${FAST_DRAFT:-0}
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-074}
+# prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
+# for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
+# GPU_UTIL=0.75 for perplexity work, 0.97 for throughput.
+GPU_UTIL=${GPU_UTIL:-0.97}
 
 SNAP="$HOME/models/Qwen3.8-27B-MXFP4-mtpfp8"
 [ -f "$SNAP/config.json" ] || { echo "no checkpoint at $SNAP" >&2; exit 1; }
@@ -81,7 +95,7 @@ if [ "$R4D_ATTN" = "1" ]; then ATTN=R4D; else ATTN=ROCM_AITER_UNIFIED_ATTN; fi
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
-echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT cache=$CACHE"
+echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT util=$GPU_UTIL cache=$CACHE"
 
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
@@ -120,7 +134,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     exec /opt/radiance_entrypoint.sh "$@"' _ \
     "$CSNAP" --served-model-name Qwen3.8 Qwen3.6 Qwen3.8-MXFP4 --host 0.0.0.0 --port "$PORT" \
     --kv-cache-dtype fp8 --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.97 \
+    --gpu-memory-utilization "$GPU_UTIL" \
     --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":8,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":true}" \
