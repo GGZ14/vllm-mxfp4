@@ -91,8 +91,12 @@ FAST_DRAFT=${FAST_DRAFT:-1}
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-074}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
-# GPU_UTIL=0.75 for perplexity work, 0.97 for throughput.
-GPU_UTIL=${GPU_UTIL:-0.97}
+# GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
+# 0.98 is the ceiling on this box, not a guess: the card has 32624 MiB, and vLLM measures free
+# memory AFTER its own HIP context and torch init exist, so it sees 31980 MiB. 0.99 asks for
+# 31.54 GiB and fails at startup. 0.98 gives 857,399 KV tokens against 840,019 at 0.97 and
+# survives a full 260k-prefill sweep with no OOM.
+GPU_UTIL=${GPU_UTIL:-0.98}
 # MTP speculative depth. Measured on this build, 4 beats 8 at decode -- 59.8/60.2 tok/s against
 # 53.1/58.6, because acceptance falls (42.1% -> 33.7%) faster than the deeper drafts pay for
 # themselves. Prefill is unaffected within run-to-run noise. The 0.5.8 baseline also ran 4, so
@@ -103,7 +107,11 @@ SPEC=${SPEC:-4}
 MAXLEN=${MAXLEN:-262144}
 # Patched libr4d (three GDN exponent-overflow guards). Stock 0.7.4 NaNs the gated-delta-net
 # output on this model; see README. Set R4D_SO= to fall back to the image's stock r4d.so.
-R4D_SO=${R4D_SO:-/home/brian/libr4d-fix}
+# Point this at a libr4d checkout carrying libr4d-gdn-overflow-guards.patch, built with
+# ./build.sh (its r4d.so is copied over the image's at container start). STRONGLY RECOMMENDED:
+# stock 0.7.4 NaNs the gated-delta-net output on this model -- WikiText-2 PPL 653586 vs 8.3706.
+# Leave empty to use the image's stock r4d.so, in which case set RADIANCE_MXFP4_SANITIZE=1.
+R4D_SO=${R4D_SO:-}
 # Batch size above which the W4A8 fp8-WMMA kernel takes over from aiter's W4A4 Triton path.
 # DEFAULT 0 = never fall back; our kernel serves every M.
 #
@@ -129,7 +137,7 @@ MIN_M=${MIN_M:-16}
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
 
-SNAP="$HOME/models/Qwen3.8-27B-MXFP4-mtpfp8"
+SNAP="${SNAP:-$HOME/models/Qwen3.8-27B-MXFP4-mtpfp8}"
 [ -f "$SNAP/config.json" ] || { echo "no checkpoint at $SNAP" >&2; exit 1; }
 # HF_HUB_OFFLINE=1 inside the container and the cache mounts at /root/.cache/huggingface, so vllm
 # must be handed the CONTAINER path -- a host path fails HF repo-id validation, not "not found".
@@ -176,10 +184,10 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_REFLINEAR="${RADIANCE_MXFP4_REFLINEAR:-0}" \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor -e TRITON_CACHE_DIR=/cache/triton \
   -e AITER_ROOT_DIR=/cache/aiter -e TRITON_CACHE_AUTOTUNING=1 \
-  -v /home/brian/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/brian/models:/models \
+  -v "${HF_CACHE:-$HOME/.cache/huggingface}":/root/.cache/huggingface \
+  -v "${MODELS:-$HOME/models}":/models \
   -v "$CACHE":/cache \
-  -v /home/brian/deadcode-vllm:/patches:z \
+  -v "${PATCHES:-$(cd "$(dirname "$0")" \&\& pwd)}":/patches:z \
   ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
   ${R4D_SO:+-e R4D_SO="$R4D_SO"} \
   --entrypoint bash \

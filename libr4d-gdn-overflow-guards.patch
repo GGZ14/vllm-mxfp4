@@ -1,0 +1,111 @@
+From 2739650ddd16e94d4ae69a3dbd476a292330cf66 Mon Sep 17 00:00:00 2001
+From: Brian <brian@localhost.localdomain>
+Date: Mon, 24 Aug 2026 08:32:32 -0500
+Subject: [PATCH] gdn: guard three exponent overflows on inactive lanes and
+ split-form halves
+
+Found serving Qwen3.8-27B (TP2, gfx1201) on vllm-radiance 0.7.4. Each one turns
+into 0 * INF = NaN, and the gated-delta-net output carries it into one whole
+head_v-wide head of the layer, which destroys the model.
+
+1. kkt_solve, padding rows. `gi` is forced to 0 for i >= rows while gb[j] keeps
+   its real negative cumsum, so d = gi - gb[j] = -gb[j] is large POSITIVE and
+   __expf overflows -- the opposite of the "never positive" invariant the code
+   comments assert, which holds only for live rows. The NaNs land in padding
+   rows of the 64x64 tile, and the blocked inverse merges the whole tile with
+   WMMA, so they reach live rows. Adding `live &&` to the guard takes A from 16
+   non-finite values to 0.
+
+2. chunk_scan, split-form halves. e^{g_i-c}.e^{c-g_j} with cref at the chunk
+   midpoint gives each half +/-(gate span)/2, so a span past ~176 sends one half
+   to +INF while the other underflows to 0. kkt_solve's own header documents
+   this hazard as its reason for using the direct form; chunk_scan kept the
+   split form without a guard.
+
+3. chunk_scan, V' staging (the dominant one, and only visible across chunks).
+   The binding limit is not fp32: V' = V.gv[t] is staged in bf16, so gv must
+   leave room for V under bf16's 3.4e38 ceiling. Clamping at e^88 is still too
+   generous and NaNs; e^80 leaves ~3x margin.
+
+The product is always safe -- rs[i].gv[j] = scale.e^{g_i-g_j} and the per-token
+state weight gv[t].lam = e^{gl-g_t} are both <= 1 under the tril mask -- so
+saturating the growing half keeps the shrinking one at 0 and the product
+evaluates to 0, which is correct: e^{g_i-g_j} really is negligible whenever a
+half leaves range. Ordinary chunks are untouched.
+
+WikiText-2, 208,539 tokens, no other mitigation:
+
+  stock                653586.39   top-1  0.00%
+  fixed, clamp 70           8.3841       54.068%
+  fixed, clamp 80           8.3706       54.119%
+  fixed, clamp 83           8.3728       54.093%
+  0.5.8 reference (no NaN)  8.3335       54.18%
+
+The clamp bounds the damage rather than removing the cause. The clean fix is to
+stop splitting a per-token weight that is provably <= 1 into a huge x tiny pair:
+stage V' in fp32, or scale by e^{gl-g_t} directly on the state path.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip | 22 ++++++++++++++++++++--
+ r4d_gdn_kkt_solve_k128_c64_bf16.hip       | 11 +++++++++--
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip b/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
+index 1835fba..e18d5d8 100644
+--- a/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
++++ b/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
+@@ -467,8 +467,26 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
+       bool ok = tid < nval;
+       s.bt[tid] = btr;
+       s.ge[tid] = __expf(ggr);
+-      s.gv[tid] = ok ? __expf(cref - ggr) : 0.f;
+-      s.rs[tid] = ok ? scale * __expf(ggr - cref) : 0.f;
++      // The split form e^{g_i-c}.e^{c-g_j} is one exp per token instead of eight per tile, but
++      // each half can overflow on its own even where the PRODUCT cannot. The binding limit is not
++      // fp32: it is that V' = V.gv[t] is staged in bf16 (s.D), so gv must leave room for V and for
++      // the 128-term accumulation of V'^T @ K under bf16's 3.4e38 ceiling. e^70 = 2.5e30 leaves
++      // headroom against |V| and bf16's 3.4e38 ceiling; e^88 does not, which is why clamping
++      // there still produced NaN. 80 is measured, not assumed -- WikiText-2 PPL over 208,539
++      // tokens with no other mitigation: 70 -> 8.3841, 80 -> 8.3706, 83 -> 8.3728, stock -> 653586.
++      // Past 80 the marginal overflow costs more than the extra range recovers.
++      // Specifically: with cref at the chunk
++      // midpoint each half spans +/-(gate span)/2, so a span past ~176 sends one half to +INF
++      // while the other underflows to 0, and 0 * INF = NaN.
++      //
++      // The product is always safe -- rs[i].gv[j] = scale.e^{g_i-g_j}, and g decreases while the
++      // tril mask keeps only j <= i, so the exponent is never positive. Saturating the growing
++      // half just below fp32's overflow point keeps it finite, and the shrinking half still
++      // underflows to 0, so the product evaluates to 0 -- which is the correct answer, because
++      // e^{g_i-g_j} really is negligible whenever a half runs out of range. Where both halves fit
++      // (every ordinary chunk) nothing changes.
++      s.gv[tid] = ok ? __expf(fminf(cref - ggr, 80.0f)) : 0.f;
++      s.rs[tid] = ok ? scale * __expf(fminf(ggr - cref, 80.0f)) : 0.f;
+     }
+     BAR();                                                   // (1)
+ #if PFIN && PFV == 4
+diff --git a/r4d_gdn_kkt_solve_k128_c64_bf16.hip b/r4d_gdn_kkt_solve_k128_c64_bf16.hip
+index 4538f61..d259fbc 100644
+--- a/r4d_gdn_kkt_solve_k128_c64_bf16.hip
++++ b/r4d_gdn_kkt_solve_k128_c64_bf16.hip
+@@ -207,8 +207,15 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
+ #pragma unroll
+         for (int e = 0; e < 8; ++e) {
+           const int j = j0 + e;
+-          // i > j means g_i <= g_j, so this exponent is never positive whatever the span is
+-          const float d = (i > j && j < rows) ? (gi - s.gb[j]) : -INFINITY;
++          // i > j means g_i <= g_j, so this exponent is never positive whatever the span is --
++          // but ONLY for a live row. On a padding row (i >= rows) gi is forced to 0 above while
++          // gb[j] keeps its real, negative cumsum, so gi - gb[j] = -gb[j] is large POSITIVE,
++          // __expf overflows to +INF, and bi * INF = 0 * INF = NaN. Those NaNs sit in padding
++          // rows of the 64x64 tile, and the blocked inverse below merges the whole tile with
++          // WMMA, so they reach live rows and poison the chunk's output for the head.
++          // Measured on Qwen3.8-27B at TP2: 16 non-finite values in A, which chunk_scan then
++          // spreads to one entire head_v-wide head of the layer output.
++          const float d = (live && i > j && j < rows) ? (gi - s.gb[j]) : -INFINITY;
+           vv[e] = bi * __expf(d) * P[t][e];
+         }
+         *(uint2*)(&s.A[i][j0])     = f2bf4(vv[0], vv[1], vv[2], vv[3]);
+-- 
+2.54.0
+

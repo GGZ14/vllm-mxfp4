@@ -117,43 +117,78 @@ band). The native path is **bit-identical to emulation** -- the activation quant
 way -- so it is a speed change with no quality dimension: measured on gate_up 17408x5120, **6.1x at M=16,
 4.7x at M=32, 2.5x at M=64**.
 
-### Known: one gated-delta-net head emits NaN on 0.7.4
+### Running this build
 
-On this checkpoint, the input to the 64 `N=5120, K=3072` linears (gated-delta-net `out_proj`,
-attention `o_proj`) contains NaN on **one TP rank**, on an otherwise healthy and coherent serve.
-The count is exactly `M x 128` -- 512 at M=4, 640 at M=5, 2176 at M=17 -- i.e. one whole head of
-the gated-delta-net value path (`head_v` is 128; attention's `head_dim` is 256, so this is not
-attention). It is consistent across every M measured.
+```bash
+# 1. Build the patched libr4d. Stock 0.7.4 NaNs the gated-delta-net output on this model;
+#    see "The gated-delta-net NaN" below. This is not optional for MXFP4.
+git clone -b v0.4.0 https://codeberg.org/StillDeadcode/libr4d.git
+cd libr4d && git apply ../libr4d-gdn-overflow-guards.patch
+make IMAGE=stilldeadcode/vllm-radiance:0.7.4      # -> libr4d/r4d.so
+cd ..
 
-This did not happen on 0.5.8, which served the same layers with the same kernel.
+# 2. Serve. R4D_SO points at that checkout; the launcher copies its r4d.so over the image's
+#    and applies this repo's patches at container start, so no image rebuild is needed.
+R4D_SO=$PWD/libr4d MODELS=$HOME/models ./run_mxfp4_074.sh
+```
 
-It matters because the two MXFP4 activation paths react to it differently. aiter quantizes
-activations to mxfp4, where NaN squashes to a finite code and the damage is contained. The W4A8
-path quantizes to **per-token fp8**, where one NaN makes the row's amax NaN, hence the row scale
-NaN, hence the entire row NaN -- which then propagates through the residual stream and destroys
-the model. `RADIANCE_MXFP4_SANITIZE` (default `1`) zeroes non-finite activations before
-quantizing, which is what makes the W4A8 path usable at all here.
+Without the patched library, set `RADIANCE_MXFP4_SANITIZE=1` — the model then works, but a little
+slower and at PPL 8.4004 instead of 8.3706.
 
-Cost, WikiText-2, 300 chunks x 3000 chars, 208,539 tokens:
+Checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with the MTP
+drafter requantized to fp8 (`~/mxfp4_work/fp8_mtp.py`). The drafter must NOT be MXFP4 -- 4-bit
+costs more acceptance than it saves in bandwidth, and AWQ does not rescue it.
 
-| build | PPL | top-1 |
-|---|---|---|
-| 0.5.8 MXFP4 W4A8 (no NaN present) | 8.3335 | 54.18% |
-| 0.7.4, all 304 layers on our kernel + sanitize | **8.4004** | 54.02% |
-| 0.7.4, those 64 layers on aiter instead | 8.4977 | 53.80% |
+### Measured
 
-So sanitizing is the best available handling, not the cause: it is 1.14% better than letting aiter
-serve those layers. The residual +0.80% against 0.5.8 is the NaN itself.
+Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness, `SPEC=4`:
 
-Attribution is complete by elimination. **Not** the W4A8 kernel (verified against exact fp32 across every M, both tile
-paths, N on and off a 64 multiple, exponent spreads to d=60, no out-of-bounds writes, every output
-element written, bit-identical replay of live operands -- and 37x more accurate than aiter at that
-shape, 0.0014 vs 0.053). **Not** R4D attention (8.4048 with AITER attention, unchanged), so the
-+47.7% long-context prefill costs nothing in quality. **Not** the rotated 6-bit all-reduce
-(8.3975 with the exact bf16 payload, a 0.03% difference that matches the historical fp8-vs-exact
-all-reduce spread). That leaves the R4D gated-delta-net path, which cannot be A/B'd here: `RADIANCE_USE_R4D=0` sends the prefill scan back
-to FLA Triton, which tries to allocate 128 GiB regardless of `--max-num-batched-tokens` or
-`--max-model-len` -- precisely the failure R4D exists to avoid.
+| | 0.5.8 | 0.7.4 | |
+|---|---|---|---|
+| prefill 7.8k | 3873 | **4387** | +13.3% |
+| prefill 26k | 3445 | **4138** | +20.1% |
+| prefill 104k | 2310 | **3143** | +36.1% |
+| prefill 182k | 1736 | **2511** | +44.6% |
+| prefill 260k | 1393 | **2089** | +49.9% |
+| decode short / medium | 63.0 / 67.4 | **67.1 / 67.5** | +6.5% / +0.1% |
+| WikiText-2 PPL | 8.3335 | 8.3706 | +0.44% |
+
+KV cache 857,399 tokens at `GPU_UTIL=0.98`. All 304 linear layers run the W4A8 fp8-WMMA kernel;
+`aiter` is not used above `RADIANCE_MXFP4_W4A8_MIN_M`. The prefill gain scales with context
+because it is mostly R4D's paged attention, whose share of prefill grows with sequence length.
+
+`run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `FAST_DRAFT`
+(default 1, the int2 draft head, +6.5% decode), `MIN_M` (16), `SPEC` (4 -- measurably better than
+8 here), `CHUNK` (8192), `GPU_UTIL` (0.98).
+
+### The gated-delta-net NaN
+
+Stock libr4d v0.4.0 produces NaN in the gated-delta-net output on this model. It is not subtle
+once found: WikiText-2 PPL is **653586** with the W4A8 path and no mitigation.
+
+`libr4d-gdn-overflow-guards.patch` fixes three exponent overflows, all the same shape -- an
+unguarded `__expf` on an inactive lane or a split-form half, giving `0 * INF = NaN`:
+
+1. **`kkt_solve`, padding rows.** `gi` is forced to 0 for `i >= rows` while `gb[j]` keeps its real
+   negative cumsum, so `d = -gb[j]` is large POSITIVE and overflows -- the opposite of the "never
+   positive" invariant the code asserts, which holds only for live rows. The NaNs land in padding
+   rows of the 64x64 tile and the blocked inverse merges the whole tile with WMMA, so they reach
+   live rows. Adding `live &&` takes `A` from 16 non-finite values to 0.
+2. **`chunk_scan`, split-form halves.** `e^{g_i-c}.e^{c-g_j}` with `cref` at the chunk midpoint
+   gives each half +/-(gate span)/2, so a span past ~176 sends one half to +INF and the other to
+   0. `kkt_solve`'s own header documents this hazard as its reason for using the direct form.
+3. **`chunk_scan`, `V'` staging.** The dominant one, and only visible across chunks. The binding
+   limit is not fp32: `V' = V.gv[t]` is staged in **bf16**, so `gv` must leave room for `V` under
+   bf16's 3.4e38 ceiling. Clamping at `e^88` still NaNs; `e^80` leaves ~3x margin.
+
+The clamp bounds the damage rather than removing the cause. The clean fix is to stop splitting a
+per-token weight that is provably <= 1 into a huge x tiny pair: stage `V'` in fp32, or scale by
+`e^{gl-g_t}` directly on the state path. Measured tradeoff, PPL over 208,539 tokens:
+70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, stock -> 653586.
+
+This also fixed a second symptom: `RADIANCE_FAST_DRAFT` used to hang a worker at chunk 8192. The
+draft head was being fed NaN like everything else downstream of the GDN core, so fixing the kernel
+removed the hang and let the full 8192 chunk stay (chunk 4096 costs ~10% of long-context prefill).
 
 **`RADIANCE_MXFP4_MAX_M` is retired** (it was read up to 0.5.8). It handed big batches back to emulation as
 a throughput win on paper; in practice quark's TileLang backend cannot initialise inside a vLLM worker, and
