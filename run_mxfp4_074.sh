@@ -55,6 +55,14 @@
 #                      exact-rerank guarantee holds), but a long-prompt sweep at chunk 8192 hung a
 #                      worker and killed the engine with an RPC TimeoutError in sample_tokens.
 #                      Upstream ships it opt-in at chunk 4096. Retry there before trusting it.
+#   DECODE_MAX_M     the small-M decode GEMM (M<=48, TM=ceil(M/16), split-K). ON BY DEFAULT at 48.
+#                      Needs MIN_M=0 to be reachable at all -- at MIN_M=16 the M=5 decode call
+#                      never enters our launcher. Measured: single-stream step time 35.1 -> 33.4 ms
+#                      (-4.8%), aggregate throughput +28.5% at 4 concurrent and +19.7% at 8, prefill
+#                      unchanged within 1.2%. GSM8K 500q paired: 486 both correct, 3/3 discordant,
+#                      sign test p=1.00, at 14% less wall. See ~/mxfp4_work/tier5/RESULTS.md.
+#                      Set 0 to fall back to the prefill-tiled kernel for every M.
+#
 #                      Original note: it quantizes the drafter's
 #                      lm_head and reranks against an untouched bf16 copy, but this checkpoint's
 #                      drafter is FP8 and vLLM may be sharing the target's head, in which case
@@ -134,19 +142,26 @@ if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   R4D_SO="$R4D_CACHE/$R4D_PIN"
   echo "[radiance] libr4d $R4D_PIN -> $R4D_SO"
 fi
-# Batch size above which the W4A8 fp8-WMMA kernel takes over from aiter's W4A4 Triton path.
-# DEFAULT 0 = never fall back; our kernel serves every M.
+# Where the hand-written W4A8 kernel takes over from aiter's W4A4 Triton path.
+# DEFAULT 0 = never fall back; our kernel serves every M. The comparison is `x.shape[0] > MIN_M`,
+# so MIN_M=1 would still route M=1 to aiter -- use 0, not 1.
 #
-# This is a correctness requirement, not a tuning choice. aiter's W4A4 path returns a WRONG result
-# for N=5120 K=3072 (o_proj): captured from a live serve and replayed against an fp32 reference,
-# aiter lands at rel=1.066 with ~1/35th of the correct magnitude, while our kernel is at rel=0.0017.
-# That shape is the one with no tuned table in mxfp4-configs/, so it takes aiter's generic bands.
-# With MIN_M=16 it went unnoticed in prefill (M=17, our kernel) and poisoned decode (M=9, aiter),
-# which is exactly the fluent-looking garbage this build shipped with for an afternoon.
+# This was 16 until the decode kernel landed, for two separate reasons that are now both resolved:
 #
-# Note the comparison is `x.shape[0] > MIN_M`, so MIN_M=1 still routes M=1 to aiter. Use 0.
+#   CORRECTNESS. aiter's W4A4 path returns a WRONG result for N=5120 K=3072 (o_proj): captured from
+#   a live serve and replayed against an fp32 reference, aiter lands at rel=1.066 with ~1/35th of the
+#   correct magnitude, while ours is at rel=0.0017. That shape has no tuned table in mxfp4-configs/,
+#   so it takes aiter's generic bands. At MIN_M=16 it went unnoticed in prefill (M=17, our kernel)
+#   and poisoned decode (M=9, aiter) -- the fluent-looking garbage this build shipped with for an
+#   afternoon.
+#
+#   SPEED. MIN_M=0 used to be a ~55% decode regression (54.3 ms/step against 35.1) because the only
+#   kernel available at M<=16 was the prefill-tiled one, which at M=5 issues 51x more matrix MACs
+#   than useful. RADIANCE_MXFP4_DECODE_MAX_M below fixes exactly that, so MIN_M=0 is now both
+#   correct AND faster than the old default.
+#
 # Set it absurdly high to route everything to aiter -- only useful for bisecting.
-MIN_M=${MIN_M:-16}
+MIN_M=${MIN_M:-0}
 
 # All 304 linear layers run on the W4A8 kernel. RADIANCE_MXFP4_KERNEL_NK / _PERBLOCK_NK remain as
 # shape-level bisect tools (N:K pairs) but are unset by default.
@@ -188,13 +203,14 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB="$AR_MAX_KB" \
   -e RADIANCE_PRESHUFFLE="${RADIANCE_PRESHUFFLE:-1}" -e RADIANCE_FUSE_RMS_QUANT="${RADIANCE_FUSE_RMS_QUANT:-1}" \
   -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_MXFP4_W4A8_MIN_M="$MIN_M" \
-  -e RADIANCE_FAST_DRAFT="$FAST_DRAFT" -e RADIANCE_DRAFT_TAU=0.20 \
+  -e RADIANCE_FAST_DRAFT="$FAST_DRAFT" -e RADIANCE_DRAFT_TAU="${RADIANCE_DRAFT_TAU:-0.20}" \
   -e RADIANCE_MXFP4_DEBUG="${RADIANCE_MXFP4_DEBUG:-0}" \
   -e RADIANCE_MXFP4_PUREQUANT="${RADIANCE_MXFP4_PUREQUANT:-0}" \
   -e RADIANCE_MXFP4_SYNC="${RADIANCE_MXFP4_SYNC:-0}" \
   -e RADIANCE_MXFP4_CLONE="${RADIANCE_MXFP4_CLONE:-0}" -e RADIANCE_MXFP4_CHECKX="${RADIANCE_MXFP4_CHECKX:-0}" \
   -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
+  -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-48}" \
   -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
   -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-0}" \
   -e RADIANCE_GDN_PATHS="${RADIANCE_GDN_PATHS:-both}" \

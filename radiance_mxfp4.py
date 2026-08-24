@@ -24,6 +24,10 @@ import torch
 
 ENABLED = os.environ.get("RADIANCE_MXFP4_W4A8", "0") == "1"
 MIN_M = int(os.environ.get("RADIANCE_MXFP4_W4A8_MIN_M", "256"))
+# Decode band for the small-M kernel. 0 = dark. Also gates the scratch preallocation.
+DECODE_MAX_M = int(os.environ.get("RADIANCE_MXFP4_DECODE_MAX_M", "0"))
+_decode_scratch_ready = [False]
+_decode_scratch = [None]   # keeps the buffer alive for the process
 
 try:
     import radiance_mxfp4_fp8 as _ext
@@ -98,7 +102,11 @@ CHECK_X = os.environ.get("RADIANCE_MXFP4_CHECKX", "0") == "1"
 # Verify EVERY call at one N:K against exact fp32, with no dedup. The earlier check kept only the
 # first call per (N,K,M), so a shape that is right once and wrong later reads as "ok".
 _ca = os.environ.get("RADIANCE_MXFP4_CHECKALL", "").strip()
-CHECK_ALL = tuple(int(v) for v in _ca.split(":")) if _ca else None
+# Comma-separated list of N:K shapes to verify against exact fp32 on every call, e.g.
+# "17408:5120,5120:8704". A list rather than a single pair so one serve can gate every
+# production shape -- checking them one per serve costs a container restart each.
+CHECK_ALL = ({tuple(int(v) for v in pair.split(":")) for pair in _ca.split(",") if pair}
+             if _ca else None)
 # Bisect which layer class our kernel breaks. Comma-separated N values our kernel is allowed to
 # serve; every other layer is handed to aiter (which is known-coherent for the whole model).
 # Empty = no restriction. Gating projections (N=48, in_proj_ba) feed exponentials in the GDN core,
@@ -297,7 +305,7 @@ def mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tens
                 weight_ref.data_ptr() if folded else 0,
                 x_scale.data_ptr(), out.data_ptr(), M, N, K,
                 torch.cuda.current_stream().cuda_stream)
-    if CHECK_ALL is not None and (N, K) == CHECK_ALL and x.shape[0] <= 128:
+    if CHECK_ALL is not None and (N, K) in CHECK_ALL and x.shape[0] <= 128:
         _ref = _exact_ref(x_fp8, x_scale, weight, weight_scale, N, K)
         _rel = ((out.float() - _ref).norm() / _ref.norm().clamp_min(1e-9)).item()
         STATS["checked"] = STATS.get("checked", 0) + 1
@@ -310,9 +318,13 @@ def mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tens
                     f"M={x.shape[0]} rel={_rel:.4f} |ours|={out.float().abs().mean():.5f} "
                     f"|ref|={_ref.abs().mean():.5f} x_nonfin={(~torch.isfinite(xf2)).sum().item()} "
                     f"x_contig={x.is_contiguous()} x_stride={tuple(x.stride())}\n")
-        elif STATS["checked"] in (1, 32, 64):
-            sys.stderr.write(f"[radiance.mxfp4.all] ok call#{STATS['checked']} rel={_rel:.5f} "
-                             f"(wrong so far: {STATS.get('wrong', 0)})\n")
+        else:
+            _k = ("seen", N, K)
+            STATS[_k] = STATS.get(_k, 0) + 1
+            if STATS[_k] in (1, 64):
+                sys.stderr.write(f"[radiance.mxfp4.all] ok N={N} K={K} M={x.shape[0]} "
+                                 f"call#{STATS[_k]} rel={_rel:.5f} "
+                                 f"(wrong so far: {STATS.get('wrong', 0)})\n")
         sys.stderr.flush()
     if CHECK_X:
         key = (N, K, int(x.shape[0]))
@@ -461,6 +473,33 @@ def _make_kernel_class():
             return True, None
 
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            # Preallocate the decode kernel's split-K partial slab on the FIRST layer, which is
+            # weight-load time -- outside CUDA-graph capture.
+            #
+            # It cannot be done lazily inside the kernel launcher. Whenever the torch.compile cache
+            # is warm ("Directly load AOT compilation from path ..."), vLLM skips the eager profile
+            # run and the first GEMM call happens during capture, where hipMalloc is illegal. That
+            # killed engine startup, and the error it surfaced through our own pybind call was a
+            # thoroughly misleading "HIP runtime library (libamdhip64.so) not found ... TileLang's
+            # ROCm backend". report_stats() is NOT a valid hook either -- it runs inside the custom
+            # op, i.e. potentially under capture as well.
+            if not _decode_scratch_ready[0] and DECODE_MAX_M > 0:
+                _decode_scratch_ready[0] = True
+                try:
+                    # torch owns it: allocating from the .so put a hipMalloc inside CUDA-graph
+                    # capture, and any C++ exception escaping our pybind module gets relabelled by
+                    # quark's TileLang exception translator into a bogus "libamdhip64.so not found".
+                    _decode_scratch[0] = torch.empty(
+                        4 * 48 * 32768, dtype=torch.float32, device=layer.weight.device)
+                    _ext.set_decode_scratch(_decode_scratch[0].data_ptr(),
+                                            _decode_scratch[0].numel() * 4)
+                    sys.stderr.write(
+                        f"[radiance.mxfp4] decode kernel ON (M<={DECODE_MAX_M}), "
+                        f"{_decode_scratch[0].numel() * 4 >> 20} MiB split-K scratch\n")
+                except Exception as _e:
+                    import traceback
+                    sys.stderr.write(f"[radiance.mxfp4] decode scratch FAILED: {_e!r}\n"
+                                     + traceback.format_exc())
             # Same transpose AiterMxfp4LinearKernel's non-asm branch does: create_weights lays the
             # scale out as [N, K/32] and both the aiter GEMM and this kernel want [K/32, N].
             layer.weight_scale = torch.nn.Parameter(

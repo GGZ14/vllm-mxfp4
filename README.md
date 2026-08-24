@@ -177,12 +177,31 @@ Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness, `SPEC=4`:
 | WikiText-2 PPL | 8.3335 | 8.3706 | +0.44% |
 
 KV cache 857,399 tokens at `GPU_UTIL=0.98`. All 304 linear layers run the W4A8 fp8-WMMA kernel;
-`aiter` is not used above `RADIANCE_MXFP4_W4A8_MIN_M`. The prefill gain scales with context
-because it is mostly R4D's paged attention, whose share of prefill grows with sequence length.
+`aiter` is not used at all now that `RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain
+scales with context because it is mostly R4D's paged attention, whose share of prefill grows with
+sequence length.
+
+**The decode GEMM (`RADIANCE_MXFP4_DECODE_MAX_M`, default 48), measured against the same 0.7.4 with
+it off.** Report step time, not tokens/s: tokens/s swings ~14% on draft-acceptance luck alone at
+fixed config, and `ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that out.
+
+| | off | on | |
+|---|---|---|---|
+| single stream, ms/step | 35.06 | **33.39** | -4.8% |
+| ms/step at 32k context | 36.53 | **34.87** | -4.5% |
+| aggregate tok/s, 4 concurrent | 170.1 | **218.5** | +28.5% |
+| aggregate tok/s, 8 concurrent | 295.0 | **353.1** | +19.7% |
+| prefill, all five lengths | — | — | unchanged (-0.3 to -1.2%) |
+| GSM8K 500q, greedy | 97.80% | 97.80% | 3/3 discordant, sign test p=1.00 |
+
+Batched gains most because at M=20-40 aiter's tuned band uses `NUM_KSPLIT=1`, which leaves the grid
+underfilled, while this kernel keeps split-K. GSM8K also ran **14% faster wall** (375.5s -> 322.7s)
+on slightly *more* generated tokens.
 
 `run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `FAST_DRAFT`
-(default 1, the int2 draft head, +6.5% decode), `MIN_M` (16), `SPEC` (4 -- measurably better than
-8 here), `CHUNK` (8192), `GPU_UTIL` (0.98).
+(default 1, the int2 draft head, +6.5% decode), `MIN_M` (0), `RADIANCE_MXFP4_DECODE_MAX_M` (48),
+`SPEC` (4 -- measurably better than 6 and 8 here, re-confirmed on this build), `CHUNK` (8192),
+`GPU_UTIL` (0.98).
 
 ### The gated-delta-net NaN (fixed upstream)
 
@@ -225,7 +244,7 @@ checkpoints here at all, which makes the native kernel the only way to run them 
 faster one. With `RADIANCE_MXFP4_W4A8=1` the crossover is moot anyway: large M goes to the fp8-WMMA kernel,
 which beats both the aiter path and emulation.
 
-`RADIANCE_MXFP4_W4A8=1` additionally routes large-M (prefill) linears to a hand-written fp8-WMMA HIP kernel
+`RADIANCE_MXFP4_W4A8=1` additionally routes linears to a hand-written fp8-WMMA HIP kernel
 (`radiance_mxfp4_fp8.hip`). Triton lowers `tl.dot_scaled` by upconverting e2m1 to bf16 and using the 16-bit
 WMMA; register-resident on this card, **fp8 WMMA runs 325 TFLOP/s against f16's 160**, while Triton's own
 fp8 `tl.dot` manages 43 because it upconverts and pays conversion on top. Against the tuned aiter path it
@@ -234,8 +253,16 @@ activations beat the mxfp4 ones aiter quantizes to. It is **off by default becau
 the layer becomes W4A8 rather than the checkpoint's declared W4A4 -- more precise than what the model was
 calibrated against, but no longer bit-identical. The N tile is M-keyed (`RADIANCE_MXFP4_TN4_MIN_M`, default
 2048): the wide tile amortises A-tile staging for +10% at M=8192 but cannot fill below ~2048 rows.
-`RADIANCE_MXFP4_W4A8_MIN_M` (default 256) is where it takes over from aiter; below that the W4A4 path wins,
-since these tiles are sized for prefill.
+`RADIANCE_MXFP4_W4A8_MIN_M` is where it takes over from aiter, and it now defaults to **0** -- our
+kernel serves every M.
+
+**There are two tilings, because prefill and decode are different problems.** The tile above
+(BM=256 via TM=4) is sized for prefill. At decode M is 5 (batch 1 x `num_speculative_tokens`+1), where
+it issues 51x more matrix MACs than useful -- 4352 WMMA per wave against 5 real rows. So M<=48 goes
+to a second kernel with TM=`ceil(M/16)`, no wasted M-fragments, and split-K to fill the CUs, gated by
+`RADIANCE_MXFP4_DECODE_MAX_M` (default 48). It reverses one of the prefill answers: **BK=128 wins at
+decode** (1.87x on gate_up) where it measured -34% at prefill, because that loss was purely the LDS
+occupancy cliff and a 16-row A tile never reaches it.
 
 Two practical notes. **4-bit weights leave far more room for KV**: on 2x R9700 the 27B MXFP4 body occupies
 9.24 GiB/GPU against roughly 12.6 for the same model in FP8, and that headroom goes straight into context.

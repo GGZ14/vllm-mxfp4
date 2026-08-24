@@ -343,6 +343,162 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
       }
 }
 
+// ---------------------------------------------------------------- decode path (M <= 16)
+// The tiles above are sized for prefill: BMF=256 via TM=4. At decode M is 5 (batch 1 x SPEC+1), so
+// per wave the folded kernel issues K/DBK * DBK/16 * TM * TN = 4352 WMMA against 5 real rows -- 51x
+// more MACs than useful, a ~70 us matrix-issue floor on a shape whose DRAM floor is 41 us. TM=1
+// cuts issued MACs 16x and shrinks the A tile from 256xBK to 16xBK at the same time.
+//
+// Split-K is not optional here: with TM=1 the independent N-fragments number N/16, so N=5120 gives
+// only 320 waves = 2.5 per SIMD no matter how the N tile is chosen. Measured, DKS=1 is 2.4x worse
+// than DKS=4 on mlp.down. Partials are fp32 [DKS][M][N]; the folded scale composes for free because
+// Wref[n] is a whole-row max over k, so both per-row factors are applied once in the reduce.
+//
+// DBK=128 here, which REVERSES the prefill answer (where it measured -34%). That loss was pure LDS
+// occupancy: 22.5 -> 43.5 KB took resident blocks 2 -> 1. With a 16-row A tile, LDS is
+// (16+BND)*(DBK+PAD) = 10.88 KB, so 5-6 blocks still fit. Measured 1.87x on gate_up. See
+// ~/mxfp4_work/tier5/RESULTS.md.
+#define DEC_MTILE 16
+#define DEC_PAD 8
+
+// DTM = number of 16-row M-fragments; the launcher picks ceil(M/16). vLLM captures decode at
+// num_seqs*(SPEC+1), i.e. 5/10/20/25/35/40 at SPEC=4, so DTM 1..3 covers every reachable batch.
+// Use the SMALLEST DTM that covers M: measured at M=20, DTM=2 beats DTM=3 by 12% (89.1 vs 99.9 us
+// on gate_up) purely because the wider tile computes rows nobody asked for.
+template <int DWN, int DBK, int DKS, int DTM>
+__global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
+    const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
+    const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
+    float *__restrict__ P, int M, int N, int K) {
+  constexpr int BND = DWN * 16;
+  constexpr int DASTR = DBK + DEC_PAD, DWSTR = DBK + DEC_PAD;
+  constexpr int DNTHREADS = DWN * 32;
+  __shared__ unsigned char sA[DEC_MTILE * DTM * DASTR];
+  __shared__ unsigned char sW[BND * DWSTR];
+
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int col = lane & 15, kb8 = (lane >> 4) * 8;
+  const int n0 = blockIdx.x * BND;
+  const int ks = blockIdx.z;
+
+  const int slabs = (K + DBK - 1) / DBK;
+  const int spb = (slabs + DKS - 1) / DKS;
+  const int s_lo = ks * spb, s_hi = min(slabs, s_lo + spb);
+
+  floatx8 acc[DTM];
+#pragma unroll
+  for (int i = 0; i < DTM; ++i)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
+
+  for (int s = s_lo; s < s_hi; ++s) {
+    const int k0 = s * DBK;
+#pragma unroll
+    for (int off = 0; off < DEC_MTILE * DTM * DBK; off += DNTHREADS * 16) {
+      const int idx = off + tid * 16;
+      if (idx < DEC_MTILE * DTM * DBK) {
+        const int r = idx / DBK, c = idx % DBK;
+        uint4_t v = uint4_t{0, 0, 0, 0};
+        if (r < M) v = *(const uint4_t *)(A + (size_t)r * K + k0 + c);
+        *(uint4_t *)(&sA[r * DASTR + c]) = v;
+      }
+    }
+#pragma unroll
+    for (int off = 0; off < BND * DBK / 2; off += DNTHREADS * 8) {
+      const int idx = off + tid * 8;
+      const int r = idx / (DBK / 2), c = idx % (DBK / 2), gn = n0 + r;
+      unsigned long long packed = 0ull;
+      int dsh = 0;
+      if (gn < N) {
+        packed = *(const unsigned long long *)(W + ((size_t)gn * K + k0) / 2 + c);
+        const int blk = (k0 + c * 2) / 32;
+        dsh = (int)Wref[gn] - (int)Ws[(size_t)blk * N + gn];
+        dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
+      }
+      const unsigned int t0 = kMag[dsh][0], t1 = kMag[dsh][1];
+      unsigned int outw[4];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const unsigned int wv = (unsigned int)(packed >> (32 * h));
+        const unsigned int ev = wv & 0x0F0F0F0Fu;
+        const unsigned int od = (wv >> 4) & 0x0F0F0F0Fu;
+        const unsigned int be = __builtin_amdgcn_perm(t1, t0, ev & 0x07070707u)
+                              | ((ev & 0x08080808u) << 4);
+        const unsigned int bo = __builtin_amdgcn_perm(t1, t0, od & 0x07070707u)
+                              | ((od & 0x08080808u) << 4);
+        outw[2 * h]     = __builtin_amdgcn_perm(bo, be, 0x05010400u);
+        outw[2 * h + 1] = __builtin_amdgcn_perm(bo, be, 0x07030602u);
+      }
+      *(uint4_t *)(&sW[r * DWSTR + c * 2]) = uint4_t{outw[0], outw[1], outw[2], outw[3]};
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int step = 0; step < DBK / 16; ++step) {
+      const int kk = step * 16 + kb8;
+      int2_t af[DTM], wf;
+#pragma unroll
+      for (int i = 0; i < DTM; ++i) {
+        const unsigned char *pa = &sA[(i * 16 + col) * DASTR + kk];
+        af[i][0] = *(const int *)pa; af[i][1] = *(const int *)(pa + 4);
+      }
+      const unsigned char *pw = &sW[(wave * 16 + col) * DWSTR + kk];
+      wf[0] = *(const int *)pw; wf[1] = *(const int *)(pw + 4);
+#pragma unroll
+      for (int i = 0; i < DTM; ++i)
+        acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[i]);
+    }
+    __syncthreads();
+  }
+
+  const int n = n0 + wave * 16 + col;
+  if (n < N) {
+#pragma unroll
+    for (int i = 0; i < DTM; ++i)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = i * 16 + kb8 + e;
+        if (m < M) P[((size_t)ks * M + m) * N + n] = acc[i][e];
+      }
+  }
+}
+
+__global__ void radiance_mxfp4_fp8_decode_reduce(
+    const float *__restrict__ P, const unsigned char *__restrict__ Wref,
+    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int DKS) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N) return;
+  const float rf = __int_as_float((int)Wref[n] << 23);
+  for (int m = 0; m < M; ++m) {
+    float s = 0.f;
+    for (int k = 0; k < DKS; ++k) s += P[((size_t)k * M + m) * N + n];
+    C[(size_t)m * N + n] = (__bf16)(s * rf * As[m]);
+  }
+}
+
+// Split-K partial slab. PyTorch owns the memory; we only hold the pointer.
+//
+// This used to hipMalloc here and that was wrong twice over. Allocating lazily from launch() puts
+// the allocation inside CUDA-graph capture whenever the torch.compile cache is warm (vLLM then
+// skips the eager profile run), where it is illegal. And allocating from this .so at all produced
+// a completely misleading error: quark's TileLang registers a pybind11 exception translator in the
+// same ABI domain, so ANY C++ exception escaping our module is reported as
+// "HIP runtime library (libamdhip64.so) not found ... TileLang's ROCm backend", pointing at our own
+// pybind frame. Letting torch allocate it removes both problems and makes the buffer visible from
+// Python, where its lifetime is obvious.
+//
+// Sized KS(4) x 48 rows x N(<=32768) x 4 B = 24 MiB. Single-stream decode per rank is assumed.
+#define DEC_MAX_N 32768
+#define DEC_KS 4
+#define DEC_MAX_TM 3        // covers M<=48; SPEC=4 x max_num_seqs=8 reaches M=40
+static float *g_decode_partial = nullptr;
+static size_t g_decode_partial_bytes = 0;
+
+static void set_decode_scratch(uintptr_t ptr, size_t bytes) {
+  g_decode_partial = (float *)ptr;
+  g_decode_partial_bytes = bytes;
+}
+
 static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                    uintptr_t c, int M, int N, int K, uintptr_t stream) {
   if (K % BK) throw std::runtime_error("radiance_mxfp4_fp8: K must be a multiple of 64");
@@ -355,7 +511,34 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
       const char *e = getenv("RADIANCE_MXFP4_TN4_MIN_M");
       return e ? atoi(e) : 2048;
     }();
+    // Decode band. Default 0 = dark; the branch must come first because 16 < tn4_min_m.
+    static const int decode_max_m = [] {
+      const char *e = getenv("RADIANCE_MXFP4_DECODE_MAX_M");
+      return e ? atoi(e) : 0;
+    }();
     dim3 fblock(NTHREADS);
+    if (M > 0 && M <= decode_max_m && M <= DEC_MTILE * DEC_MAX_TM && N <= DEC_MAX_N &&
+        (size_t)DEC_KS * M * N * sizeof(float) <= g_decode_partial_bytes && g_decode_partial) {
+      constexpr int DWN = 8, DBK = 128, DKS = DEC_KS;  // tuned: ~/mxfp4_work/tier5/RESULTS.md
+      constexpr int DBND = DWN * 16;
+      float *P = g_decode_partial;
+      const dim3 dgrid((N + DBND - 1) / DBND, 1, DKS), dblock(DWN * 32);
+      const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;   // smallest tile that covers M
+#define RAD_DEC_LAUNCH(TM_)                                                                  \
+      hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_decode<DWN, DBK, DKS, TM_>), dgrid, dblock, \
+                         0, (hipStream_t)stream, (const unsigned char *)a,                    \
+                         (const unsigned char *)w, (const unsigned char *)ws,                 \
+                         (const unsigned char *)wref, P, M, N, K)
+      if (tm == 1)      RAD_DEC_LAUNCH(1);
+      else if (tm == 2) RAD_DEC_LAUNCH(2);
+      else              RAD_DEC_LAUNCH(3);
+#undef RAD_DEC_LAUNCH
+      hipLaunchKernelGGL(radiance_mxfp4_fp8_decode_reduce, dim3((N + 255) / 256), dim3(256), 0,
+                         (hipStream_t)stream, P, (const unsigned char *)wref,
+                         (const float *)as, (__bf16 *)c, M, N, DKS);
+      return;
+      // no scratch (alloc failed) -- fall through to the folded kernel, never produce nothing
+    }
     if (M >= tn4_min_m) {
       constexpr int B4 = BNF_OF(4);
       dim3 fgrid((N + B4 - 1) / B4, (M + BMF - 1) / BMF);
@@ -379,4 +562,8 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
 
 PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch", &launch, "MXFP4 x FP8 WMMA GEMM (gfx1201)");
+  // Hand in a torch-owned fp32 buffer for the decode kernel's split-K partials. Call once per
+  // worker at weight-load time; the caller must keep the tensor alive.
+  m.def("set_decode_scratch", &set_decode_scratch,
+        "register the split-K partial buffer (ptr, bytes) for the decode kernel");
 }
