@@ -117,12 +117,13 @@ band). The native path is **bit-identical to emulation** -- the activation quant
 way -- so it is a speed change with no quality dimension: measured on gate_up 17408x5120, **6.1x at M=16,
 4.7x at M=32, 2.5x at M=64**.
 
-**Set `RADIANCE_MXFP4_MAX_M` high enough to disable the large-M fallback** (the script uses `1e9`). On paper
-that fallback hands big batches back to emulation as a throughput win; in practice quark's TileLang backend
-cannot initialise inside a vLLM worker, and the branch is specialised into the compile graph during the
-`max-num-batched-tokens` profile run -- so it kills startup rather than one request. That also means the
-stock emulated path cannot serve these checkpoints here at all, which makes the native kernel the only way
-to run them on this card, not merely the faster one.
+**`RADIANCE_MXFP4_MAX_M` is retired** (it was read up to 0.5.8). It handed big batches back to emulation as
+a throughput win on paper; in practice quark's TileLang backend cannot initialise inside a vLLM worker, and
+the branch was specialised into the compile graph during the `max-num-batched-tokens` profile run -- so it
+killed startup rather than one request. That also means the stock emulated path cannot serve these
+checkpoints here at all, which makes the native kernel the only way to run them on this card, not merely the
+faster one. With `RADIANCE_MXFP4_W4A8=1` the crossover is moot anyway: large M goes to the fp8-WMMA kernel,
+which beats both the aiter path and emulation.
 
 `RADIANCE_MXFP4_W4A8=1` additionally routes large-M (prefill) linears to a hand-written fp8-WMMA HIP kernel
 (`radiance_mxfp4_fp8.hip`). Triton lowers `tl.dot_scaled` by upconverting e2m1 to bf16 and using the 16-bit
