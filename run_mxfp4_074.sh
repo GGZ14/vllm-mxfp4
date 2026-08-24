@@ -106,15 +106,34 @@ SPEC=${SPEC:-4}
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-# Patched libr4d (three GDN exponent-overflow guards). Stock 0.7.4 NaNs the gated-delta-net
-# output on this model; see README. Set R4D_SO= to fall back to the image's stock r4d.so.
-# Point this at a libr4d checkout built from MAIN; its r4d.so is copied over the image's at
-# container start. The GDN overflow fixes are upstream (StillDeadcode/libr4d PR #1, merged) but
-# there is still no tag past v0.4.0, and the 0.7.4 image pins v0.4.0 -- so the SHIPPED kernel
-# predates the fix and NaNs the gated-delta-net output on this model: WikiText-2 PPL 653586 vs
-# 8.3706. Once deadcode tags a release and ships an image pinning it, this override can go away.
-# Leave empty to use the image's stock r4d.so, in which case set RADIANCE_MXFP4_SANITIZE=1.
+# A libr4d checkout DIRECTORY whose r4d.so is copied over the image's at container start. Leave
+# unset and it is built for you (see AUTO_R4D just below); set it to use your own checkout.
+# Needed because the GDN overflow fixes are upstream (StillDeadcode/libr4d PR #1, merged) but the
+# only tag is still v0.4.0 and the 0.7.4 image pins v0.4.0 -- so the SHIPPED kernel predates the
+# fix and NaNs the gated-delta-net output on this model: WikiText-2 PPL 653586 vs 8.3706. Once
+# deadcode tags a release and ships an image pinning it, all of this can go away.
 R4D_SO=${R4D_SO:-}
+# Built automatically when R4D_SO is unset: libr4d is cloned at the pinned commit and compiled
+# inside $IMAGE once, then cached and reused. Costs a few minutes on the first launch only.
+# AUTO_R4D=0 opts out and runs the image stock kernel (broken on this model -- see above), and
+# setting R4D_SO by hand still wins, so an existing checkout is never rebuilt behind your back.
+R4D_PIN=${R4D_PIN:-b9e42ab}
+R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
+if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
+  if [ ! -f "$R4D_CACHE/$R4D_PIN/r4d.so" ]; then
+    echo "[radiance] building libr4d $R4D_PIN in $IMAGE -- one time, a few minutes"
+    rm -rf "$R4D_CACHE/.build"
+    mkdir -p "$R4D_CACHE/.build"
+    git clone -q https://codeberg.org/StillDeadcode/libr4d.git "$R4D_CACHE/.build"
+    git -C "$R4D_CACHE/.build" checkout -q "$R4D_PIN"
+    podman run --rm --entrypoint bash -v "$R4D_CACHE/.build":/work:z -w /work \
+      "$IMAGE" -c ./build.sh
+    # publish only after a successful build, so an interrupted one is not cached as good
+    mv "$R4D_CACHE/.build" "$R4D_CACHE/$R4D_PIN"
+  fi
+  R4D_SO="$R4D_CACHE/$R4D_PIN"
+  echo "[radiance] libr4d $R4D_PIN -> $R4D_SO"
+fi
 # Batch size above which the W4A8 fp8-WMMA kernel takes over from aiter's W4A4 Triton path.
 # DEFAULT 0 = never fall back; our kernel serves every M.
 #

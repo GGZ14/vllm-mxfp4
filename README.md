@@ -120,40 +120,43 @@ way -- so it is a speed change with no quality dimension: measured on gate_up 17
 ### Running this build
 
 ```bash
-# 1. Build libr4d from main. The GDN overflow fixes are upstream now
-#    (StillDeadcode/libr4d PR #1, merged), but the only tag is still v0.4.0 and the 0.7.4 image
-#    pins that tag -- so the SHIPPED r4d.so predates the fix. Until deadcode cuts a new tag and
-#    an image that pins it, build it yourself.
-git clone https://codeberg.org/StillDeadcode/libr4d.git
-cd libr4d && git checkout b9e42ab        # the commit these numbers were measured against
-#    Build inside the image the .so is loaded from -- the extension must be compiled with the
-#    same ROCm/hipcc it links against at runtime. libr4d's own `make IMAGE=...` does this too,
-#    but it shells out to `docker` with no SELinux label, so on a podman or SELinux-enforcing
-#    host invoke the container directly:
-podman run --rm --entrypoint bash -v "$PWD":/work:z -w /work \
-  stilldeadcode/vllm-radiance:0.7.4 -c ./build.sh            # -> libr4d/r4d.so
-cd ..
-
-# 2. Serve. R4D_SO copies that r4d.so over the image's at container start, and this repo's
-#    patches are applied in the same prelude, so no image rebuild is needed.
-R4D_SO=$PWD/libr4d MODELS=$HOME/models ./run_mxfp4_074.sh
+MODELS=$HOME/models ./run_mxfp4_074.sh
 ```
 
-Verified reproducible: a fresh clone built this way produces an `r4d.so` byte-identical (sha256
+That is the whole thing. On the first launch it clones libr4d at a pinned commit and compiles it
+inside the same image it will be loaded from, which takes a few minutes; the result is cached in
+`~/.cache/radiance-libr4d` and every later launch reuses it. This repo's vLLM patches and the W4A8
+kernel are applied in the container prelude, so no image rebuild is involved either.
+
+The build step exists because the fix this build depends on is upstream but unreleased. The GDN
+overflow guards are merged (StillDeadcode/libr4d PR #1), but the only tag is still `v0.4.0` and the
+0.7.4 image pins that tag -- so the `r4d.so` **inside the image predates the fix** and NaNs the
+gated-delta-net output on this model: WikiText-2 perplexity 653586 against 8.3706. Once deadcode
+cuts a tag and ships an image pinning it, the whole step disappears.
+
+Knobs, if you want them:
+
+| | |
+|---|---|
+| `R4D_SO=/path/to/libr4d` | use your own checkout instead; nothing is rebuilt behind your back |
+| `R4D_PIN=<sha>` | build a different libr4d commit (each is cached separately) |
+| `AUTO_R4D=0` | skip the build and run the image stock kernel -- see below |
+
+The pin is deliberate. `main` is a moving branch, and nothing in radiance version-checks the library
+it loads: all six `radiance_*.py` modules just `import r4d` and call it. If a later commit renames an
+entry point or changes a compiled-in geometry constant, the registry and the constants disagree,
+`radiance_gdn.py` sets `ENABLED = False`, and the build **falls back to the Triton path with one line
+on stderr** -- you lose the performance rather than getting an error. `R4D_PIN=main` builds the tip instead, but note the cache
+is keyed by that string, so it is fetched once and then reused -- `rm -rf ~/.cache/radiance-libr4d/main`
+to pick up newer commits. Either way, read the R4D selections table printed at startup
+(`RADIANCE_R4D_REPORT=1`, on by default) and confirm the GDN and attention kernels actually bound.
+
+Verified reproducible: the automatic build produces an `r4d.so` byte-identical (sha256
 `3026297b...`) to the one every number below was measured with.
 
-The checkout is pinned deliberately. `main` is a moving branch with no tagged release past
-`v0.4.0`, and nothing in radiance version-checks the library it loads -- all six `radiance_*.py`
-modules just `import r4d` and call it. If a later commit renames an entry point or changes a
-compiled-in geometry constant, the registry and the constants disagree, `ENABLED` is set to False,
-and the build **falls back to the Triton path with only a line on stderr** -- you lose the
-performance rather than getting an error. Tracking `main` unpinned is fine if you want to; just
-read the R4D selections table the launcher prints at startup (`RADIANCE_R4D_REPORT=1`, on by
-default) and confirm the GDN and attention kernels actually bound.
-
-Skipping step 1 leaves you on the stock kernel, where the W4A8 path is unusable: WikiText-2
-perplexity 653586 against 8.3706. If you must run stock, set `RADIANCE_MXFP4_SANITIZE=1`, which
-zeroes non-finite activations and gets you to 8.4004 -- worse than the fix, but serviceable.
+`AUTO_R4D=0` leaves you on the stock kernel, where the W4A8 path is unusable. If you must run
+stock, set `RADIANCE_MXFP4_SANITIZE=1`, which zeroes non-finite activations and gets you to
+perplexity 8.4004 -- worse than the fix, but serviceable.
 
 Checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with the MTP
 drafter requantized to fp8 (`~/mxfp4_work/fp8_mtp.py`). The drafter must NOT be MXFP4 -- 4-bit
