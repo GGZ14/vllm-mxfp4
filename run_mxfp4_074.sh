@@ -43,7 +43,14 @@
 #   (default)        R4D GDN + WHT6 all-reduce (RADIANCE_USE_R4D=1), AITER attention   <- parity gate
 #   R4D_ATTN=1       + the R4D paged attention backend -- ON BY DEFAULT, measured +37.8% prefill
 #                      at 260k, +30.9% at 182k, +20.9% at 104k against the 0.5.8 baseline
-#   FAST_DRAFT=1     + the int2 MTP draft head. UNSTABLE HERE: the head itself arms correctly
+#   FAST_DRAFT       int2 MTP draft head with an exact bf16 rerank. ON BY DEFAULT, worth
+#                      +6.5% decode short / +0.1% medium against the 0.5.8 baseline, and the
+#                      difference between 58.5 and 67.1 tok/s on this build.
+#
+#                      It HUNG a worker at chunk 8192 before the libr4d GDN overflows were fixed:
+#                      the draft head was being fed NaN like everything else downstream of the
+#                      gated-delta-net. Fixing the kernel at source fixed the hang too, so it now
+#                      runs at the full chunk size. Historical note: it arms correctly
 #                      (this checkpoint's lm_head is bf16 and excluded from quantization, so the
 #                      exact-rerank guarantee holds), but a long-prompt sweep at chunk 8192 hung a
 #                      worker and killed the engine with an RPC TimeoutError in sample_tokens.
@@ -80,7 +87,7 @@ NAME=${NAME:-vllmmxfp4074}
 PORT=${PORT:-8080}
 CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-1}
-FAST_DRAFT=${FAST_DRAFT:-0}
+FAST_DRAFT=${FAST_DRAFT:-1}
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-074}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
