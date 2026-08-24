@@ -5,12 +5,13 @@ ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom k
 this card, plus RDNA4-tuned GEMM / attention / all-reduce paths and a dynamic MTP draft controller, so you
 don't have to build the stack yourself.
 
-> **Status: super early dev (v0.5.8). Experimental.** Everything here was built and measured on three exact
-> setups: **Qwen3.6-27B-FP8**, **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8), and
-> **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), all with fp8 (or bf16/`auto`) KV
-> cache on two R9700 GPUs (tensor parallel). Other models, non-FP8 weights, single or
-> 3+ GPUs, and non-R9700 hardware are untested. Expect rough edges and breaking changes. Not production
-> hardened. Use at your own risk.
+> **Status: super early dev (v0.5.8). Experimental.** Everything here was built and measured on four exact
+> setups: **Qwen3.6-27B-FP8**, **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8),
+> **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), and
+> **Qwen3.8-27B-Quark-AWQ-MXFP4** (4-bit OCP micro-scaling, see [MXFP4](#mxfp4-4-bit-checkpoints)), all with
+> fp8 (or bf16/`auto`) KV cache on two R9700 GPUs (tensor parallel). Other models, other weight formats,
+> single or 3+ GPUs, and non-R9700 hardware are untested. Expect rough edges and breaking changes. Not
+> production hardened. Use at your own risk.
 
 This repository is the **source** for the image published as `stilldeadcode/vllm-radiance` on Docker Hub.
 See **[DOCKERHUB.md](DOCKERHUB.md)** for the full description, the complete environment-variable / knob
@@ -90,6 +91,49 @@ card: the drafter has a head-512 layer, so pass `"attention_backend":"ROCM_AITER
 speculative config (the usual `flash_attn` caps at head 256). For example:
 `--speculative-config '{"method":"mtp","model":"/models/google/gemma-4-31B-it-assistant","num_speculative_tokens":8,"attention_backend":"ROCM_AITER_UNIFIED_ATTN","disable_padded_drafter_batch":true}' --no-async-scheduling`.
 
+### MXFP4 (4-bit) checkpoints
+
+Quark OCP micro-scaling checkpoints (`quantization_config.quant_method: quark`, mxfp4 weights *and*
+activations, group 32, e8m0 scales) run **natively** with `RADIANCE_MXFP4=1` -- e.g.
+`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`. Drop `--quantization`: the runtime reads the method from `config.json`
+and routes it itself. `run_mxfp4_minm.sh` at the repo root is a complete worked launch, annotated with every
+deliberate difference from the FP8 setup and why.
+
+Without this, vLLM falls back to emulated MXFP4, which materialises every weight tensor in bf16 on each
+forward. Nothing in the way was a compiler limitation -- Triton 3.6 does lower `tl.dot_scaled` on gfx1201 --
+just three soft gates, all handled in `patch_quark_mxfp4.py`: an `is_fp4_avail()` allowlist that omits
+gfx1201, an aiter module path that moved in 0.1.17, and gfx1250 tiles that ask for
+`matrix_instr_nonkdim=32` when this card's WMMA is 16x16x16 only (`mxfp4-configs/` pins 16 across every
+band). The native path is **bit-identical to emulation** -- the activation quantization is the same either
+way -- so it is a speed change with no quality dimension: measured on gate_up 17408x5120, **6.1x at M=16,
+4.7x at M=32, 2.5x at M=64**.
+
+**Set `RADIANCE_MXFP4_MAX_M` high enough to disable the large-M fallback** (the script uses `1e9`). On paper
+that fallback hands big batches back to emulation as a throughput win; in practice quark's TileLang backend
+cannot initialise inside a vLLM worker, and the branch is specialised into the compile graph during the
+`max-num-batched-tokens` profile run -- so it kills startup rather than one request. That also means the
+stock emulated path cannot serve these checkpoints here at all, which makes the native kernel the only way
+to run them on this card, not merely the faster one.
+
+`RADIANCE_MXFP4_W4A8=1` additionally routes large-M (prefill) linears to a hand-written fp8-WMMA HIP kernel
+(`radiance_mxfp4_fp8.hip`). Triton lowers `tl.dot_scaled` by upconverting e2m1 to bf16 and using the 16-bit
+WMMA; register-resident on this card, **fp8 WMMA runs 325 TFLOP/s against f16's 160**, while Triton's own
+fp8 `tl.dot` manages 43 because it upconverts and pays conversion on top. Against the tuned aiter path it
+measures **1.47-2.26x faster and 4.2x more accurate** (0.0265 vs 0.1119 relative error), since fp8
+activations beat the mxfp4 ones aiter quantizes to. It is **off by default because it changes numerics**:
+the layer becomes W4A8 rather than the checkpoint's declared W4A4 -- more precise than what the model was
+calibrated against, but no longer bit-identical. The N tile is M-keyed (`RADIANCE_MXFP4_TN4_MIN_M`, default
+2048): the wide tile amortises A-tile staging for +10% at M=8192 but cannot fill below ~2048 rows.
+`RADIANCE_MXFP4_W4A8_MIN_M` (default 256) is where it takes over from aiter; below that the W4A4 path wins,
+since these tiles are sized for prefill.
+
+Two practical notes. **4-bit weights leave far more room for KV**: on 2x R9700 the 27B MXFP4 body occupies
+9.24 GiB/GPU against roughly 12.6 for the same model in FP8, and that headroom goes straight into context.
+And **do not quantize the MTP drafter to MXFP4**: at n=8 the drafter is 34% of decode weight traffic so it
+looks like an obvious target, but data-free RTN (~11.6% relative error) drops mean acceptance from 2.5 to
+2.21 and AWQ calibration does not rescue it -- for a drafter, accuracy *is* throughput. An fp8 e4m3
+per-channel drafter (~2-3% error) holds acceptance at 2.60-2.80 and is what the worked script serves.
+
 All tunables are `${VAR:-default}` in the compose file; override via the shell or a `.env` file without
 editing it. The full knob list (kernel toggles, draft controller, AITER routing, …) is in
 [DOCKERHUB.md](DOCKERHUB.md).
@@ -113,6 +157,10 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
   removes the stock config's `M>=96` cliff for a lower prefill TTFT, lossless), plus a custom bf16 MoE-gate
   GEMM (`RADIANCE_MOE_ROUTER`) for the `n` in `[6,16]` band that rocBLAS serves poorly. Both inert on
   models they do not apply to.
+- **Native MXFP4** for Quark OCP micro-scaling checkpoints (`RADIANCE_MXFP4`), bit-identical to vLLM's
+  emulation and multiples faster, plus an optional hand-written fp8-WMMA W4A8 prefill GEMM
+  (`RADIANCE_MXFP4_W4A8`) that reaches the fp8 matrix instruction Triton will not emit. See
+  [MXFP4](#mxfp4-4-bit-checkpoints).
 - **Lossless dynamic MTP drafting**: a per-request confidence gate plus verbatim n-gram tail that varies
   draft depth without changing what the model verifies.
 - **Prefix caching that works on the GDN hybrid** (enabled in the compose): hybrid models leave automatic
@@ -128,9 +176,11 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
 
 ## Layout
 
-Flat build context: the runtime Python modules (`radiance_*.py`), the `patch_*.py` fixes, the `fp8-configs/`
-and `moe-configs/` GEMM configs, the HIP kernel sources (`router_gemm.hip`, `radiance_ar_ext.hip`,
-`radiance_ar_quant_ext.hip`), the chat template, `Dockerfile`, and `docker-compose.yml` all live at the repo
-root so `docker build .` works directly. `prune_rocm.sh` is the ROCm slimming step (it self-checks: the
+Flat build context: the runtime Python modules (`radiance_*.py`), the `patch_*.py` fixes, the `fp8-configs/`,
+`moe-configs/` and `mxfp4-configs/` GEMM configs, the HIP kernel sources (`router_gemm.hip`,
+`radiance_ar_ext.hip`, `radiance_ar_quant_ext.hip`, `radiance_mxfp4_fp8.hip`), the chat template,
+`Dockerfile`, and `docker-compose.yml` all live at the repo root so `docker build .` works directly.
+`run_mxfp4_minm.sh` is a worked MXFP4 launch kept alongside them (a podman invocation from the box it was
+measured on, not part of the build). `prune_rocm.sh` is the ROCm slimming step (it self-checks: the
 arch's own kernels must survive and hipcc must still link a HIP shared object, since AITER JITs at runtime). The `Makefile` is a side tool for rebuilding a single HIP kernel
 against the image's toolchain during development; the image build compiles them itself.
