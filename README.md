@@ -123,9 +123,9 @@ way -- so it is a speed change with no quality dimension: measured on gate_up 17
 # 1. Build libr4d from main. The GDN overflow fixes are upstream now
 #    (StillDeadcode/libr4d PR #1, merged), but the only tag is still v0.4.0 and the 0.7.4 image
 #    pins that tag -- so the SHIPPED r4d.so predates the fix. Until deadcode cuts a new tag and
-#    an image that pins it, build from main.
+#    an image that pins it, build it yourself.
 git clone https://codeberg.org/StillDeadcode/libr4d.git
-cd libr4d
+cd libr4d && git checkout b9e42ab        # the commit these numbers were measured against
 #    Build inside the image the .so is loaded from -- the extension must be compiled with the
 #    same ROCm/hipcc it links against at runtime. libr4d's own `make IMAGE=...` does this too,
 #    but it shells out to `docker` with no SELinux label, so on a podman or SELinux-enforcing
@@ -139,8 +139,17 @@ cd ..
 R4D_SO=$PWD/libr4d MODELS=$HOME/models ./run_mxfp4_074.sh
 ```
 
-Verified reproducible: a fresh clone of libr4d main built this way produces an `r4d.so` that is
-byte-identical (sha256 `3026297b...`) to the one every number below was measured with.
+Verified reproducible: a fresh clone built this way produces an `r4d.so` byte-identical (sha256
+`3026297b...`) to the one every number below was measured with.
+
+The checkout is pinned deliberately. `main` is a moving branch with no tagged release past
+`v0.4.0`, and nothing in radiance version-checks the library it loads -- all six `radiance_*.py`
+modules just `import r4d` and call it. If a later commit renames an entry point or changes a
+compiled-in geometry constant, the registry and the constants disagree, `ENABLED` is set to False,
+and the build **falls back to the Triton path with only a line on stderr** -- you lose the
+performance rather than getting an error. Tracking `main` unpinned is fine if you want to; just
+read the R4D selections table the launcher prints at startup (`RADIANCE_R4D_REPORT=1`, on by
+default) and confirm the GDN and attention kernels actually bound.
 
 Skipping step 1 leaves you on the stock kernel, where the W4A8 path is unusable: WikiText-2
 perplexity 653586 against 8.3706. If you must run stock, set `RADIANCE_MXFP4_SANITIZE=1`, which
