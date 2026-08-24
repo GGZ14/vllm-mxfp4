@@ -120,20 +120,22 @@ way -- so it is a speed change with no quality dimension: measured on gate_up 17
 ### Running this build
 
 ```bash
-# 1. Build the patched libr4d. Stock 0.7.4 NaNs the gated-delta-net output on this model;
-#    see "The gated-delta-net NaN" below. This is not optional for MXFP4.
-git clone -b v0.4.0 https://codeberg.org/StillDeadcode/libr4d.git
-cd libr4d && git apply ../libr4d-gdn-overflow-guards.patch
-make IMAGE=stilldeadcode/vllm-radiance:0.7.4      # -> libr4d/r4d.so
+# 1. Build libr4d from main. The GDN overflow fixes are upstream now
+#    (StillDeadcode/libr4d PR #1, merged), but the only tag is still v0.4.0 and the 0.7.4 image
+#    pins that tag -- so the SHIPPED r4d.so predates the fix. Until deadcode cuts a new tag and
+#    an image that pins it, build from main.
+git clone https://codeberg.org/StillDeadcode/libr4d.git
+cd libr4d && make IMAGE=stilldeadcode/vllm-radiance:0.7.4   # -> libr4d/r4d.so
 cd ..
 
-# 2. Serve. R4D_SO points at that checkout; the launcher copies its r4d.so over the image's
-#    and applies this repo's patches at container start, so no image rebuild is needed.
+# 2. Serve. R4D_SO copies that r4d.so over the image's at container start, and this repo's
+#    patches are applied in the same prelude, so no image rebuild is needed.
 R4D_SO=$PWD/libr4d MODELS=$HOME/models ./run_mxfp4_074.sh
 ```
 
-Without the patched library, set `RADIANCE_MXFP4_SANITIZE=1` — the model then works, but a little
-slower and at PPL 8.4004 instead of 8.3706.
+Skipping step 1 leaves you on the stock kernel, where the W4A8 path is unusable: WikiText-2
+perplexity 653586 against 8.3706. If you must run stock, set `RADIANCE_MXFP4_SANITIZE=1`, which
+zeroes non-finite activations and gets you to 8.4004 -- worse than the fix, but serviceable.
 
 Checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with the MTP
 drafter requantized to fp8 (`~/mxfp4_work/fp8_mtp.py`). The drafter must NOT be MXFP4 -- 4-bit
@@ -161,34 +163,38 @@ because it is mostly R4D's paged attention, whose share of prefill grows with se
 (default 1, the int2 draft head, +6.5% decode), `MIN_M` (16), `SPEC` (4 -- measurably better than
 8 here), `CHUNK` (8192), `GPU_UTIL` (0.98).
 
-### The gated-delta-net NaN
+### The gated-delta-net NaN (fixed upstream)
 
-Stock libr4d v0.4.0 produces NaN in the gated-delta-net output on this model. It is not subtle
-once found: WikiText-2 PPL is **653586** with the W4A8 path and no mitigation.
-
-`libr4d-gdn-overflow-guards.patch` fixes three exponent overflows, all the same shape -- an
-unguarded `__expf` on an inactive lane or a split-form half, giving `0 * INF = NaN`:
+libr4d v0.4.0 produces NaN in the gated-delta-net output on this model -- WikiText-2 PPL **653586**
+with the W4A8 path and no mitigation. Three exponent overflows, all the same shape: an unguarded
+`__expf` on an inactive lane or a split-form half, giving `0 * INF = NaN`.
 
 1. **`kkt_solve`, padding rows.** `gi` is forced to 0 for `i >= rows` while `gb[j]` keeps its real
-   negative cumsum, so `d = -gb[j]` is large POSITIVE and overflows -- the opposite of the "never
-   positive" invariant the code asserts, which holds only for live rows. The NaNs land in padding
-   rows of the 64x64 tile and the blocked inverse merges the whole tile with WMMA, so they reach
-   live rows. Adding `live &&` takes `A` from 16 non-finite values to 0.
+   negative cumsum, so `d = -gb[j]` is large POSITIVE -- the opposite of the "never positive"
+   invariant the code asserts, which holds only for live rows. The NaNs land in padding rows of the
+   64x64 tile and the blocked inverse merges the whole tile with WMMA, so they reach live rows.
 2. **`chunk_scan`, split-form halves.** `e^{g_i-c}.e^{c-g_j}` with `cref` at the chunk midpoint
-   gives each half +/-(gate span)/2, so a span past ~176 sends one half to +INF and the other to
-   0. `kkt_solve`'s own header documents this hazard as its reason for using the direct form.
-3. **`chunk_scan`, `V'` staging.** The dominant one, and only visible across chunks. The binding
-   limit is not fp32: `V' = V.gv[t]` is staged in **bf16**, so `gv` must leave room for `V` under
-   bf16's 3.4e38 ceiling. Clamping at `e^88` still NaNs; `e^80` leaves ~3x margin.
+   gives each half +/-(gate span)/2; a span past ~176 sends one to +INF and the other to 0.
+3. **`chunk_scan`, `V'` staging.** The dominant one, and only visible across chunks. `V' = V.gv[t]`
+   is staged in **bf16**, so `gv` must leave room for `V` under bf16's 3.4e38 ceiling. Clamping at
+   `e^88` still NaNs; `e^80` leaves margin.
 
-The clamp bounds the damage rather than removing the cause. The clean fix is to stop splitting a
-per-token weight that is provably <= 1 into a huge x tiny pair: stage `V'` in fp32, or scale by
-`e^{gl-g_t}` directly on the state path. Measured tradeoff, PPL over 208,539 tokens:
-70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, stock -> 653586.
+Fixed in **StillDeadcode/libr4d PR #1** (merged 2026-08-24). Not in a tag yet, hence the build-from-
+main step above.
 
-This also fixed a second symptom: `RADIANCE_FAST_DRAFT` used to hang a worker at chunk 8192. The
-draft head was being fed NaN like everything else downstream of the GDN core, so fixing the kernel
-removed the hang and let the full 8192 chunk stay (chunk 4096 costs ~10% of long-context prefill).
+Clamp value, measured over 208,539 WikiText-2 tokens with no other mitigation:
+70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586.
+
+**The clamp bounds the damage; it does not remove the cause** -- and upstream sharpened this point
+when merging. The original note here claimed the clamped product "evaluates to 0, which is the
+correct answer". That is wrong: what leaves range is the distance from `cref`, not `g_i-g_j`, so on
+a span-200 chunk the last token's own diagonal -- and its `e^{gl-g_t} ~ 1` weight into the state,
+which the next chunk reads -- are *attenuated* by `e^{80-(cref-g_t)}` rather than correctly
+vanishing. The real fix is to stop splitting a weight that is provably <= 1 into a huge x tiny
+pair: stage `V'` in fp32, or apply `e^{gl-g_t}` directly on the state path.
+
+Fixing this also removed a second symptom: `RADIANCE_FAST_DRAFT` used to hang a worker at chunk
+8192 because the draft head was being fed NaN like everything else downstream of the GDN core.
 
 **`RADIANCE_MXFP4_MAX_M` is retired** (it was read up to 0.5.8). It handed big batches back to emulation as
 a throughput win on paper; in practice quark's TileLang backend cannot initialise inside a vLLM worker, and

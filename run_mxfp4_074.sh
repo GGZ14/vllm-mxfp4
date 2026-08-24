@@ -108,9 +108,11 @@ MAXLEN=${MAXLEN:-262144}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 # Patched libr4d (three GDN exponent-overflow guards). Stock 0.7.4 NaNs the gated-delta-net
 # output on this model; see README. Set R4D_SO= to fall back to the image's stock r4d.so.
-# Point this at a libr4d checkout carrying libr4d-gdn-overflow-guards.patch, built with
-# ./build.sh (its r4d.so is copied over the image's at container start). STRONGLY RECOMMENDED:
-# stock 0.7.4 NaNs the gated-delta-net output on this model -- WikiText-2 PPL 653586 vs 8.3706.
+# Point this at a libr4d checkout built from MAIN; its r4d.so is copied over the image's at
+# container start. The GDN overflow fixes are upstream (StillDeadcode/libr4d PR #1, merged) but
+# there is still no tag past v0.4.0, and the 0.7.4 image pins v0.4.0 -- so the SHIPPED kernel
+# predates the fix and NaNs the gated-delta-net output on this model: WikiText-2 PPL 653586 vs
+# 8.3706. Once deadcode tags a release and ships an image pinning it, this override can go away.
 # Leave empty to use the image's stock r4d.so, in which case set RADIANCE_MXFP4_SANITIZE=1.
 R4D_SO=${R4D_SO:-}
 # Batch size above which the W4A8 fp8-WMMA kernel takes over from aiter's W4A4 Triton path.
