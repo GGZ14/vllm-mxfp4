@@ -105,6 +105,7 @@ SPEC=${SPEC:-4}
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 # Patched libr4d (three GDN exponent-overflow guards). Stock 0.7.4 NaNs the gated-delta-net
 # output on this model; see README. Set R4D_SO= to fall back to the image's stock r4d.so.
 # Point this at a libr4d checkout carrying libr4d-gdn-overflow-guards.patch, built with
@@ -187,7 +188,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -v "${HF_CACHE:-$HOME/.cache/huggingface}":/root/.cache/huggingface \
   -v "${MODELS:-$HOME/models}":/models \
   -v "$CACHE":/cache \
-  -v "${PATCHES:-$(cd "$(dirname "$0")" \&\& pwd)}":/patches:z \
+  -v "${PATCHES:-$SCRIPT_DIR}":/patches:z \
   ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
   ${R4D_SO:+-e R4D_SO="$R4D_SO"} \
   --entrypoint bash \
@@ -225,4 +226,5 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":true}" \
     --no-async-scheduling $EXTRA \
     --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+    --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
     --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja
