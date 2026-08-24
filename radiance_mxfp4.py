@@ -10,6 +10,12 @@ This is a NUMERICS change, not just a speed one: the checkpoint declares W4A4 an
 fp8 activations are strictly more precise than the fp4 the model was calibrated against, but output
 is no longer bit-identical to emulation, so it is opt-in via RADIANCE_MXFP4_W4A8=1 and only above
 RADIANCE_MXFP4_W4A8_MIN_M (default 256, where the fp8 kernel starts winning).
+
+Integration: vLLM 0.27 replaced QuarkOCP_MX's inline dispatch with a kernel plugin ABC --
+MxFp4LinearKernel, selected in priority order from _POSSIBLE_MXFP4_KERNELS[platform] by
+init_mxfp4_linear_kernel(). RadianceMxfp4W4A8LinearKernel below is that plugin;
+patch_quark_mxfp4.py does nothing but put it at the head of the ROCm list. Before 0.27 this took
+seven string hunks against a single 389-line file, all of which the rewrite invalidated.
 """
 import os
 import sys
@@ -92,3 +98,103 @@ def layer_is_supported(layer, K: int) -> bool:
                     and layer.weight_scale.shape[0] == K // 32)
     except Exception:
         return False
+
+
+# --------------------------------------------------------------------------------------------
+# The vLLM 0.27 kernel plugin
+# --------------------------------------------------------------------------------------------
+# Deliberately NOT composed with AiterMxfp4LinearKernel. Its __init__ asserts is_supported(), which
+# gates on current_platform.supports_mx() -- a CDNA4 (gfx950/gfx1250) allowlist that gfx1201 fails.
+# The sub-MIN_M fallback calls torch.ops.vllm.gemm_with_dynamic_quant directly instead. That op is
+# registered by vllm/model_executor/kernels/linear/mxfp4/aiter.py under
+# `if is_aiter_found_and_supported():`, which does NOT consult supports_mx(), so it is present here.
+
+
+def _on_gfx12x() -> bool:
+    try:
+        from vllm.platforms.rocm import on_gfx12x
+        return bool(on_gfx12x())
+    except Exception:
+        return False
+
+
+def _asm_gemm_enabled() -> bool:
+    try:
+        from vllm._aiter_ops import rocm_aiter_ops
+        return bool(rocm_aiter_ops.is_asm_fp4_gemm_dynamic_quant_enabled())
+    except Exception:
+        return False
+
+
+def _make_kernel_class():
+    """Built lazily so importing this module never drags in vllm.model_executor.kernels."""
+    from vllm.model_executor.kernels.linear.mxfp4.base import (
+        MxFp4LinearKernel,
+        MxFp4LinearLayerConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+
+    class RadianceMxfp4W4A8LinearKernel(MxFp4LinearKernel):
+        """MXFP4 weights x fp8 activations on gfx1201, via the hand-written fp8-WMMA GEMM."""
+
+        @classmethod
+        def is_supported(cls, compute_capability=None):
+            if not ENABLED or _ext is None:
+                return False, "RADIANCE_MXFP4_W4A8 is not enabled, or the HIP extension is missing"
+            if not _on_gfx12x():
+                return False, "the radiance W4A8 MXFP4 kernel is compiled for gfx12x only"
+            return True, None
+
+        @classmethod
+        def can_implement(cls, config: MxFp4LinearLayerConfig):
+            if config.activation_quant_key != kMxfp4Dynamic:
+                return False, "only supports MXFP4 dynamic activation"
+            # The asm path stores weights shuffled (16,16) and the scale in a swizzled layout;
+            # this kernel reads the plain packed weight and a [K/32, N] scale, and the sub-MIN_M
+            # fallback would hand shuffled operands to the non-asm aiter GEMM. Decline instead of
+            # silently computing the wrong thing -- AiterMxfp4LinearKernel takes it from here.
+            if _asm_gemm_enabled():
+                return False, "aiter asm fp4 GEMM is enabled; its weight layout is incompatible"
+            return True, None
+
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            # Same transpose AiterMxfp4LinearKernel's non-asm branch does: create_weights lays the
+            # scale out as [N, K/32] and both the aiter GEMM and this kernel want [K/32, N].
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.data.T.contiguous(), requires_grad=False)
+
+            K = layer.weight.shape[1] * 2          # weights are 2 e2m1 codes per byte
+            ok = layer_is_supported(layer, K)
+            # Every layer carries the attribute so apply_weights never branches on hasattr, which
+            # dynamo would have to guard. Ineligible layers get a 1-element placeholder, and the
+            # op passes 0 for it, which makes the kernel take the per-block-rescale path.
+            ref = make_row_ref(layer.weight_scale.data) if ok else torch.zeros(
+                1, dtype=layer.weight_scale.dtype, device=layer.weight_scale.device)
+            layer.radiance_wref = torch.nn.Parameter(ref, requires_grad=False)
+            layer.radiance_w4a8_ok = bool(ok)
+
+        def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
+                          bias: torch.Tensor | None = None) -> torch.Tensor:
+            y = torch.ops.radiance.mxfp4_linear(
+                x, layer.weight, layer.weight_scale, layer.radiance_wref,
+                layer.radiance_w4a8_ok, False)
+            if bias is not None:
+                y = y + bias
+            return y
+
+    return RadianceMxfp4W4A8LinearKernel
+
+
+_KERNEL_CLS = None
+
+
+def kernel_class():
+    """The plugin class, built once. Returns None if anything about it is unavailable."""
+    global _KERNEL_CLS
+    if _KERNEL_CLS is None:
+        try:
+            _KERNEL_CLS = _make_kernel_class()
+        except Exception as e:
+            sys.stderr.write(f"[radiance.mxfp4] kernel class unavailable, disabled: {e!r}\n")
+            _KERNEL_CLS = False
+    return _KERNEL_CLS or None
