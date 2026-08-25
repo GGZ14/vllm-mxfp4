@@ -170,13 +170,6 @@ def fused_prefill(q, k, v, A, g, beta, scale, initial_state, output_final_state,
 # =================================================================================================
 
 ALL = ENABLED
-# which step kinds the fused path takes; "both" in production, one of them when bisecting
-PATHS = os.environ.get("RADIANCE_GDN_PATHS", "both")
-# The gated RMS norm is off by default until it is priced in a trace: it sits INSIDE the compiled
-# region, where vLLM's fuse_norm_quant pass may already have claimed it, and replacing a fused
-# norm+quant with this norm plus a separate quant would be a regression dressed as a win.
-NORM_FUSE = ALL and os.environ.get("RADIANCE_GDN_NORM", "0") == "1"
-CHECK = os.environ.get("RADIANCE_GDN_CHECK", "0") == "1"
 SOFTPLUS_THRESHOLD = 20.0          # FLA's, and the value both kernels are validated against
 _fallbacks = {}
 _seen = set()
@@ -293,53 +286,6 @@ def kkt_solve(k, beta, g, cu, num_seqs, T, H, Hg):
     return A
 
 
-def _norm_params(self):
-    """(fp32 weight, eps, act code) for the layer's gated RMS norm, or None if it is not the shape
-    the kernels implement. Cached: the weight is 128 values and never changes."""
-    p = getattr(self, "_radiance_norm_params", "miss")
-    if p == "miss":
-        n = getattr(self, "norm", None)
-        ok = (n is not None and getattr(n, "group_size", None) is None
-              and getattr(n, "norm_before_gate", False) is True
-              and getattr(n, "bias", None) is None
-              and n.weight.numel() == HEAD_V
-              and getattr(n, "activation", "silu") in ("silu", "swish", "sigmoid"))
-        p = ((n.weight.detach().float().contiguous(), float(n.eps),
-              1 if n.activation == "sigmoid" else 0) if ok else None)
-        self._radiance_norm_params = p
-    return p
-
-
-def output_norm(self, core_attn_out, z):  # noqa: C901
-    """The layer's gated RMS norm, in R4D. Returns the normalised tensor, or None to leave it to
-    the original path.
-
-    On the decode path the recurrent kernel has already applied it (its workgroup owns the whole
-    128-channel row, so it costs a reduction rather than a kernel), and this returns the buffer
-    untouched. On the prefill path it cannot be fused -- the chunked scan's workgroup owns 64 of
-    the 128 channels of a row -- so it launches one kernel over the rows.
-    """
-    self.__dict__.pop("_radiance_z", None)          # never let the stash outlive the step
-    if not NORM_FUSE or _r4d is None:
-        return None
-    if self.__dict__.pop("_radiance_normed", False):
-        return core_attn_out                       # already normalised inside the decode kernel
-    np_ = _norm_params(self)
-    if np_ is None:
-        return None
-    w, eps, act = np_
-    x = core_attn_out.reshape(-1, HEAD_V)
-    zz = z.reshape(-1, HEAD_V)
-    if (x.dtype != torch.bfloat16 or zz.dtype != torch.bfloat16
-            or x.stride(1) != 1 or zz.stride(1) != 1):
-        return None
-    out = torch.empty_like(x)
-    _GATED_RMSNORM(
-        x.data_ptr(), zz.data_ptr(), w.data_ptr(), out.data_ptr(), x.shape[0],
-        x.stride(0), zz.stride(0), out.stride(0), HEAD_V, eps, act, _stream())
-    return out
-
-
 def recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx, num_accepted,
                      num_seqs, H, Hg, scale, z_gate=None, norm=None):
     # The slot and head strides come from the tensor: vLLM pads the mamba page to the attention
@@ -412,11 +358,6 @@ def _plan(self, mixed_qkv, b, a, core_attn_out):
         return no(f"mixed batch: prefills {md.num_prefills} decodes {md.num_decodes} "
                   f"spec {spec is not None}")
 
-    if kind == "decode" and PATHS not in ("both", "decode"):
-        return no("decode path disabled by RADIANCE_GDN_PATHS")
-    if kind != "decode" and PATHS not in ("both", "prefill"):
-        return no("prefill path disabled by RADIANCE_GDN_PATHS")
-
     sidx = None
     if have_spec:
         sidx = md.spec_state_indices_tensor
@@ -445,11 +386,6 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
     if plan is None:
         return False
 
-    # Take the stashed z and DROP the attribute in the same breath: holding it on the layer keeps
-    # one per-step tensor alive per layer between steps, which at this model's chunk size is about
-    # 25 MB x 48 layers of memory the allocator can never reuse -- enough to OOM a serve that runs
-    # at 0.95 utilisation.
-    z_stash = self.__dict__.pop("_radiance_z", None)
     kind, T, conv_state, ssm_state, md, (sidx, cu) = plan
     H = self.num_v_heads // self.tp_size
     Hg = self.num_k_heads // self.tp_size
@@ -462,30 +398,13 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         nseq = md.num_spec_decodes
         maxq = sidx.size(-1)
         cu = md.spec_query_start_loc[: nseq + 1]
-        if CHECK:
-            _check_decode(self, mixed_qkv, a, b, conv_w, A_log, dt_bias, conv_state, ssm_state,
-                          sidx, cu, md, nseq, maxq, T, H, Hg)
         q, k, v = conv_update(mixed_qkv, conv_w, self.conv1d.bias, conv_state,
                               (4 - 1) + (maxq - 1), sidx[:, 0][:nseq],
                               md.num_accepted_tokens, cu, nseq, T, H, Hg, maxq)
         _first("decode")
         o = core_attn_out[:T].view(T, H, HEAD_V)
-        # Fold the layer's gated RMS norm into this kernel when z is visible: the workgroup owns
-        # the whole 128-channel row here, so it is a reduction rather than a second pass. z is
-        # stashed by the ROCm entry point (patch_r4d.py); without it the norm stays where it
-        # was and output_norm() takes the prefill route.
-        zg = z_stash if NORM_FUSE else None
-        nrm = _norm_params(self) if NORM_FUSE else None
-        if (zg is not None and nrm is not None and zg.dtype == torch.bfloat16
-                and zg.shape[0] >= T and zg.stride(-1) == 1
-                and zg.reshape(-1, HEAD_V).stride(0) == HEAD_V):
-            recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx,
-                             md.num_accepted_tokens, nseq, H, Hg, HEAD_K ** -0.5,
-                             z_gate=zg[:T], norm=nrm)
-            self._radiance_normed = True
-        else:
-            recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx,
-                             md.num_accepted_tokens, nseq, H, Hg, HEAD_K ** -0.5)
+        recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx,
+                         md.num_accepted_tokens, nseq, H, Hg, HEAD_K ** -0.5)
         return True
 
     # ---- chunked prefill, with or without a spec group riding along --------------------------

@@ -141,7 +141,7 @@ def section_opts():
 
     print("  " + dim("feature toggles (set to 0 to disable):"))
     for name, dflt, desc in [
-        ("RADIANCE_USE_R4D",          "1", "hand-written gfx1201 kernels: attention, gated delta net, vision, all-reduce, router GEMM"),
+        ("RADIANCE_USE_R4D",          "1", "hand-written gfx1201 kernels: attention, gated delta net, vision, all-reduce, skinny GEMM"),
         ("RADIANCE_USE_R4D_AR",       "1", "P2P one-shot all-reduce for TP=2, byte-identical to RCCL"),
         ("RADIANCE_USE_R4D_AR_QUANT", "1", "compressed all-reduce payload for large messages: rotated 6-bit (on; not RCCL-identical)"),
         ("RADIANCE_PRESHUFFLE",       "1", "preshuffled AITER FP8 blockscale GEMM"),
