@@ -369,12 +369,14 @@ template <int DWN, int DBK, int DKS, int DTM>
 __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
-    float *__restrict__ P, int M, int N, int K) {
+    const float *__restrict__ As, float *__restrict__ P, int *__restrict__ cnt,
+    __bf16 *__restrict__ C, int M, int N, int K) {
   constexpr int BND = DWN * 16;
   constexpr int DASTR = DBK + DEC_PAD, DWSTR = DBK + DEC_PAD;
   constexpr int DNTHREADS = DWN * 32;
   __shared__ unsigned char sA[DEC_MTILE * DTM * DASTR];
   __shared__ unsigned char sW[BND * DWSTR];
+  __shared__ int s_last;
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
@@ -461,18 +463,30 @@ __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
         if (m < M) P[((size_t)ks * M + m) * N + n] = acc[i][e];
       }
   }
-}
 
-__global__ void radiance_mxfp4_fp8_decode_reduce(
-    const float *__restrict__ P, const unsigned char *__restrict__ Wref,
-    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int DKS) {
-  const int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n >= N) return;
-  const float rf = __int_as_float((int)Wref[n] << 23);
-  for (int m = 0; m < M; ++m) {
-    float s = 0.f;
-    for (int k = 0; k < DKS; ++k) s += P[((size_t)k * M + m) * N + n];
-    C[(size_t)m * N + n] = (__bf16)(s * rf * As[m]);
+  // Fused reduction. The DKS blocks covering one n-range race on an atomic counter and whoever
+  // arrives last reduces in place, so there is no second kernel launch -- 13,376 of them per
+  // decode run in the profile, at a 4.5 us mean host gap. It is also faster in pure kernel time
+  // (-5.5% on gate_up to -29% on gdn.out) because the partials are still in cache when the
+  // reduction reads them. The last block resets the counter, leaving it zeroed for the next
+  // launch; launches on one stream are serialised, so no separate clearing pass is needed.
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence();
+    s_last = (atomicAdd(&cnt[blockIdx.x], 1) == DKS - 1);
+  }
+  __syncthreads();
+  if (!s_last) return;
+  if (tid == 0) cnt[blockIdx.x] = 0;
+
+  const int nhi = min(n0 + BND, N);
+  for (int nn = n0 + tid; nn < nhi; nn += DNTHREADS) {
+    const float rf = __int_as_float((int)Wref[nn] << 23);
+    for (int m = 0; m < M; ++m) {
+      float sum = 0.f;
+      for (int k = 0; k < DKS; ++k) sum += P[((size_t)k * M + m) * N + nn];
+      C[(size_t)m * N + nn] = (__bf16)(sum * rf * As[m]);
+    }
   }
 }
 
@@ -494,9 +508,12 @@ __global__ void radiance_mxfp4_fp8_decode_reduce(
 static float *g_decode_partial = nullptr;
 static size_t g_decode_partial_bytes = 0;
 
-static void set_decode_scratch(uintptr_t ptr, size_t bytes) {
+static int *g_decode_cnt = nullptr;
+
+static void set_decode_scratch(uintptr_t ptr, size_t bytes, uintptr_t cnt) {
   g_decode_partial = (float *)ptr;
   g_decode_partial_bytes = bytes;
+  g_decode_cnt = (int *)cnt;        // must be ZEROED by the caller, once
 }
 
 static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
@@ -518,24 +535,23 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
     }();
     dim3 fblock(NTHREADS);
     if (M > 0 && M <= decode_max_m && M <= DEC_MTILE * DEC_MAX_TM && N <= DEC_MAX_N &&
-        (size_t)DEC_KS * M * N * sizeof(float) <= g_decode_partial_bytes && g_decode_partial) {
+        (size_t)DEC_KS * M * N * sizeof(float) <= g_decode_partial_bytes &&
+        g_decode_partial && g_decode_cnt) {
       constexpr int DWN = 8, DBK = 128, DKS = DEC_KS;  // tuned: ~/mxfp4_work/tier5/RESULTS.md
       constexpr int DBND = DWN * 16;
       float *P = g_decode_partial;
       const dim3 dgrid((N + DBND - 1) / DBND, 1, DKS), dblock(DWN * 32);
       const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;   // smallest tile that covers M
-#define RAD_DEC_LAUNCH(TM_)                                                                  \
-      hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_decode<DWN, DBK, DKS, TM_>), dgrid, dblock, \
-                         0, (hipStream_t)stream, (const unsigned char *)a,                    \
-                         (const unsigned char *)w, (const unsigned char *)ws,                 \
-                         (const unsigned char *)wref, P, M, N, K)
+#define RAD_DEC_LAUNCH(TM_)                                                                   \
+      hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_decode<DWN, DBK, DKS, TM_>), dgrid, dblock,  \
+                         0, (hipStream_t)stream, (const unsigned char *)a,                     \
+                         (const unsigned char *)w, (const unsigned char *)ws,                  \
+                         (const unsigned char *)wref, (const float *)as, P, g_decode_cnt,      \
+                         (__bf16 *)c, M, N, K)
       if (tm == 1)      RAD_DEC_LAUNCH(1);
       else if (tm == 2) RAD_DEC_LAUNCH(2);
       else              RAD_DEC_LAUNCH(3);
 #undef RAD_DEC_LAUNCH
-      hipLaunchKernelGGL(radiance_mxfp4_fp8_decode_reduce, dim3((N + 255) / 256), dim3(256), 0,
-                         (hipStream_t)stream, P, (const unsigned char *)wref,
-                         (const float *)as, (__bf16 *)c, M, N, DKS);
       return;
       // no scratch (alloc failed) -- fall through to the folded kernel, never produce nothing
     }
@@ -565,5 +581,5 @@ PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   // Hand in a torch-owned fp32 buffer for the decode kernel's split-K partials. Call once per
   // worker at weight-load time; the caller must keep the tensor alive.
   m.def("set_decode_scratch", &set_decode_scratch,
-        "register the split-K partial buffer (ptr, bytes) for the decode kernel");
+        "register the split-K partial buffer (ptr, bytes) and the zeroed block counter");
 }
