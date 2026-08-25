@@ -26,6 +26,12 @@ ENABLED = os.environ.get("RADIANCE_MXFP4_W4A8", "0") == "1"
 MIN_M = int(os.environ.get("RADIANCE_MXFP4_W4A8_MIN_M", "256"))
 # Decode band for the small-M kernel. 0 = dark. Also gates the scratch preallocation.
 DECODE_MAX_M = int(os.environ.get("RADIANCE_MXFP4_DECODE_MAX_M", "0"))
+# Hoist the activation quant into the traced graph so the rms+quant fusion can match it.
+# Needs MIN_M <= 0 (see apply_weights); refuses rather than producing wrong results.
+HOIST_QUANT = os.environ.get("RADIANCE_MXFP4_HOIST_QUANT", "0") == "1"
+if HOIST_QUANT and MIN_M > 0:
+    raise RuntimeError("RADIANCE_MXFP4_HOIST_QUANT=1 needs RADIANCE_MXFP4_W4A8_MIN_M=0: "
+                       "the aiter fallback quantizes to mxfp4, not fp8.")
 _decode_scratch_ready = [False]
 _decode_scratch = [None, None]   # [partials, block counter] — kept alive for the process
 
@@ -359,6 +365,31 @@ def mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tens
     return out.clone() if CLONE_OUT else out
 
 
+# ---- pre-quantized variant -------------------------------------------------------------------
+# Same kernel dispatch, but the fp8 activation quant happens in apply_weights rather than in here.
+# The point is VISIBILITY: a torch.library.custom_op is opaque to inductor by construction, so with
+# the quant inside, vLLM's rms_norm+quant fusion pattern matches zero times -- measured, the launch
+# count did not move. Hoisting is necessary but not sufficient; it pairs with
+# RADIANCE_RMS_QUANT_FUSION, which supplies a replacement op that works on RDNA4.
+@torch.library.custom_op("radiance::mxfp4_linear_pq", mutates_args=())
+def mxfp4_linear_pq(x_fp8: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor,
+                    weight_scale: torch.Tensor, weight_ref: torch.Tensor) -> torch.Tensor:
+    if not _stats_reported[0]:
+        report_stats()
+    M, N = x_fp8.shape[0], weight.shape[0]
+    K = weight_scale.shape[0] * 32
+    out = torch.empty((M, N), device=x_fp8.device, dtype=torch.bfloat16)
+    _ext.launch(x_fp8.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(),
+                weight_ref.data_ptr(), x_scale.data_ptr(), out.data_ptr(),
+                M, N, K, torch.cuda.current_stream().cuda_stream)
+    return out
+
+
+@mxfp4_linear_pq.register_fake
+def _(x_fp8, x_scale, weight, weight_scale, weight_ref):
+    return torch.empty((x_fp8.shape[0], weight.shape[0]), device=x_fp8.device, dtype=torch.bfloat16)
+
+
 @mxfp4_linear.register_fake
 def _(x, weight, weight_scale, weight_ref):
     return torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
@@ -490,7 +521,7 @@ def _make_kernel_class():
                     # capture, and any C++ exception escaping our pybind module gets relabelled by
                     # quark's TileLang exception translator into a bogus "libamdhip64.so not found".
                     _decode_scratch[0] = torch.empty(
-                        4 * 48 * 32768, dtype=torch.float32, device=layer.weight.device)
+                        4 * 64 * 32768, dtype=torch.float32, device=layer.weight.device)
                     # Block counter for the fused reduction, one int per n-block. MUST start
                     # zeroed; the kernel's last-arriving block resets it, so it stays that way.
                     _decode_scratch[1] = torch.zeros(
@@ -544,8 +575,18 @@ def _make_kernel_class():
 
         def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                           bias: torch.Tensor | None = None) -> torch.Tensor:
-            y = torch.ops.radiance.mxfp4_linear(
-                x, layer.weight, layer.weight_scale, layer.radiance_wref)
+            if HOIST_QUANT:
+                # Quantize in the TRACED region so the rms+quant fusion can see it. Only valid at
+                # MIN_M <= 0: the aiter fallback quantizes activations to mxfp4, not fp8, so it
+                # cannot consume a pre-quantized fp8 input. Asserted at import, not per call.
+                from vllm import _custom_ops as _o
+                x_fp8, x_scale = _o.scaled_fp8_quant(x, scale=None, use_per_token_if_dynamic=True)
+                y = torch.ops.radiance.mxfp4_linear_pq(
+                    x_fp8, x_scale.view(-1).float(), layer.weight, layer.weight_scale,
+                    layer.radiance_wref)
+            else:
+                y = torch.ops.radiance.mxfp4_linear(
+                    x, layer.weight, layer.weight_scale, layer.radiance_wref)
             if bias is not None:
                 y = y + bias
             return y

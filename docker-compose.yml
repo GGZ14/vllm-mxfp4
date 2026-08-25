@@ -10,7 +10,7 @@
 # this file, e.g.:  MAX_NUM_SEQS=16 MAX_MODEL_LEN=32768 docker compose up -d
 services:
   vllm:
-    image: ${IMAGE:-vllm-radiance:0.7.4}
+    image: ${IMAGE:-vllm-radiance:0.9.3}
     container_name: vllm-radiance
     restart: unless-stopped
     command:
@@ -82,7 +82,7 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_coder
       - --reasoning-parser=qwen3
-      - --chat-template=/work/qwen3.6-enhanced.jinja
+      - --chat-template=/work/qwen3.8-enhanced.jinja
       - --language-model-only
       - --trust-remote-code
       - --host=0.0.0.0
@@ -103,7 +103,7 @@ services:
       # radiance rms+group-fp8-quant fusion coverage fix (also baked default 1; explicit here).
       RADIANCE_FUSE_RMS_QUANT: "1"
       # master switch for the hand-written gfx1201 kernel library: attention, the gated delta net,
-      # vision attention, the all-reduce and the router GEMM. Set "0" and every one of them reverts
+      # vision attention, the all-reduce and the skinny GEMM. Set "0" and every one of them reverts
       # to the stock path (also drop --attention-backend=R4D above, which then refuses to start).
       RADIANCE_USE_R4D: "${RADIANCE_USE_R4D:-1}"
       # the P2P one-shot all-reduce itself; "0" keeps RCCL. Bit-identical to RCCL either way.
@@ -127,11 +127,18 @@ services:
       # entirely ("1:8,2:8,4:8,8:8") measures -7.5% at eight streams, so they do bind.
       RADIANCE_DRAFT_SCHEDULE: "${RADIANCE_DRAFT_SCHEDULE:-1:8,2:7,4:6,8:5,16:4}"
       RADIANCE_DRAFT_TAU: "${RADIANCE_DRAFT_TAU:-0.28}"
-      # 2-bit draft head instead of the 4-bit default: +3.2% tokens/s single-stream with drafting
-      # acceptance unchanged, and it matches the exact bf16 argmax on every one of 8192 real draft
-      # inputs where the 4-bit head deviates on 22. Opt-in because it is a larger change than a
-      # tuning knob. MUST be declared here to be settable: compose only forwards declared vars.
-      RADIANCE_FAST_DRAFT: "${RADIANCE_FAST_DRAFT:-0}"
+      # The tuned drafter stack, as one switch: the draft head at 2 bits with an exact rerank
+      # (+16.6% tokens/s single-stream, +12.5% at eight, acceptance unchanged, and it matches the
+      # exact bf16 argmax on every one of 8192 real draft inputs), and -- on a dflash drafter,
+      # which this MTP configuration is not -- its weights at 4 bits. Opt-in because it is a
+      # larger change than a tuning knob.
+      # ON by default, and the DRAFT_TAU above is the matching value: 0.28 is what was tuned FOR
+      # the 2-bit head, because a cheaper draft step lowers the marginal acceptance a draft
+      # position has to clear. If you set FAST_DRAFT="0" to get the stock bf16 head back, set
+      # DRAFT_TAU="0.35" with it -- that is the measured value there, and leaving them crossed
+      # drafts deeper than the expensive head pays for.
+      # MUST be declared here to be settable: compose only forwards declared vars.
+      RADIANCE_FAST_DRAFT: "${RADIANCE_FAST_DRAFT:-1}"
       NCCL_PROTO: Simple
       # throttle inductor compile workers to limit peak compile-time RAM (defensive).
       TORCHINDUCTOR_COMPILE_THREADS: "4"
@@ -160,7 +167,7 @@ services:
       # override any of these via the shell or a .env file (e.g. MODELS=/data/models)
       - ${MODELS:-./models}:/models:ro           # holds your model at Qwen/Qwen3.8-27B-FP8 (matches command: below)
       - ${VLLM_CACHE:-./vllm-cache}:/cache        # torch.compile / aiter JIT cache, persist across restarts
-      - ${WORK:-.}:/work:ro                        # supplies /work/qwen3.6-enhanced.jinja (this repo directory)
+      - ${WORK:-.}:/work:ro                        # supplies /work/qwen3.8-enhanced.jinja (this repo directory)
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s

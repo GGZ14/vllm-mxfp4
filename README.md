@@ -33,7 +33,7 @@ base (digest-pinned) and leaves the wheels in `/wheels` (it also builds `rocm-ba
 sweep). **rocmprune** (`prune_rocm.sh`) cuts the 19 GB ROCm tree down to this one GPU architecture.
 **assemble** installs the wheels, applies the RDNA4 correctness patches, and clones and compiles
 [libr4d](https://codeberg.org/StillDeadcode/libr4d) -- the hand-written gfx1201 kernel library (paged
-attention, the fused gated-delta-net prefill scan, the P2P all-reduce, the MoE router GEMM) -- with the
+attention, the fused gated-delta-net prefill scan, the P2P all-reduce, the skinny bf16 GEMM) -- with the
 image's own `hipcc`. **final** is the release image: a clean `ubuntu:24.04` that receives only the pruned ROCm tree, the
 venv, and the entrypoint, so neither the build toolchain nor the wheels ever reach the published image. No
 prebuilt component wheels, no rotating wheel indexes, and no checked-in binaries go into the image. It is a
@@ -344,15 +344,32 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
   Needs head_dim 256, paged block 16, 6 query heads per KV head, causal attention and a bf16 or fp8 KV
   cache; any other shape is refused at startup with the reason, and nothing changes unless you ask for it.
 - **Fine-grained MoE support** (e.g. Qwen3.6-35B-A3B): RDNA4-tuned fused-MoE Triton configs (always on;
-  removes the stock config's `M>=96` cliff for a lower prefill TTFT, lossless), plus a custom bf16 MoE-gate
-  GEMM for the `n` in `[6,16]` band that rocBLAS serves poorly. Both inert on
-  models they do not apply to.
+  removes the stock config's `M>=96` cliff for a lower prefill TTFT, lossless), plus the skinny bf16 GEMM
+  below on the MoE gate. Both inert on models they do not apply to.
+- **Skinny bf16 GEMM** (`RADIANCE_SKINNY_GEMM`, on): a projection small enough that rocBLAS lays it out as a
+  handful of workgroups leaves most of the machine idle. The R4D split-K kernel takes those shapes for `M` in
+  `[6,64]`. The default set is the ones that are a clear win alone; `all` adds shapes that differ from
+  rocBLAS at a bf16 ULP, most importantly the gated-delta-net `in_proj_ba` -- 480 KiB run 48 times per step,
+  28.5us against 3.6us.
 - **Native MXFP4** for Quark OCP micro-scaling checkpoints (`RADIANCE_MXFP4`), bit-identical to vLLM's
   emulation and multiples faster, plus an optional hand-written fp8-WMMA W4A8 prefill GEMM
   (`RADIANCE_MXFP4_W4A8`) that reaches the fp8 matrix instruction Triton will not emit. See
   [MXFP4](#mxfp4-4-bit-checkpoints).
 - **Lossless dynamic MTP drafting**: a per-request confidence gate plus verbatim n-gram tail that varies
-  draft depth without changing what the model verifies.
+  draft depth without changing what the model verifies. `mtp` only -- it works by stopping a serial loop of
+  draft forwards early, and a `dflash` drafter has no such loop (it emits every position in one graphed pass).
+- **The tuned drafter stack** (`RADIANCE_FAST_DRAFT`, one switch, opt-in): the draft head at 2 bits with an
+  exact rerank (any drafter), plus a `dflash` drafter's decoder projections packed to signed symmetric int4
+  -- one f16 scale per 128 input channels, no zero point, 4.25 bits per weight -- on two purpose-built
+  gfx1201 kernels. Below 16 rows an f16 matrix-core kernel, which is already at the memory roofline there;
+  above it an int8 one, because gfx1201's f16 matrix instruction is *half* the rate of its int8 one and a
+  quarter of its int4 one. One packed weight feeds both: the nibble is a two's complement code the int8
+  kernel reads by shifting it into a byte's high half, and the f16 kernel converts to offset binary in one
+  XOR per dword. Codes are derived at load from the weight, so there is no calibration data, no offline step
+  and nothing on disk. On Qwen3.8-27B with the DFlash2 drafter the draft pass falls 9.1% at a drafter batch
+  of 64; with `RADIANCE_SKINNY_GEMM=all` the decode step falls 5.1% for +3.5% tokens/s over four paired
+  compiles. Lossless in the same sense as any drafting change: the target verifies every proposed token with
+  its own untouched weights.
 - **Prefix caching that works on the GDN hybrid** (enabled in the compose): hybrid models leave automatic
   prefix caching off by default, so it is turned on explicitly with `--enable-prefix-caching
   --mamba-cache-mode=align`. Align mode snapshots and restores the linear-attention (GDN) recurrent state at
@@ -367,7 +384,7 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
 ## Layout
 
 Flat build context: the runtime Python modules (`radiance_*.py`), the `patch_*.py` fixes, the `fp8-configs/`
-`moe-configs/` and `mxfp4-configs/` GEMM configs, the chat template, `Dockerfile`, and `docker-compose.yml` all live at the repo
+`moe-configs/` and `mxfp4-configs/` GEMM configs, the chat templates, `Dockerfile`, and `docker-compose.yml` all live at the repo
 root so `docker build .` works directly. `prune_rocm.sh` is the ROCm slimming step (it self-checks: the
 arch's own kernels must survive and hipcc must still link a HIP shared object, since AITER JITs at runtime).
 

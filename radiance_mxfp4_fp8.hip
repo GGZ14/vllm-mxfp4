@@ -353,7 +353,8 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
 #define DEC_PAD 8
 
 // DTM = number of 16-row M-fragments; the launcher picks ceil(M/16). vLLM captures decode at
-// num_seqs*(SPEC+1), i.e. 5/10/20/25/35/40 at SPEC=4, so DTM 1..3 covers every reachable batch.
+// num_seqs*(SPEC+1): 5/10/20/25/35/40 under mtp at SPEC=4, and batch x 8 under a dflash drafter
+// at SPEC=7, which reaches 64 at max_num_seqs=8. DTM 1..4 covers every reachable batch of both.
 // Use the SMALLEST DTM that covers M: measured at M=20, DTM=2 beats DTM=3 by 12% (89.1 vs 99.9 us
 // on gate_up) purely because the wider tile computes rows nobody asked for.
 template <int DWN, int DBK, int DKS, int DTM>
@@ -495,7 +496,10 @@ __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
 // Sized KS(4) x 48 rows x N(<=32768) x 4 B = 24 MiB. Single-stream decode per rank is assumed.
 #define DEC_MAX_N 32768
 #define DEC_KS 4
-#define DEC_MAX_TM 3        // covers M<=48; SPEC=4 x max_num_seqs=8 reaches M=40
+#define DEC_MAX_TM 4        // covers M<=64. mtp SPEC=4 x max_num_seqs=8 reaches M=40, but a
+                            // dflash drafter drafts a whole block: at SPEC=7 M is batch x 8,
+                            // so max_num_seqs=8 reaches exactly 64. At TM=3 that call fell off
+                            // this kernel onto the BM=256 prefill tile.
 static float *g_decode_partial = nullptr;
 static size_t g_decode_partial_bytes = 0;
 
@@ -541,7 +545,8 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
                          (__bf16 *)c, M, N, K)
       if (tm == 1)      RAD_DEC_LAUNCH(1);
       else if (tm == 2) RAD_DEC_LAUNCH(2);
-      else              RAD_DEC_LAUNCH(3);
+      else if (tm == 3) RAD_DEC_LAUNCH(3);
+      else              RAD_DEC_LAUNCH(4);
 #undef RAD_DEC_LAUNCH
       return;
       // no scratch (alloc failed) -- fall through to the folded kernel, never produce nothing
