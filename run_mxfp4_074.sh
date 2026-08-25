@@ -59,7 +59,7 @@
 #                      exact-rerank guarantee holds), but a long-prompt sweep at chunk 8192 hung a
 #                      worker and killed the engine with an RPC TimeoutError in sample_tokens.
 #                      Upstream ships it opt-in at chunk 4096. Retry there before trusting it.
-#   DECODE_MAX_M     the small-M decode GEMM (M<=48, TM=ceil(M/16), split-K). ON BY DEFAULT at 48.
+#   DECODE_MAX_M     the small-M decode GEMM (M<=64, TM=ceil(M/16), split-K). ON BY DEFAULT at 64.
 #                      Needs MIN_M=0 to be reachable at all -- at MIN_M=16 the M=5 decode call
 #                      never enters our launcher. Measured: single-stream step time 35.1 -> 33.4 ms
 #                      (-4.8%), aggregate throughput +28.5% at 4 concurrent and +19.7% at 8, prefill
@@ -109,11 +109,27 @@ CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-074}
 # 31.54 GiB and fails at startup. 0.98 gives 857,399 KV tokens against 840,019 at 0.97 and
 # survives a full 260k-prefill sweep with no OOM.
 GPU_UTIL=${GPU_UTIL:-0.98}
-# MTP speculative depth. Measured on this build, 4 beats 8 at decode -- 59.8/60.2 tok/s against
-# 53.1/58.6, because acceptance falls (42.1% -> 33.7%) faster than the deeper drafts pay for
-# themselves. Prefill is unaffected within run-to-run noise. The 0.5.8 baseline also ran 4, so
-# this keeps the comparison honest as well as fast.
-SPEC=${SPEC:-4}
+# Which drafter to speculate with.
+#   mtp    -- the multi-token-prediction head inside the target checkpoint. One draft forward per
+#             speculative position, so RADIANCE_DYNAMIC_DRAFT can stop the loop early.
+#   dflash -- a separate block-diffusion drafter (DFlash2) that emits the whole block in ONE graphed
+#             pass. Depth is fixed when its CUDA graph is captured, so DYNAMIC_DRAFT is inert and
+#             num_speculative_tokens becomes a real tuning knob again.
+SPEC_METHOD=${SPEC_METHOD:-mtp}
+# Drafter checkpoint for SPEC_METHOD=dflash. Must live under MODELS -- only MODELS is mounted.
+DRAFTER=${DRAFTER:-$MODELS/Qwen3.8-27B-DFlash2-FP8}
+# The drafter's own attention backend. It has to support FULL cuda graphs or vLLM logs "running the
+# draft eagerly" and the single-pass draft loses its graph -- which is the entire point of dflash.
+# TRITON_ATTN does; R4D is the target's backend and is what mtp uses for the drafter too.
+DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
+# Speculative depth.
+#   mtp: measured on this build, 4 beats 8 at decode -- 59.8/60.2 tok/s against 53.1/58.6, because
+#   acceptance falls (42.1% -> 33.7%) faster than the deeper drafts pay for themselves. The 0.5.8
+#   baseline also ran 4, so this keeps the comparison honest as well as fast.
+#   dflash: the drafter's block_size is 8, and upstream measures per-position acceptance down to
+#   ~0.10 by the seventh, so 7 is the documented starting point -- but each extra position widens
+#   BOTH the draft pass and the target's verify, so sweep it.
+if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
@@ -204,11 +220,33 @@ case "$SNAP" in
      exit 1 ;;
 esac
 
+if [ "$R4D_ATTN" = "1" ]; then ATTN=R4D; else ATTN=ROCM_AITER_UNIFIED_ATTN; fi
+
+# Speculative config, built here so the drafter path is validated before podman is invoked rather
+# than surfacing as an HF repo-id error inside the worker.
+if [ "$SPEC_METHOD" = dflash ]; then
+  DRAFTER="$(realpath -m "$DRAFTER")"
+  if [ ! -f "$DRAFTER/config.json" ]; then
+    echo "no dflash drafter at $DRAFTER" >&2
+    echo "  hf download tcclaviger/Qwen3.8-27B-DFlash2-FP8 --local-dir $DRAFTER" >&2
+    exit 1
+  fi
+  case "$DRAFTER" in
+    "$MODELS"/*) CDRAFTER="/models/${DRAFTER#"$MODELS"/}" ;;
+    *) echo "DRAFTER ($DRAFTER) must be under MODELS ($MODELS): only MODELS is mounted." >&2
+       exit 1 ;;
+  esac
+  # disable_padded_drafter_batch is the single-stream lever (~+50% on the 27B hybrids) and the
+  # image bakes the vLLM unpad patch it relies on; it applies to dflash as well as mtp.
+  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$CDRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$DRAFT_ATTN\",\"disable_padded_drafter_batch\":true}"
+else
+  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":true}"
+fi
+
 # The AR size gate compares the raw bf16 byte count: CHUNK x hidden(5120) x 2. Derive it rather
 # than hardcoding it, so changing CHUNK cannot silently drop prefill back onto RCCL.
 AR_MAX_KB=$(( (CHUNK * 5120 * 2) / 1024 + 4096 ))
 
-if [ "$R4D_ATTN" = "1" ]; then ATTN=R4D; else ATTN=ROCM_AITER_UNIFIED_ATTN; fi
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
@@ -234,8 +272,10 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_CLONE="${RADIANCE_MXFP4_CLONE:-0}" -e RADIANCE_MXFP4_CHECKX="${RADIANCE_MXFP4_CHECKX:-0}" \
   -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
-  -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-48}" \
+  -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS="${RADIANCE_TOPK_TRITON_MIN_ROWS:-1}" \
+  -e RADIANCE_MXFP4_HOIST_QUANT="${RADIANCE_MXFP4_HOIST_QUANT:-0}" \
+  -e RADIANCE_RMS_QUANT_FUSION="${RADIANCE_RMS_QUANT_FUSION:-0}" \
   -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
   -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-0}" \
   -e RADIANCE_GDN_PATHS="${RADIANCE_GDN_PATHS:-both}" \
@@ -261,11 +301,12 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_quark_mxfp4.py
     python3 patch_ar_maxbytes.py
     python3 patch_topk_triton_rows.py
+    python3 patch_rmsquant_fusion.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-    cp radiance_mxfp4.py radiance_gdn.py "$SP"/
+    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
@@ -287,7 +328,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     --gpu-memory-utilization "$GPU_UTIL" \
     --max-model-len "$MAXLEN" --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
-    --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":true}" \
+    --speculative-config "$SPEC_CFG" \
     --no-async-scheduling $EXTRA \
     --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
     --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
