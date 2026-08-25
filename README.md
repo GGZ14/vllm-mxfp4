@@ -174,7 +174,7 @@ Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness, `SPEC=4`:
 | prefill 182k | 1736 | **2511** | +44.6% |
 | prefill 260k | 1393 | **2089** | +49.9% |
 | decode short / medium | 63.0 / 67.4 | **67.1 / 67.5** | +6.5% / +0.1% |
-| WikiText-2 PPL | 8.3335 | 8.3706 | +0.44% |
+| WikiText-2 PPL | 8.3335 | 8.3719 | +0.46% |
 
 KV cache 857,399 tokens at `GPU_UTIL=0.98`. All 304 linear layers run the W4A8 fp8-WMMA kernel;
 `aiter` is not used at all now that `RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain
@@ -223,7 +223,9 @@ Fixed in **StillDeadcode/libr4d PR #1** (merged 2026-08-24). Not in a tag yet, h
 main step above.
 
 Clamp value, measured over 208,539 WikiText-2 tokens with no other mitigation:
-70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586.
+70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586. (Those were measured
+before the fold was widened; on the current build the same configuration reads 8.3719, against
+8.3736 with the original fold table.)
 
 **The clamp bounds the damage; it does not remove the cause** -- and upstream sharpened this point
 when merging. The original note here claimed the clamped product "evaluates to 0, which is the

@@ -40,49 +40,40 @@ __device__ __constant__ unsigned char kLUT[16] = {
     0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
     0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC};
 
-__device__ __constant__ unsigned int kMag[16][2] = {
-#define MROW(d) {\
-  (unsigned int)(0u | ((unsigned)((6-(d))>0?(0x30-((d)<<3)):0)<<8) |\
-   ((unsigned)((7-(d))>0?(0x38-((d)<<3)):0)<<16) |\
-   ((unsigned)((7-(d))>0?(0x3C-((d)<<3)):0)<<24)),\
-  (unsigned int)((unsigned)((8-(d))>0?(0x40-((d)<<3)):0) |\
-   ((unsigned)((8-(d))>0?(0x44-((d)<<3)):0)<<8) |\
-   ((unsigned)((9-(d))>0?(0x48-((d)<<3)):0)<<16) |\
-   ((unsigned)((9-(d))>0?(0x4C-((d)<<3)):0)<<24))}
- MROW(0),MROW(1),MROW(2),MROW(3),MROW(4),MROW(5),MROW(6),MROW(7),
- MROW(8),MROW(9),MROW(10),MROW(11),MROW(12),MROW(13),MROW(14),MROW(15)
-#undef MROW
-};
-
-// kLUT2[d][code]: e2m1 code -> e4m3 byte, already shifted DOWN by d binades. Folding the MX block
-// exponent into the WEIGHT here removes the per-32-block rescale from the inner loop entirely --
-// the scale becomes one per-row factor applied in the epilogue.
+// kMag[d]: the 8 e2m1 magnitudes, each already shifted DOWN by d binades and encoded as an e4m3
+// byte, packed 4 per word so `v_perm_b32` can resolve four lookups per instruction. Folding the MX
+// block exponent into the WEIGHT here removes the per-32-block rescale from the inner loop
+// entirely -- the scale becomes one per-row factor applied in the epilogue. The sign is separable
+// (a negative code is the positive byte with bit 7 set), which is why only magnitudes are tabulated.
 //
-// Exact while the shifted value stays an e4m3 normal: smallest e2m1 magnitude is 0.5 = 2^-1 and
-// e4m3's min normal is 2^-6, so d <= 5 is lossless. Measured on AMD's checkpoint: 99.998% of 761M
-// blocks need d <= 5, worst case anywhere is 10, and 282 blocks (0.000037%) would flush to zero.
-__device__ __constant__ unsigned char kLUT2[16][16] = {
-#define RAD_ROW(d)                                                                             \
-  {0x00,                                                                                       \
-   (unsigned char)((6 - (d)) > 0 ? (0x30 - ((d) << 3)) : 0),                                   \
-   (unsigned char)((7 - (d)) > 0 ? (0x38 - ((d) << 3)) : 0),                                   \
-   (unsigned char)((7 - (d)) > 0 ? (0x3C - ((d) << 3)) : 0),                                   \
-   (unsigned char)((8 - (d)) > 0 ? (0x40 - ((d) << 3)) : 0),                                   \
-   (unsigned char)((8 - (d)) > 0 ? (0x44 - ((d) << 3)) : 0),                                   \
-   (unsigned char)((9 - (d)) > 0 ? (0x48 - ((d) << 3)) : 0),                                   \
-   (unsigned char)((9 - (d)) > 0 ? (0x4C - ((d) << 3)) : 0),                                   \
-   0x80,                                                                                       \
-   (unsigned char)((6 - (d)) > 0 ? (0xB0 - ((d) << 3)) : 0x80),                                \
-   (unsigned char)((7 - (d)) > 0 ? (0xB8 - ((d) << 3)) : 0x80),                                \
-   (unsigned char)((7 - (d)) > 0 ? (0xBC - ((d) << 3)) : 0x80),                                \
-   (unsigned char)((8 - (d)) > 0 ? (0xC0 - ((d) << 3)) : 0x80),                                \
-   (unsigned char)((8 - (d)) > 0 ? (0xC4 - ((d) << 3)) : 0x80),                                \
-   (unsigned char)((9 - (d)) > 0 ? (0xC8 - ((d) << 3)) : 0x80),                                \
-   (unsigned char)((9 - (d)) > 0 ? (0xCC - ((d) << 3)) : 0x80)}
-    RAD_ROW(0), RAD_ROW(1), RAD_ROW(2),  RAD_ROW(3),  RAD_ROW(4),  RAD_ROW(5),  RAD_ROW(6),
-    RAD_ROW(7), RAD_ROW(8), RAD_ROW(9),  RAD_ROW(10), RAD_ROW(11), RAD_ROW(12), RAD_ROW(13),
-    RAD_ROW(14), RAD_ROW(15)
-#undef RAD_ROW
+// The table runs into e4m3 SUBNORMALS, and that is deliberate. Stopping at the smallest e4m3 NORMAL
+// (2^-6) makes the fold exact only while d <= 5, and this checkpoint exceeds that: mlp.down_proj
+// reaches d=10 and holds 11,354 of the model's 14,433 out-of-range blocks. On layer 58 that zeroed
+// 6.7% of the weights on 36 output channels, for per-channel errors up to 18.7% and a 1.18%
+// whole-layer norm error -- squarely inside the range CHECKALL flags. Extending into subnormals
+// (down to 2^-9) makes every d <= 8 exact and leaves d=9..12 rounding rather than flushing:
+// measured, every affected layer with max d <= 8 goes to exactly zero error, and layer 58 (the only
+// d=10 one) drops 4x to 0.31%.
+//
+// This is only sound because the gfx12 fp8 WMMA HONOURS e4m3 subnormals rather than flushing them
+// -- verified on hardware, exact for every m*2^-9, m=1..7 (~/mxfp4_work/tier6/subnorm.hip).
+__device__ __constant__ unsigned int kMag[16][2] = {
+  {0x3c383000u, 0x4c484440u},
+  {0x34302800u, 0x44403c38u},
+  {0x2c282000u, 0x3c383430u},
+  {0x24201800u, 0x34302c28u},
+  {0x1c181000u, 0x2c282420u},
+  {0x14100800u, 0x24201c18u},
+  {0x0c080400u, 0x1c181410u},
+  {0x06040200u, 0x14100c08u},
+  {0x03020100u, 0x0c080604u},
+  {0x01010000u, 0x06040302u},
+  {0x01000000u, 0x03020101u},
+  {0x00000000u, 0x01010100u},
+  {0x00000000u, 0x01000000u},
+  {0x00000000u, 0x00000000u},
+  {0x00000000u, 0x00000000u},
+  {0x00000000u, 0x00000000u},
 };
 
 #define BM 128
@@ -211,7 +202,7 @@ __global__ __launch_bounds__(NWAVE * 32) void radiance_mxfp4_fp8_gemm(
 
 
 // Autotuned folded-scale kernel. The MX block exponent is pushed into the weight byte during the
-// LDS upconvert (kLUT2), so the inner loop is pure WMMA -- no temp accumulator, no per-32-block
+// LDS upconvert (kMag), so the inner loop is pure WMMA -- no temp accumulator, no per-32-block
 // rescale, no LDS scale reads. Lossless while the shifted value stays an e4m3 normal (d <= 5):
 // 99.998% of the checkpoint's 761M blocks qualify, worst case 10, 282 blocks flush.
 //
