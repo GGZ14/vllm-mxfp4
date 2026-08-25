@@ -51,7 +51,7 @@ ARG RBT_VERSION=rocm-6.4.4
 # fork or a local mirror can be substituted without editing the build. The tag is asserted against
 # the version the built library reports, so a stale clone fails the build instead of shipping.
 ARG R4D_REPO=https://codeberg.org/StillDeadcode/libr4d.git
-ARG R4D_VERSION=v0.4.0
+ARG R4D_VERSION=v0.5.0
 
 # =====================================================================================
 # STAGE 1 builder: compile the stack from source into /wheels
@@ -62,10 +62,13 @@ ARG TORCH_VERSION
 ARG TRITON_VERSION
 ARG TORCHVISION_VERSION
 ARG AITER_VERSION
+# Build parallelism, as an ARG so a build can be told to leave the box some headroom:
+#   docker build --build-arg MAX_JOBS=16 .
+ARG MAX_JOBS=32
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_ROCM_ARCH=${GFX_ARCH} \
     ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
-    USE_ROCM=1 USE_CUDA=0 MAX_JOBS=32 CMAKE_BUILD_PARALLEL_LEVEL=32
+    USE_ROCM=1 USE_CUDA=0 MAX_JOBS=${MAX_JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS}
 
 # Build tooling the base dev image lacks (git/venv/pkg-config + the -dev packages torch's cmake
 # probes: libdrm for rocm_smi, libnuma, libelf).
@@ -212,8 +215,8 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd \
 # every process, otherwise it enumerates 0 devices and platform detection fails.
 COPY radiance_amdsmi.py radiance_amdsmi.pth \
      radiance_kernels.py radiance_vit_attn.py radiance_allreduce.py \
-     radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_router.py \
-     radiance_r4d_attn.py radiance_gdn.py radiance_mxfp4.py ${SP}/
+     radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_gemm.py \
+     radiance_r4d_attn.py radiance_gdn.py radiance_w4.py radiance_mxfp4.py ${SP}/
 COPY fp8-configs/ ${SP}/vllm/model_executor/layers/quantization/utils/configs/
 COPY moe-configs/ ${SP}/vllm/model_executor/layers/fused_moe/configs/
 # mxfp4-configs: aiter ships GEMM-AFP4WFP4 tiles for gfx950/gfx1250 only, and its gfx1250
@@ -228,6 +231,29 @@ COPY mxfp4-configs/ ${SP}/aiter/ops/triton/configs/gemm/
 # patch_conv1d_blockn widens the gated-delta-net prefill conv1d channel block to a 16-byte-per-lane
 # access; bit-identical, and it defuses a 2**14-byte row pitch the caller's split() view creates.
 # patch_r4d is the whole libr4d integration in one patch, switchable at run time with
+# patch_dflash2 backports DFlash2 speculative decoding (vllm-project/vllm#52816, merged ten days
+# after 0.27.1 was tagged): a block-diffusion drafter that proposes a whole block of positions in
+# one backbone pass and walks a candidate path through the target head's top-K per position. It
+# carries two new upstream modules, installed from /opt/patches/dflash2/. patch_dflash_base
+# must run FIRST: DFlash2 subclasses the DFlash speculator, and 0.27.1's copy of that base
+# predates three correctness fixes it relies on. Without them the drafter runs, reports a
+# healthy acceptance curve, and emits garbled text -- the rejected suffix of the previous
+# step is loaded back as accepted context.
+# patch_dflash_fused_kv_fp8 lets that drafter be an fp8 checkpoint: the context-KV precompute
+# fuses every layer's K/V projection by slicing the raw parameter, which is neither the right
+# dtype nor the right row layout once the weights are quantized and preshuffled.
+# patch_gdn_metadata cuts the per-step Python cost of building the gated-delta-net attention
+# metadata: the per-request bookkeeping runs as one numpy pass over the same buffers, the arange
+# and empty index become slices of cached buffers, and the block table is sliced rather than
+# gathered when every sequence is a spec decode. Byte-identical output; RADIANCE_GDN_META=0 falls
+# back to the stock path.
+# patch_dflash_w4 marks the drafter's weight load so radiance_w4 can pack it to 4 bits -- the
+# drafter's linears and the target's are indistinguishable inside a quant method's callback, and
+# the drafter is loaded by exactly one call, so bracketing that call is the whole discriminator.
+# Inert unless RADIANCE_FAST_DRAFT=1, the one switch over the whole tuned drafter stack: the draft
+# pass falls 9.1% at a drafter batch of 64, and the acceptance question is settled -- acceptance on
+# this stack is bimodal and the mode is drawn per compile, in the control arm too, so a single
+# sample per arm reads a coin flip as a tax.
 # RADIANCE_USE_R4D: the R4D attention backend enum, plus the gated-delta-net layer, where a whole
 # step runs in five hand-written kernels (conv+prep+gating+cumsum, the K-gram with its triangular
 # inverse, and the chunked scan on the prefill path; the conv update and the recurrent state
@@ -235,12 +261,14 @@ COPY mxfp4-configs/ ${SP}/aiter/ops/triton/configs/gemm/
 # the layer hook declines. The two patches above tune that FLA path, which is what runs when
 # RADIANCE_USE_R4D=0.
 COPY patch_*.py install_radiance_hooks.py _patchlib.py /opt/patches/
+COPY dflash2/ /opt/patches/dflash2/
 RUN set -eu; cd /opt/patches; \
-    for p in patch_gfx1201 patch_radiance_dispatch patch_router_gemm patch_unified_attention_lds \
+    for p in patch_gfx1201 patch_radiance_dispatch patch_skinny_gemm patch_unified_attention_lds \
              patch_gdn_wmma patch_preshuffle patch_radiance_fusion install_radiance_hooks \
              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
-             patch_dynamo_metrics patch_conv1d_blockn patch_r4d \
-             patch_quark_mxfp4 patch_ar_maxbytes patch_qwen3_thinkoff; do \
+             patch_dynamo_metrics patch_conv1d_blockn patch_r4d patch_dflash_base patch_dflash2 \
+             patch_dflash_fused_kv_fp8 patch_dflash_w4 patch_gdn_metadata \
+             patch_quark_mxfp4 patch_ar_maxbytes patch_topk_triton_rows patch_qwen3_thinkoff; do \
       echo "== applying $p =="; python "$p.py"; \
     done; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
@@ -248,7 +276,7 @@ RUN set -eu; cd /opt/patches; \
 # --- R4D: the gfx1201 kernel library, cloned and compiled from source ---
 # One shared object holding every hand-written kernel this image runs: paged attention (prefill and
 # decode, fp8 or bf16 KV), the fused gated-delta-net prefill scan, the TP=2 P2P all-reduce in both
-# its exact and its 6-bit-packed form, and the MoE router GEMM. Built here rather than in the
+# its exact and its 6-bit-packed form, and the skinny bf16 GEMM. Built here rather than in the
 # builder stage because it has to be compiled by the same hipcc the venv loads it against.
 # ARGs are declared at the point of use: they are cache-key instructions, so putting them at the top
 # of the stage would invalidate the wheel install above on every kernel bump.
@@ -331,13 +359,12 @@ ENV VIRTUAL_ENV=/opt/vllm \
 
 # --- radiance feature flags (set any to 0 to fall back to stock). RADIANCE_USE_R4D is the master
 #     switch for the hand-written gfx1201 kernel library: 0 takes it out of the picture entirely
-#     (attention, the gated delta net, vision attention, the all-reduce and the router GEMM all
+#     (attention, the gated delta net, vision attention, the all-reduce and the skinny GEMM all
 #     revert to the stock path) without a rebuild. RADIANCE_USE_R4D_AR and its _QUANT variant are
 #     the two all-reduce behaviours worth switching independently, since one is bit-identical to
-#     RCCL and the other is not. RADIANCE_R4D_REPORT prints which kernel each part of the model
-#     resolved to once the worker is up. RADIANCE_RUN_BWTEST runs the bandwidth sweep at startup;
+#     RCCL and the other is not. RADIANCE_RUN_BWTEST runs the bandwidth sweep at startup;
 #     it is backgrounded and takes about a second, so it never delays the serve. ---
-ENV RADIANCE_USE_R4D=1 RADIANCE_R4D_REPORT=1 \
+ENV RADIANCE_USE_R4D=1 \
     RADIANCE_USE_R4D_AR=1 RADIANCE_USE_R4D_AR_QUANT=1 \
     RADIANCE_PRESHUFFLE=1 RADIANCE_FUSE_RMS_QUANT=1 \
     RADIANCE_DYNAMIC_DRAFT=1 RADIANCE_DRAFT_SCHEDULE=1:8,2:7,4:6,8:5,16:4 RADIANCE_DRAFT_TAU=0.35 \

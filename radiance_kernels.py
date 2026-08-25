@@ -40,13 +40,19 @@ def _ps_cfg(M, N, K):
     return {**_PS_BASE, "BLOCK_SIZE_M": (16 if M <= 32 else 64), "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8}
 
 
+# The preshuffle kernel reads the act-scale column-major. It used to be given a physically transposed
+# copy to do that, which is a whole kernel launch per GEMM -- 260 of them per decode step, 0.36 ms,
+# for a tensor of a few hundred bytes. The kernel already takes the act-scale strides as arguments,
+# so is_x_scale_tranposed=False hands it the original tensor and the same values reach the same
+# lanes.
+
 if _PS is not None:
     @torch.library.custom_op("radiance::preshuffle_gemm", mutates_args=())
     def preshuffle_gemm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor,
                         Bs: torch.Tensor, N: int, K: int) -> torch.Tensor:
-        xs_shuf = As.transpose(0, 1).contiguous().view(*As.shape)   # physical transpose, same logical shape
+        cfg = _ps_cfg(A.shape[0], N, K)
         return _PS.gemm_a8w8_blockscale_preshuffle(
-            A, B, xs_shuf, Bs, torch.bfloat16, config=_ps_cfg(A.shape[0], N, K))
+            A, B, As, Bs, torch.bfloat16, config=cfg, is_x_scale_tranposed=False)
 
     @preshuffle_gemm.register_fake
     def _(A, B, As, Bs, N, K):
@@ -66,6 +72,9 @@ def install_load_hook():
     def _wrapped(self, layer):
         _orig(self, layer)
         try:
+            # A layer radiance_w4 has already packed to 4 bits has no fp8 weight left to shuffle.
+            if getattr(layer, "_radiance_w4", None) is not None:
+                return
             if not getattr(self, "block_quant", False):
                 return
             w = getattr(layer, "weight", None)
@@ -366,10 +375,8 @@ def install_r4d_report():
     has imported and every select() has been made -- including the ones on paths that only resolve
     when a real forward runs. Rank 0 only: the ranks are symmetric and two copies is just noise.
 
-    Gated by RADIANCE_R4D_REPORT (default on). Never fatal: this is a log line, and a serve must
+    Never fatal: this is a log line, and a serve must
     not fail to start over one."""
-    if os.environ.get("RADIANCE_R4D_REPORT", "1") != "1":
-        return
     try:
         import r4d  # noqa: F401
     except Exception:
@@ -400,6 +407,13 @@ def install_all():
     """Install every gated radiance runtime hook. Called once per process by the vLLM plugin loader,
     after torch/vllm/aiter are imported but before the model loads. Idempotent; each hook is env-gated."""
     try:
+        # Before the preshuffle hook: both wrap process_weights_after_loading, and the 4-bit packer
+        # has to see the plain weight rather than a shuffled one.
+        import radiance_w4
+        radiance_w4.install_load_hook()          # RADIANCE_FAST_DRAFT (default off)
+    except Exception as e:
+        sys.stderr.write(f"[radiance] radiance_w4 install failed: {e!r}\n")
+    try:
         install_load_hook()
     except Exception as e:
         sys.stderr.write(f"[radiance] install_load_hook failed: {e!r}\n")
@@ -428,7 +442,7 @@ def install_all():
     except Exception as e:
         sys.stderr.write(f"[radiance] radiance_vit_attn install failed: {e!r}\n")
     try:
-        install_r4d_report()                     # RADIANCE_R4D_REPORT (default on)
+        install_r4d_report()
     except Exception as e:
         sys.stderr.write(f"[radiance] install_r4d_report failed: {e!r}\n")
 

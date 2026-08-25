@@ -28,7 +28,7 @@ RADIANCE_USE_R4D (default 1) is read by the radiance_* modules the injected code
 the injected code here: this patch is applied once at image build, and what a serve needs is to be
 able to take the library out of the picture without a rebuild. Set it to 0 and every hook is still
 installed and every one of them declines, so the fallbacks -- FLA/Triton for the gated delta net,
-the Triton kernel for vision attention, RCCL for the all-reduce, rocBLAS for the router GEMM -- run
+the Triton kernel for vision attention, RCCL for the all-reduce, rocBLAS for the skinny GEMMs -- run
 exactly as they would in an image built without the library. `--attention-backend R4D` then refuses
 at startup, which is better than quietly serving something slower than what was asked for.
 
