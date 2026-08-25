@@ -187,8 +187,8 @@ fixed config, and `ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that o
 
 | | off | on | |
 |---|---|---|---|
-| single stream, ms/step | 35.06 | **33.39** | -4.8% |
-| ms/step at 32k context | 36.53 | **34.87** | -4.5% |
+| single stream, ms/step | 35.06 | **32.16** | -8.3% |
+| ms/step at 32k context | 36.53 | **33.47** | -8.4% |
 | aggregate tok/s, 4 concurrent | 170.1 | **218.5** | +28.5% |
 | aggregate tok/s, 8 concurrent | 295.0 | **353.1** | +19.7% |
 | prefill, all five lengths | — | — | unchanged (-0.3 to -1.2%) |
@@ -260,7 +260,9 @@ kernel serves every M.
 (BM=256 via TM=4) is sized for prefill. At decode M is 5 (batch 1 x `num_speculative_tokens`+1), where
 it issues 51x more matrix MACs than useful -- 4352 WMMA per wave against 5 real rows. So M<=48 goes
 to a second kernel with TM=`ceil(M/16)`, no wasted M-fragments, and split-K to fill the CUs, gated by
-`RADIANCE_MXFP4_DECODE_MAX_M` (default 48). It reverses one of the prefill answers: **BK=128 wins at
+`RADIANCE_MXFP4_DECODE_MAX_M` (default 48). The split-K reduction is **fused**: the KS blocks covering
+one output range race on an atomic counter and the last arrival reduces in place, so there is no
+second launch — worth a further -3.9% of step time on top, at bit-identical output. It reverses one of the prefill answers: **BK=128 wins at
 decode** (1.87x on gate_up) where it measured -34% at prefill, because that loss was purely the LDS
 occupancy cliff and a 16-row A tile never reaches it.
 

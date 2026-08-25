@@ -27,7 +27,7 @@ MIN_M = int(os.environ.get("RADIANCE_MXFP4_W4A8_MIN_M", "256"))
 # Decode band for the small-M kernel. 0 = dark. Also gates the scratch preallocation.
 DECODE_MAX_M = int(os.environ.get("RADIANCE_MXFP4_DECODE_MAX_M", "0"))
 _decode_scratch_ready = [False]
-_decode_scratch = [None]   # keeps the buffer alive for the process
+_decode_scratch = [None, None]   # [partials, block counter] — kept alive for the process
 
 try:
     import radiance_mxfp4_fp8 as _ext
@@ -491,8 +491,13 @@ def _make_kernel_class():
                     # quark's TileLang exception translator into a bogus "libamdhip64.so not found".
                     _decode_scratch[0] = torch.empty(
                         4 * 48 * 32768, dtype=torch.float32, device=layer.weight.device)
+                    # Block counter for the fused reduction, one int per n-block. MUST start
+                    # zeroed; the kernel's last-arriving block resets it, so it stays that way.
+                    _decode_scratch[1] = torch.zeros(
+                        32768 // 128 + 8, dtype=torch.int32, device=layer.weight.device)
                     _ext.set_decode_scratch(_decode_scratch[0].data_ptr(),
-                                            _decode_scratch[0].numel() * 4)
+                                            _decode_scratch[0].numel() * 4,
+                                            _decode_scratch[1].data_ptr())
                     sys.stderr.write(
                         f"[radiance.mxfp4] decode kernel ON (M<={DECODE_MAX_M}), "
                         f"{_decode_scratch[0].numel() * 4 >> 20} MiB split-K scratch\n")
