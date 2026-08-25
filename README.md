@@ -119,6 +119,36 @@ way -- so it is a speed change with no quality dimension: measured on gate_up 17
 
 ### Running this build
 
+First build the checkpoint, once. `fp8_mtp.py` needs torch; if the host has none, run it inside the
+image, which does:
+
+```bash
+hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4
+
+docker run --rm \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$HOME/models:/models" -v "$PWD:/repo" \
+  --entrypoint bash stilldeadcode/vllm-radiance:$(cat VERSION) -lc '
+    python3 /repo/fp8_mtp.py \
+      "$(ls -d /root/.cache/huggingface/hub/models--amd--Qwen3.8-27B-Quark-AWQ-MXFP4/snapshots/*/ | head -1)" \
+      /models/Qwen3.8-27B-MXFP4-mtpfp8'
+```
+
+On a host that already has torch, `./fp8_mtp.py <src-snapshot> $HOME/models/Qwen3.8-27B-MXFP4-mtpfp8`
+does the same thing without the container.
+
+This is **not** an optimization step you can skip -- AMD's release does not load with MTP enabled.
+It ships the MTP head bf16 but names `mtp.*` in neither `exclude` nor `layer_quant_config`, so
+vLLM's quark config falls through to `global_quant_config` (mxfp4), builds a packed uint8 weight of
+half the input width, and dies loading the full-width bf16 tensor into it: `AssertionError:
+Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))`.
+`fp8_mtp.py` requantizes the eight MTP projections to fp8 e4m3 per-channel and writes the matching
+`layer_quant_config`, which is what makes the head loadable. Why fp8 and not mxfp4 is
+[below](#the-drafter-is-fp8). It reads and rewrites one safetensors file, needs only torch, and
+takes about fifteen minutes.
+
+Then:
+
 ```bash
 MODELS=$HOME/models ./run_mxfp4_074.sh
 ```
@@ -158,9 +188,16 @@ Verified reproducible: the automatic build produces an `r4d.so` byte-identical (
 stock, set `RADIANCE_MXFP4_SANITIZE=1`, which zeroes non-finite activations and gets you to
 perplexity 8.4004 -- worse than the fix, but serviceable.
 
+#### The drafter is FP8
+
 Checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with the MTP
-drafter requantized to fp8 (`~/mxfp4_work/fp8_mtp.py`). The drafter must NOT be MXFP4 -- 4-bit
-costs more acceptance than it saves in bandwidth, and AWQ does not rescue it.
+drafter requantized to fp8 by [`fp8_mtp.py`](fp8_mtp.py). The drafter must NOT be MXFP4 -- 4-bit
+costs more acceptance than it saves in bandwidth, and AWQ does not rescue it. Data-free RTN
+measured ~11.6% relative error and cost acceptance 2.5 -> 2.21; AWQ calibration improved that by
+0-5% (the alpha search chose 0.1-0.2, and 0.0 for `mtp.fc`, because MXFP4's per-32 E8M0 block
+exponent already does most of what per-channel scaling would). FP8 e4m3 per-channel is ~2-3%
+relative error and holds acceptance at 2.60-2.80, removing ~17% of decode weight traffic instead
+of 25% -- the smaller win that actually holds.
 
 ### Measured
 
@@ -174,7 +211,7 @@ Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness, `SPEC=4`:
 | prefill 182k | 1736 | **2511** | +44.6% |
 | prefill 260k | 1393 | **2089** | +49.9% |
 | decode short / medium | 63.0 / 67.4 | **67.1 / 67.5** | +6.5% / +0.1% |
-| WikiText-2 PPL | 8.3335 | 8.3706 | +0.44% |
+| WikiText-2 PPL | 8.3335 | 8.3719 | +0.46% |
 
 KV cache 857,399 tokens at `GPU_UTIL=0.98`. All 304 linear layers run the W4A8 fp8-WMMA kernel;
 `aiter` is not used at all now that `RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain
@@ -223,7 +260,9 @@ Fixed in **StillDeadcode/libr4d PR #1** (merged 2026-08-24). Not in a tag yet, h
 main step above.
 
 Clamp value, measured over 208,539 WikiText-2 tokens with no other mitigation:
-70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586.
+70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586. (Those were measured
+before the fold was widened; on the current build the same configuration reads 8.3719, against
+8.3736 with the original fold table.)
 
 **The clamp bounds the damage; it does not remove the cause** -- and upstream sharpened this point
 when merging. The original note here claimed the clamped product "evaluates to 0, which is the

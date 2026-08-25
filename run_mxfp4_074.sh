@@ -7,11 +7,15 @@
 #   prefill 3602 / 3409 / 2283 / 1730 / 1390 tok/s at 7.8k/26k/104k/182k/259k
 #   real decode 55.4 / 61.7 tok/s | weights 9.24 GiB/GPU | KV ~856k tok | WikiText-2 PPL 8.3335
 #
-# Checkpoint built by ~/mxfp4_work/fp8_mtp.py from amd/Qwen3.8-27B-Quark-AWQ-MXFP4. The drafter is
-# FP8, not MXFP4, and that is a settled result: MXFP4 RTN cost acceptance 2.5 -> 2.21 and AWQ did
-# not rescue it (MXFP4's per-32 E8M0 block exponent already does most of what per-channel scaling
-# would), while FP8 e4m3 per-channel holds acceptance at 2.60-2.80. Do not point this at
-# ~/models/Qwen3.8-27B-MXFP4-mtpq or -mtpawq; those exist only for that comparison.
+# Checkpoint built by this repo's ./fp8_mtp.py from amd/Qwen3.8-27B-Quark-AWQ-MXFP4; run it once
+# before this script (it prints the command if the checkpoint is missing). AMD's release will not
+# load as-is: its mtp.* layers are bf16 but named in neither `exclude` nor `layer_quant_config`,
+# so vLLM applies the global mxfp4 scheme to them and asserts on a half-width parameter.
+#
+# The drafter is FP8, not MXFP4, and that is a settled result: MXFP4 RTN cost acceptance
+# 2.5 -> 2.21 and AWQ did not rescue it (MXFP4's per-32 E8M0 block exponent already does most of
+# what per-channel scaling would), while FP8 e4m3 per-channel holds acceptance at 2.60-2.80. Do
+# not point this at Qwen3.8-27B-MXFP4-mtpq or -mtpawq; those exist only for that comparison.
 #
 # WHAT IS DIFFERENT FROM THE 0.5.8 RUN
 #   - image 0.5.8 -> 0.7.4; cache .radiance-cache-w4a8-058 -> -074. Cache dirs validate on model +
@@ -60,7 +64,7 @@
 #                      never enters our launcher. Measured: single-stream step time 35.1 -> 33.4 ms
 #                      (-4.8%), aggregate throughput +28.5% at 4 concurrent and +19.7% at 8, prefill
 #                      unchanged within 1.2%. GSM8K 500q paired: 486 both correct, 3/3 discordant,
-#                      sign test p=1.00, at 14% less wall. See ~/mxfp4_work/tier5/RESULTS.md.
+#                      sign test p=1.00, at 14% less wall. Same numbers in the README table.
 #                      Set 0 to fall back to the prefill-tiled kernel for every M.
 #
 #                      Original note: it quantizes the drafter's
@@ -174,11 +178,31 @@ MIN_M=${MIN_M:-0}
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
 
-SNAP="${SNAP:-$HOME/models/Qwen3.8-27B-MXFP4-mtpfp8}"
-[ -f "$SNAP/config.json" ] || { echo "no checkpoint at $SNAP" >&2; exit 1; }
+# MODELS is bind-mounted at /models below, so SNAP must live somewhere under it.
+MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
+SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
+if [ ! -f "$SNAP/config.json" ]; then
+  echo "no checkpoint at $SNAP" >&2
+  echo >&2
+  echo "Build it from AMD's MXFP4 release (one-off, ~15 min, needs the fp8 MTP head -- the stock" >&2
+  echo "checkpoint asserts on load because its bf16 mtp.* layers fall through to the mxfp4 scheme):" >&2
+  echo >&2
+  echo "  hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4" >&2
+  echo "  ./fp8_mtp.py \\" >&2
+  echo "    \"\$(ls -d ~/.cache/huggingface/hub/models--amd--Qwen3.8-27B-Quark-AWQ-MXFP4/snapshots/*/ | head -1)\" \\" >&2
+  echo "    \"$SNAP\"" >&2
+  exit 1
+fi
 # HF_HUB_OFFLINE=1 inside the container and the cache mounts at /root/.cache/huggingface, so vllm
 # must be handed the CONTAINER path -- a host path fails HF repo-id validation, not "not found".
-CSNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8
+# Derived from SNAP rather than hardcoded, so overriding SNAP actually redirects the server
+# instead of silently serving whatever sits at the default name inside the mount.
+case "$SNAP" in
+  "$MODELS"/*) CSNAP="/models/${SNAP#"$MODELS"/}" ;;
+  *) echo "SNAP ($SNAP) must be under MODELS ($MODELS): only MODELS is mounted into the" >&2
+     echo "container. Move the checkpoint there, or set MODELS to a directory containing it." >&2
+     exit 1 ;;
+esac
 
 # The AR size gate compares the raw bf16 byte count: CHUNK x hidden(5120) x 2. Derive it rather
 # than hardcoding it, so changing CHUNK cannot silently drop prefill back onto RCCL.
@@ -223,7 +247,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor -e TRITON_CACHE_DIR=/cache/triton \
   -e AITER_ROOT_DIR=/cache/aiter -e TRITON_CACHE_AUTOTUNING=1 \
   -v "${HF_CACHE:-$HOME/.cache/huggingface}":/root/.cache/huggingface \
-  -v "${MODELS:-$HOME/models}":/models \
+  -v "$MODELS":/models \
   -v "$CACHE":/cache \
   -v "${PATCHES:-$SCRIPT_DIR}":/patches:z \
   ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
