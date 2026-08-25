@@ -4,7 +4,7 @@
 # image that predates this fork's MXFP4 work. For the current build use run_mxfp4_074.sh.
 # EVALUATION (not production): native MXFP4 body on gfx1201, with the MTP drafter in FP8.
 #
-# Checkpoint built by ~/mxfp4_work/fp8_mtp.py from amd/Qwen3.8-27B-Quark-AWQ-MXFP4, served on
+# Checkpoint built by this repo's ./fp8_mtp.py from amd/Qwen3.8-27B-Quark-AWQ-MXFP4, served on
 # stilldeadcode/vllm-radiance:0.5.8 with patch_quark_mxfp4.py applied at container start.
 #
 # The drafter is NOT MXFP4, and that is a settled result, not an oversight. AMD ships the MTP
@@ -16,8 +16,8 @@
 # 4 bits, and for a drafter accuracy IS throughput. FP8 e4m3 per-channel is ~2-3% rel error and
 # removes ~17% of decode weight traffic instead of 25% -- the smaller win that actually holds:
 # measured acceptance 2.60-2.80 vs the MXFP4 drafter's 2.21-2.61.
-# ~/mxfp4_work/quantize_mtp.py (the MXFP4-drafter build) and its serve_mtpq.log / serve_mtpawq.log
-# are kept for that comparison; do not point this script at their checkpoints.
+# The MXFP4-drafter builds (-mtpq / -mtpawq) exist only for that comparison and are not shipped;
+# do not point this script at their checkpoints.
 #
 # Derived from run_radiance_prod_38.sh (2026-08-20 state). Serve flags and RADIANCE_* values are
 # inherited from prod EXCEPT where listed below, so the numbers stay comparable to
@@ -89,6 +89,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SNAP="$HOME/models/Qwen3.8-27B-MXFP4-mtpfp8"
 [ -f "$SNAP/config.json" ] || { echo "no checkpoint at $SNAP" >&2; exit 1; }
 # HF_HUB_OFFLINE=1 inside the container, and the cache mounts at /root/.cache/huggingface, so vllm
@@ -110,10 +111,10 @@ exec podman run --replace --name vllmminm --privileged --ipc=host --network=host
   -e RADIANCE_AR_MAX_KB=98304 -e RADIANCE_FUSE_RMS_QUANT=1 -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_MAX_M=1000000000 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_MXFP4_W4A8_MIN_M=16 -e RADIANCE_DRAFT_TAU=0.20 \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor -e TRITON_CACHE_DIR=/cache/triton \
   -e AITER_ROOT_DIR=/cache/aiter -e TRITON_CACHE_AUTOTUNING=1 \
-  -v /home/brian/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/brian/models:/models \
-  -v /home/brian/.radiance-cache-w4a8-058:/cache \
-  -v /home/brian/deadcode-vllm:/patches:z \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -v "$HOME/models":/models \
+  -v "$HOME/.radiance-cache-w4a8-058":/cache \
+  -v "$SCRIPT_DIR":/patches:z \
   --entrypoint bash \
   stilldeadcode/vllm-radiance:0.5.8 -lc '
     set -e
