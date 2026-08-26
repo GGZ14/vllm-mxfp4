@@ -5,7 +5,7 @@ Upstream hardcodes the P2P all-reduce size gate at 48 MB, sized to hold one pref
 shipped `--max-num-batched-tokens 4096` (4096 x 5120 x bf16 = 40 MiB). Anything larger falls back
 to RCCL, silently.
 
-That is exactly the trap this repo's own compose comment warns about, from the other direction. The gate compares the
+That is exactly the trap this fork hit once before, from the other direction. The gate compares the
 raw bf16 byte count, and a chunked-prefill all-reduce is `--max-num-batched-tokens x hidden x 2`.
 At 8192 tokens and hidden 5120 that is 80 MiB -- above the cap -- so *every prefill reduction* goes
 to RCCL while the P2P kernel only ever sees the small decode messages. Measured on 2x R9700 (TP2,
@@ -14,7 +14,7 @@ on RCCL at 3.145 ms per call; sizing the cap to fit moved all 924 reductions ont
 1.317 ms each (2.18x), worth +0.9-7.3% prefill on fp8 and +3.1-12.8% on MXFP4. KV cache size did
 not change -- the extra 2 x max_bytes of IPC scratch comes out of non-KV budget, not headroom.
 
-The default here is the existing 49152, so an unconfigured serve behaves exactly as it does today.
+The default here is upstream's 49152, so an unconfigured serve behaves exactly as upstream does.
 This only makes the number reachable, which matters because it has to track the chunk size:
 whenever `--max-num-batched-tokens` changes, `tokens x hidden x 2` has to stay under the cap or the
 fast all-reduce disappears without a word in the log. At chunk 16384 the message is 160 MiB and

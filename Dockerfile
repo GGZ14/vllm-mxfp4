@@ -216,9 +216,13 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm HIP_PLATFORM=amd \
 COPY radiance_amdsmi.py radiance_amdsmi.pth \
      radiance_kernels.py radiance_vit_attn.py radiance_allreduce.py \
      radiance_draft.py radiance_draft_gpu.py radiance_drafthead.py radiance_gemm.py \
-     radiance_r4d_attn.py radiance_gdn.py radiance_w4.py ${SP}/
+     radiance_r4d_attn.py radiance_gdn.py radiance_w4.py radiance_mxfp4.py ${SP}/
 COPY fp8-configs/ ${SP}/vllm/model_executor/layers/quantization/utils/configs/
 COPY moe-configs/ ${SP}/vllm/model_executor/layers/fused_moe/configs/
+# mxfp4-configs: aiter ships GEMM-AFP4WFP4 tiles for gfx950/gfx1250 only, and its gfx1250
+# bands set matrix_instr_nonkdim=32 for M>=64, which gfx1201 (WMMA 16x16x16 only) cannot
+# lower. These pin 16 across every band. Used only when RADIANCE_MXFP4=1.
+COPY mxfp4-configs/ ${SP}/aiter/ops/triton/configs/gemm/
 
 # --- gfx1201 fixes and tuned-kernel patches ---
 # Each patch edits a vLLM (or aiter/triton) source file in place and checks for source drift before
@@ -263,7 +267,8 @@ RUN set -eu; cd /opt/patches; \
              patch_gdn_wmma patch_preshuffle patch_radiance_fusion install_radiance_hooks \
              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
              patch_dynamo_metrics patch_conv1d_blockn patch_r4d patch_dflash_base patch_dflash2 \
-             patch_dflash_fused_kv_fp8 patch_dflash_w4 patch_gdn_metadata patch_ar_maxbytes; do \
+             patch_dflash_fused_kv_fp8 patch_dflash_w4 patch_gdn_metadata \
+             patch_quark_mxfp4 patch_ar_maxbytes patch_topk_triton_rows patch_qwen3_thinkoff; do \
       echo "== applying $p =="; python "$p.py"; \
     done; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
@@ -286,10 +291,22 @@ print('r4d', r4d.__version__, 'built:'); \
 [print('   ', k['family'], k['name']) for k in r4d.kernels()]" "$WANT" \
  && rm -rf /src/libr4d
 
+# --- the MXFP4 W4A8 GEMM, compiled from source ---
+# radiance_mxfp4_fp8.hip: hand-written fp8-WMMA GEMM for MXFP4 weights against fp8 activations
+# (W4A8). It lives here rather than in libr4d because it is specific to this fork; built in this
+# stage for the same reason R4D is -- it must be compiled by the same hipcc the venv loads it
+# against. Active only when RADIANCE_MXFP4_W4A8=1; radiance_mxfp4.py soft-disables if it is absent,
+# so the import is asserted below rather than left to fail at serve time.
+COPY radiance_mxfp4_fp8.hip /opt/patches/
+RUN INC=$(python -m pybind11 --includes); \
+    hipcc -O3 -std=c++17 -fPIC -shared --offload-arch=${GFX_ARCH} -Wno-unused-result \
+      $INC /opt/patches/radiance_mxfp4_fp8.hip -o ${SP}/radiance_mxfp4_fp8.so \
+ && python -c "import torch, radiance_mxfp4_fp8 as m; assert hasattr(m, 'launch'); print('radiance_mxfp4_fp8 built')"
+
 # --- strip debug symbols from the installed extensions (worth ~1 GB) ---
 # These are release builds, but they still carry .debug_* sections that nothing reads at runtime.
-# R4D is excluded: it is tiny and carries device fatbins.
-RUN find /opt/vllm -type f -name '*.so*' ! -name 'r4d.so' \
+# R4D and the MXFP4 W4A8 GEMM are excluded: both are tiny and carry device fatbins.
+RUN find /opt/vllm -type f -name '*.so*' ! -name 'r4d.so' ! -name 'radiance_mxfp4_fp8.so' \
       -exec strip --strip-unneeded {} + 2>/dev/null || true; \
     find /opt/vllm -name '__pycache__' -type d -prune -exec rm -rf {} + || true; \
     echo "extensions stripped"
@@ -358,17 +375,19 @@ ENV RADIANCE_USE_R4D=1 \
 # Running this in the RELEASE stage also proves the allowlist above is complete: a library left
 # behind by the prune or by the slim base shows up here as an ImportError, not in production.
 # Kept GPU-free: no `import aiter` (it runs rocminfo) and no full `import vllm`; versions come from
-# package metadata. R4D is imported after torch, which is what loads libamdhip64.
+# package metadata. R4D and the MXFP4 W4A8 GEMM are imported after torch, which is what loads
+# libamdhip64. The MXFP4 kernel soft-disables at runtime if it is broken, so assert it here instead.
 RUN WANT_VLLM=${VLLM_VERSION} WANT_AITER=${AITER_VERSION} WANT_TF=${TRANSFORMERS_VERSION} \
     python -c 'import os, torch, vllm._C, amdsmi, importlib.metadata as m; \
-import r4d; \
+import r4d, radiance_mxfp4_fp8; \
+assert hasattr(radiance_mxfp4_fp8, "launch"), "radiance_mxfp4_fp8.so is missing its launch entry point"; \
 v, a, t = m.version("vllm"), m.version("amd-aiter"), m.version("transformers"); \
 assert v.startswith(os.environ["WANT_VLLM"]), "vllm wheel reports " + v + ", built tag is " + os.environ["WANT_VLLM"]; \
 assert a.startswith(os.environ["WANT_AITER"]), "aiter wheel reports " + a + ", built tag is " + os.environ["WANT_AITER"]; \
 assert t == os.environ["WANT_TF"], "transformers is " + t + ", pinned is " + os.environ["WANT_TF"]; \
 print("stack OK | vllm", v, "| torch", torch.__version__, "| aiter", a, \
       "| torchvision", m.version("torchvision"), "| triton", m.version("triton"), \
-      "| transformers", t, "| r4d", r4d.__version__)'
+      "| transformers", t, "| r4d", r4d.__version__, "| mxfp4-w4a8 ok")'
 
 # The release image must still be able to COMPILE. AITER JIT-builds its kernels on first use, as a
 # pybind11 HIP extension, so the shipped image needs hipcc AND the C++ standard headers AND Python.h.
