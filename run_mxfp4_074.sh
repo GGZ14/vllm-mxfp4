@@ -197,7 +197,11 @@ EXTRA=${EXTRA:-}
 # MODELS is bind-mounted at /models below, so SNAP must live somewhere under it.
 MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
-if [ ! -f "$SNAP/config.json" ]; then
+# -f follows symlinks, so a checkpoint assembled as a symlink farm into the HF cache fails
+# this test on the HOST even though it resolves fine in the container, where the cache is
+# bind-mounted at /root/.cache/huggingface. Accept a dangling symlink too and let the
+# container be the judge; a genuinely absent checkpoint still has neither.
+if [ ! -f "$SNAP/config.json" ] && [ ! -L "$SNAP/config.json" ]; then
   echo "no checkpoint at $SNAP" >&2
   echo >&2
   echo "Build it from AMD's MXFP4 release (one-off, ~15 min, needs the fp8 MTP head -- the stock" >&2
