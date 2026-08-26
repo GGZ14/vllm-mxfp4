@@ -20,6 +20,19 @@ allocation still happens long before any CUDA graph capture. Steady-state memory
 fused buffer is the same bf16 tensor the unquantized path builds.
 
 An unquantized drafter keeps the original eager slice, so the bf16 configuration is untouched.
+
+The test is on the DENSE dtypes rather than on a list of quantized ones. The identity trick is
+scheme-agnostic by construction -- it asks the layer for its own effective weight -- so the only
+question is whether `weight` can be sliced directly, and that is true exactly when it is a real
+float matrix. Enumerating quantized dtypes instead silently misroutes any scheme not on the list:
+an MXFP4 checkpoint stores `weight` as packed uint8 of shape [N, K/2], which is not an fp8 dtype,
+so it took the dense slice and died in precompute_and_store_context_kv with
+
+    RuntimeError: mat1 and mat2 shapes cannot be multiplied (8192x5120 and 2560x5120)
+
+where 2560 is K/2 -- packed nibbles being multiplied as if they were a bf16 matrix. Exactness holds
+for MXFP4 too: the identity's entries are 0.0 and 1.0, both representable in e2m1, and a block of
+one 1.0 with 31 zeros takes scale 2^-2 so the element encodes as 4.0 with no rounding.
 """
 import sysconfig
 from pathlib import Path
@@ -31,13 +44,13 @@ F = Path(sysconfig.get_paths()["purelib"]) / "vllm/model_executor/models/qwen3_d
 HELPER_OLD = """@support_torch_compile
 class DFlashQwen3Model(nn.Module):"""
 
-HELPER_NEW = '''_DFLASH_FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+HELPER_NEW = '''_DFLASH_DENSE = (torch.bfloat16, torch.float16, torch.float32)
 
 
 def _dflash_kv_weight_rows(qkv_proj, q_size: int) -> torch.Tensor:
     """The K/V rows of a qkv projection as a dense compute-dtype matrix."""
     weight = qkv_proj.weight
-    if weight.dtype not in _DFLASH_FP8:
+    if weight.dtype in _DFLASH_DENSE:
         return weight[q_size:]
     dtype = getattr(qkv_proj, "orig_dtype", torch.bfloat16)
     eye = torch.eye(
@@ -55,7 +68,7 @@ class DFlashQwen3Model(nn.Module):'''
 SLICE_OLD = """        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)"""
 SLICE_NEW = """        self._kv_source_attn = layers_attn
-        if layers_attn[0].qkv_proj.weight.dtype in _DFLASH_FP8:
+        if layers_attn[0].qkv_proj.weight.dtype not in _DFLASH_DENSE:
             # Deferred: a quantized qkv_proj cannot be read until its quant method has processed
             # the weights, which happens after load_weights returns.
             self._fused_kv_weight = None

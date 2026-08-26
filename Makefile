@@ -1,4 +1,4 @@
-# Development helper for the R4D kernel library.
+# Development helper for the R4D kernel library and this fork's own HIP kernel.
 #
 # The kernels are NOT in this repo: they live in libr4d and the image build clones and compiles the
 # tag pinned as R4D_VERSION in the Dockerfile. This target does the same thing here, so a locally
@@ -8,6 +8,7 @@
 #     make r4d R4D_VERSION=v0.2.0         # a different tag
 #     make r4d IMAGE=vllm-radiance:dev    # compile against a different image's toolchain
 #     make verify
+#     make radiance_mxfp4_fp8.so       # this fork's MXFP4 W4A8 GEMM
 #     make clean
 #
 # The library must be compiled with the same ROCm/hipcc it loads against at runtime, i.e. the
@@ -21,7 +22,10 @@ R4D_REPO    ?= $(shell sed -n 's/^ARG R4D_REPO=//p' Dockerfile)
 R4D_VERSION ?= $(shell sed -n 's/^ARG R4D_VERSION=//p' Dockerfile)
 R4D_DIR     ?= libr4d
 
-RUN = docker run --rm --entrypoint bash -v "$(CURDIR)/$(R4D_DIR):/work" -w /work $(IMAGE) -c
+RUN     = docker run --rm --entrypoint bash -v "$(CURDIR)/$(R4D_DIR):/work" -w /work $(IMAGE) -c
+# The MXFP4 kernel is a single .hip at the repo root, so it mounts the root rather than $(R4D_DIR).
+RUN_ROOT = docker run --rm --entrypoint bash -v "$(CURDIR):/work" -w /work $(IMAGE) -c
+HIPCC_FLAGS = -O3 -std=c++17 -fPIC -shared --offload-arch=$(GFX_ARCH) -Wno-unused-result
 
 .DEFAULT_GOAL := r4d
 .PHONY: r4d verify clean
@@ -39,5 +43,11 @@ verify:
 	@$(RUN) 'PYTHONPATH=$$PWD $(PYTHON) -c "import torch, r4d; \
 	  print(\"[verify] r4d\", r4d.__version__, \"OK:\", [n for n in dir(r4d) if not n.startswith(\"_\")])"'
 
+# This fork's own kernel: the MXFP4 W4A8 fp8-WMMA GEMM. It is specific to this fork rather than
+# general to gfx1201, so it stays here instead of in libr4d, and the image build compiles it too.
+%.so: %.hip
+	@$(RUN_ROOT) 'INC=$$($(PYTHON) -m pybind11 --includes); \
+	  hipcc $(HIPCC_FLAGS) $$INC $< -o $@ && echo "[make] built $@"'
+
 clean:
-	rm -rf $(R4D_DIR)
+	rm -rf $(R4D_DIR) radiance_mxfp4_fp8.so
