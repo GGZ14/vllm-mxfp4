@@ -263,7 +263,7 @@ RUN set -eu; cd /opt/patches; \
              patch_gdn_wmma patch_preshuffle patch_radiance_fusion install_radiance_hooks \
              patch_unpad patch_mtp_mm_mask patch_mtp_loopbreak patch_qwen3_toolparse patch_from_json_filter \
              patch_dynamo_metrics patch_conv1d_blockn patch_r4d patch_dflash_base patch_dflash2 \
-             patch_dflash_fused_kv_fp8 patch_dflash_w4 patch_gdn_metadata; do \
+             patch_dflash_fused_kv_fp8 patch_dflash_w4 patch_gdn_metadata patch_topk_triton_rows; do \
       echo "== applying $p =="; python "$p.py"; \
     done; \
     python -c "import ast,glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; print('radiance modules parse OK')"
