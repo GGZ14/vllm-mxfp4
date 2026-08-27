@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
   constexpr int DWN = 8, DKS = 4, BND = DWN * 16, ARTN = 2, AR_BNF = AR_WN * ARTN * 16;
 
   printf("decode (us, min of 3x20, DRAM-resident, %d buffers)\n", NCOPY);
-  printf("%-9s %-4s %9s %9s %9s %9s %9s\n", "shape", "M", "full", "-unpack", "-scale", "-both",
+  printf("%-9s %-4s %9s %9s %9s %9s %9s\n", "shape", "M", "full", "-unpack", "-scale", "-LDS",
          "mxfp4");
   for (const Shape &sh : shapes) {
     const int N = sh.N, K = sh.K, kw = K / 8, G = K / AR_GROUP, Mmax = 64;
@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
         grid, block, 0, 0, dA, Wm[it % NCOPY], dWs, dWref, dAs, dP, dCnt, dC, M, N, K)
 #define MX_BY_TM do { if (tm==1) MXL(1); else if (tm==2) MXL(2); else if (tm==3) MXL(3); else MXL(4); } while(0)
       for (int rep = 0; rep < 3; ++rep) {
-        TIME(0, BY_TM(0)); TIME(1, BY_TM(1)); TIME(2, BY_TM(2)); TIME(3, BY_TM(3));
+        TIME(0, BY_TM(0)); TIME(1, BY_TM(1)); TIME(2, BY_TM(2)); TIME(3, BY_TM(4));
         TIME(4, MX_BY_TM);
       }
       printf("%-9s %-4d %9.1f %9.1f %9.1f %9.1f %9.1f\n", sh.name, M, best[0], best[1], best[2],

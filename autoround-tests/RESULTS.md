@@ -466,6 +466,7 @@ gfx1201; it is not an int4 deficiency. In serving, prefill at the 8k chunk size 
 | decode IMAJOR | closed: neutral |
 | prefill epilogue: hoisted base + full-tile fast path | **shipped**, 3.3-4.5% |
 | cheaper f32->bf16 conversion | closed: truncation saves 0-0.5% |
+| register-resident weights (drop LDS for W) | closed: removing the LDS round-trip entirely is 0, and slower on 2 of 6 |
 | hardware f32->bf16 convert | closed: does not exist on gfx1201 (cvt_pk_bf16_f32 is CDNA-only) |
 
 ## The residual serving gap is the DRAFTER, not the kernel
@@ -520,3 +521,31 @@ the epilogue; runtime does not. The epilogue's predication was worth 3.3-4.5% be
 `s_and_saveexec` serialises, not because the epilogue is a large share of the work.
 
 `AR_BF16_TRUNC` is left in place, defaults off, so the result stays re-measurable.
+
+## Register-resident weights: closed without building it
+
+libr4d's MXFP4 skinny GEMM is register-resident -- it reads the weight straight from global into
+the WMMA fragment, with no LDS and no barrier, on the argument that "global load already has the
+shape the fragment wants; staging it would cost LDS, a barrier and a [sync]". The same argument
+looks like it should apply here, and more strongly: at DTM=1, single-stream decode, each staged
+weight byte is read exactly ONCE by exactly one wave. There is no reuse at all, so the LDS write,
+the barrier and the LDS read look like pure overhead.
+
+Building it needs a fragment-order weight layout (the loader change the MXFP4 WPERM path already
+demonstrates), so before writing any of that, ABLATE bit 2 measures the ceiling: keep the global
+read and the unpack, never send the result to LDS, feed the WMMA from a register instead.
+
+| shape | M | full | -LDS | delta |
+|---|--:|--:|--:|--:|
+| gate_up | 8 | 89.6 | 90.1 | +0.6% SLOWER |
+| gate_up | 64 | 145.0 | 143.3 | -1.2% |
+| down | 8 | 43.3 | 42.8 | -1.2% |
+| down | 40 | 59.7 | 62.5 | +4.7% SLOWER |
+
+Zero, with two cases going backwards. The LDS round-trip is entirely hidden under global-load
+latency, which is what a kernel already running at 95.5% of achievable streaming bandwidth must
+look like. A whole loader change and a second decode kernel avoided by one ablation.
+
+Note the asymmetry with prefill, where the answer is different for a structural reason rather than
+a measured one: there `sW` is shared by WM=4 waves and `sA` by WN=2, so register-resident would
+take per-slab staging from 20 KB to 48 KB. LDS is load-bearing at prefill and free at decode.
