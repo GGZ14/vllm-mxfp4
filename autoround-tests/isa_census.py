@@ -19,9 +19,13 @@ for l in lines:
 
 
 def short(n):
-    if "decode" in n:
-        return "decode DTM=1"
-    return "prefill " + ("TN=4" if "Li4" in n else "TN=2")
+    """Name kernels by family and by their leading template args, since several instantiations
+    of each appear in one module and mislabelling them makes the table meaningless."""
+    fam = ("mx-folded" if "folded" in n else
+           "mx-decode" if "mxfp4" in n else
+           "ar-decode" if "decode" in n else "ar-prefill")
+    args = re.findall(r"ILi(\d+)", n) + re.findall(r"ILb(\d+)", n)
+    return f"{fam}<{','.join(args[:3])}>"
 
 
 keys = ["v_wmma_f32_16x16x16_fp8_fp8", "v_add_co_u32", "s_and_saveexec_b32",
