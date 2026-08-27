@@ -1,6 +1,10 @@
 #!/bin/bash
-# EVALUATION (not production): native MXFP4 body on gfx1201 with the MTP drafter in FP8,
-# on radiance 0.7.4 (libr4d).
+# PRODUCTION launcher: native MXFP4 body on gfx1201 with an FP8 drafter, on radiance 0.9.3 (libr4d).
+#
+# The name still says 074 because that is what the file was called when it targeted the 0.7.4 image;
+# the defaults below track production and are what actually decide which server you get. The script
+# began as an evaluation harness for 0.7.4 and became the thing that starts the real server, which
+# is how its defaults came to lag two image versions behind what they launch.
 #
 # The 0.5.8 form of this run is run_mxfp4_minm.sh, kept as-is because it is the only way to
 # reproduce the baseline these numbers are measured against:
@@ -94,13 +98,15 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.7.4}
+# Image and cache MUST move together: cache dirs validate on model + torch/Triton version and must
+# not be shared across configurations. Both defaulted to 0.7.4 / -074 long after production moved to
+# 0.9.3 / -093, so anyone taking the defaults got a DIFFERENT server than the one being measured.
+IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 NAME=${NAME:-vllmmxfp4074}
 PORT=${PORT:-8080}
 CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-1}
-FAST_DRAFT=${FAST_DRAFT:-1}
-CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-074}
+CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
@@ -116,6 +122,10 @@ GPU_UTIL=${GPU_UTIL:-0.98}
 #             pass. Depth is fixed when its CUDA graph is captured, so DYNAMIC_DRAFT is inert and
 #             num_speculative_tokens becomes a real tuning knob again.
 SPEC_METHOD=${SPEC_METHOD:-mtp}
+# MODELS is bind-mounted at /models below, so SNAP and DRAFTER must live somewhere under it.
+# Resolved HERE rather than next to SNAP further down: DRAFTER's default dereferences it, and under
+# `set -u` that made an un-exported MODELS an "unbound variable" abort rather than a default.
+MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 # Drafter checkpoint for SPEC_METHOD=dflash. Must live under MODELS -- only MODELS is mounted.
 DRAFTER=${DRAFTER:-$MODELS/Qwen3.8-27B-DFlash2-FP8}
 # The drafter's own attention backend. It has to support FULL cuda graphs or vLLM logs "running the
@@ -130,6 +140,18 @@ DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
 #   ~0.10 by the seventh, so 7 is the documented starting point -- but each extra position widens
 #   BOTH the draft pass and the target's verify, so sweep it.
 if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
+# The tuned drafter stack. The right default is NOT the same for both methods:
+#   mtp    -- 1. The 2-bit draft head with an exact rerank is a straight win here (+6.5% decode).
+#   dflash -- 0. FAST_DRAFT=1 CRASHES this drafter at load with an IndexError inside vLLM's
+#             rocm_unquantized_gemm_impl, so the int2 head and the int4 dflash weight path are both
+#             untested under dflash. Defaulting to 1 here meant `SPEC_METHOD=dflash ./run...` did
+#             not boot at all unless you already knew to pass FAST_DRAFT=0.
+if [ "$SPEC_METHOD" = dflash ]; then FAST_DRAFT=${FAST_DRAFT:-0}; else FAST_DRAFT=${FAST_DRAFT:-1}; fi
+if [ "$SPEC_METHOD" = dflash ] && [ "$FAST_DRAFT" != 0 ]; then
+  echo "[run] WARNING: FAST_DRAFT=$FAST_DRAFT with SPEC_METHOD=dflash is known to fail at load" >&2
+  echo "[run]          (IndexError in rocm_unquantized_gemm_impl). Set FAST_DRAFT=0 unless you are" >&2
+  echo "[run]          deliberately retesting that path." >&2
+fi
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
@@ -194,8 +216,6 @@ MIN_M=${MIN_M:-0}
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
 
-# MODELS is bind-mounted at /models below, so SNAP must live somewhere under it.
-MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
 # -f follows symlinks, so a checkpoint assembled as a symlink farm into the HF cache fails
 # this test on the HOST even though it resolves fine in the container, where the cache is

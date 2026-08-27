@@ -235,10 +235,19 @@ Batched gains most because at M=20-40 aiter's tuned band uses `NUM_KSPLIT=1`, wh
 underfilled, while this kernel keeps split-K. GSM8K also ran **14% faster wall** (375.5s -> 322.7s)
 on slightly *more* generated tokens.
 
-`run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `FAST_DRAFT`
-(default 1, the int2 draft head, +6.5% decode), `MIN_M` (0), `RADIANCE_MXFP4_DECODE_MAX_M` (48),
-`SPEC` (4 -- measurably better than 6 and 8 here, re-confirmed on this build), `CHUNK` (8192),
-`GPU_UTIL` (0.98).
+`run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `MIN_M` (0),
+`RADIANCE_MXFP4_DECODE_MAX_M` (64), `CHUNK` (8192), `GPU_UTIL` (0.98), and two whose default is
+keyed to `SPEC_METHOD`:
+
+* `FAST_DRAFT` -- **1 under mtp** (the int2 draft head, +6.5% decode), **0 under dflash**, where
+  setting it crashes the drafter at load with an `IndexError` in `rocm_unquantized_gemm_impl`.
+* `SPEC` -- **4 under mtp** (measurably better than 6 and 8 here), **7 under dflash** (the peak;
+  5/6/8 measure 91.2/95.5/88.9 tok/s against 101.3).
+
+`IMAGE` and `CACHE` default to `0.9.3` / `.radiance-cache-w4a8-093` and must move together --
+cache dirs validate on model + torch/Triton version and must not be shared across configurations.
+`SPEC_METHOD` still defaults to `mtp`, so production is
+`MODELS=$HOME/models SPEC_METHOD=dflash ./run_mxfp4_074.sh`.
 
 ### The gated-delta-net NaN (fixed upstream)
 
