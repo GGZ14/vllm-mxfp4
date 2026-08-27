@@ -5,3 +5,4 @@
 # recipe rather than checked in twice.
 mxfp4_kernels.h
 isadump.*
+*.so
