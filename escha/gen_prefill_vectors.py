@@ -32,7 +32,14 @@ def e4m3_bytes(x):
 CASES = [("model.language_model.layers.0.mlp.gate_proj", 256, 128, 256),
          ("model.language_model.layers.0.mlp.up_proj", 512, 128, 128),
          ("model.language_model.layers.0.mlp.gate_proj", 300, 256, 128),
-         ("model.language_model.layers.31.mlp.gate_proj", 1024, 256, 256)]
+         ("model.language_model.layers.31.mlp.gate_proj", 1024, 256, 256),
+         # Decode-shaped rows for the fp8 decode kernel, which shares this reference: M values
+         # spanning the real speculative band (5 = SPEC+1 single stream, 8/40/64 batched), with
+         # Kdim=128 chosen so a KB=4 block covers only half the k-range and the ragged tail runs.
+         ("model.language_model.layers.0.mlp.gate_proj", 5, 128, 256),
+         ("model.language_model.layers.0.mlp.up_proj", 8, 128, 128),
+         ("model.language_model.layers.0.mlp.gate_proj", 40, 256, 128),
+         ("model.language_model.layers.31.mlp.gate_proj", 64, 256, 256)]
 rng = np.random.default_rng(1)
 blobs = [struct.pack("<I", 0xE5C7A002), struct.pack("<I", len(CASES))]
 for base, M, N, Kdim in CASES:

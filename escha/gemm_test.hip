@@ -42,19 +42,27 @@ int main() {
     HIP_CHECK(hipMemcpy(dW, hw.data(), (size_t)words * 4, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(dA, hA.data(), hA.size() * 2, hipMemcpyHostToDevice));
 
-    for (int KS : {1, 4}) {
+    for (int KS : {1, 4})
+     for (int KBLK : {1, 2, 4, 8}) {
       HIP_CHECK(hipMemset(dCnt, 0, nblk * 4));
       HIP_CHECK(hipMemset(dC, 0, (size_t)M * N * 2));
       const int tm = (M + 15) / 16;
       const dim3 g(nblk, 1, KS), b(DWN * 32);
-#define L(KS_, TM_, KB_) hipLaunchKernelGGL((escha_gemm_decode<DWN, KS_, TM_, KB_>), g, b, 0, 0, \
+// KB=1 keeps PAD=8 (the original layout); KB>=2 uses PAD=4, which makes the shared stride
+// 2 mod 4 dwords and the 16 fragment lanes bank-conflict-free.
+#define L(KS_, TM_, K_, KB_, PAD_) hipLaunchKernelGGL( \
+        (escha_gemm_decode<DWN, KS_, TM_, K_, KB_, PAD_>), g, b, 0, 0, \
         dA, dW, dP, dCnt, dC, M, N, Kdim)
-#define BY_TM(KS_, KB_) do { if (tm==1) L(KS_,1,KB_); else if (tm==2) L(KS_,2,KB_); \
-        else if (tm==3) L(KS_,3,KB_); else L(KS_,4,KB_); } while (0)
-      if (K == 2) { if (KS == 1) BY_TM(1, 2); else BY_TM(4, 2); }
-      else        { if (KS == 1) BY_TM(1, 3); else BY_TM(4, 3); }
+#define BY_TM(KS_, K_, KB_, PAD_) do { if (tm==1) L(KS_,1,K_,KB_,PAD_); \
+        else if (tm==2) L(KS_,2,K_,KB_,PAD_); else if (tm==3) L(KS_,3,K_,KB_,PAD_); \
+        else L(KS_,4,K_,KB_,PAD_); } while (0)
+#define BY_KB(KS_, K_) do { if (KBLK==1) BY_TM(KS_,K_,1,8); else if (KBLK==2) BY_TM(KS_,K_,2,4); \
+        else if (KBLK==4) BY_TM(KS_,K_,4,4); else BY_TM(KS_,K_,8,4); } while (0)
+      if (K == 2) { if (KS == 1) BY_KB(1, 2); else BY_KB(4, 2); }
+      else        { if (KS == 1) BY_KB(1, 3); else BY_KB(4, 3); }
 #undef L
 #undef BY_TM
+#undef BY_KB
       HIP_CHECK(hipDeviceSynchronize());
       std::vector<unsigned short> got((size_t)M * N);
       HIP_CHECK(hipMemcpy(got.data(), dC, got.size() * 2, hipMemcpyDeviceToHost));
@@ -67,7 +75,7 @@ int main() {
       const double rel = sqrt(num / (den > 0 ? den : 1));
       const bool ok = rel < 5e-3;
       bad += !ok;
-      printf("%-6d %-5d %-6d %-7d %-5d %10.2e  %s\n", K, M, N, Kdim, KS, rel, ok ? "OK" : "FAIL");
+      printf("%-6d %-5d %-6d %-7d %-5d %-4d %10.2e  %s\n", K, M, N, Kdim, KS, KBLK, rel, ok ? "OK" : "FAIL");
     }
     hipFree(dW); hipFree(dA); hipFree(dP); hipFree(dCnt); hipFree(dC);
   }
