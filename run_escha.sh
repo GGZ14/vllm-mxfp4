@@ -74,6 +74,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_SKINNY_GEMM="${RADIANCE_SKINNY_GEMM:-1}" \
   -e ESCHA_SPEC_CFG="$SPEC_CFG" \
   -e RADIANCE_ESCHA=1 \
+  -e RADIANCE_ESCHA_TRACE="${RADIANCE_ESCHA_TRACE:-}" \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
   -e TRITON_CACHE_DIR=/cache/triton \
   -v "$HOME/models:/models:ro" \
@@ -102,5 +103,6 @@ exec /opt/radiance_entrypoint.sh $MODEL \
   --max-num-seqs $MAXSEQS \
   --max-num-batched-tokens $CHUNK \
   --trust-remote-code \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
   \"\${SPECARGS[@]}\" $EXTRA
 "

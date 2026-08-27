@@ -67,8 +67,20 @@ def escha_linear(x: torch.Tensor, code: torch.Tensor, rin: torch.Tensor, rout: t
     """
     IC = code.shape[0] * _TILE
     OC = code.shape[1] * _TILE
+    # The kernels index raw pointers with a row stride of IC/OC, so a non-contiguous or
+    # wrong-dtype activation walks off the allocation -- which shows up as a GPU memory fault
+    # inside escha_pre_quant rather than as anything that names the cause.
     x2 = x.reshape(-1, IC)
+    if x2.dtype != torch.bfloat16:
+        x2 = x2.to(torch.bfloat16)
+    x2 = x2.contiguous()
     M = x2.shape[0]
+    if M == 0:
+        return x.new_empty((*x.shape[:-1], OC), dtype=torch.bfloat16)
+    if rin.numel() != IC or s_in.numel() != IC:
+        raise ValueError(f"escha: rin/s_in length {rin.numel()}/{s_in.numel()} != IC {IC}")
+    if rout.numel() != OC or s_out.numel() != OC:
+        raise ValueError(f"escha: rout/s_out length {rout.numel()}/{s_out.numel()} != OC {OC}")
     dev = x.device
     ext = _load_ext()
 
@@ -79,10 +91,16 @@ def escha_linear(x: torch.Tensor, code: torch.Tensor, rin: torch.Tensor, rout: t
     As = torch.empty(M, device=dev, dtype=torch.float32)
     C = torch.empty((M, OC), device=dev, dtype=torch.bfloat16)
     out = torch.empty((M, OC), device=dev, dtype=torch.bfloat16)
+    trace = os.environ.get("RADIANCE_ESCHA_TRACE")
+    if trace:
+        sys.stderr.write(f"[radiance.escha] gemm M={M} IC={IC} OC={OC} K={kbits} nblk={nblk}\n")
     ext.launch(x2.data_ptr(), code.data_ptr(), rin.data_ptr(), rout.data_ptr(),
                s_in.data_ptr(), s_out.data_ptr(), A.data_ptr(), As.data_ptr(),
                C.data_ptr(), out.data_ptr(), M, OC, IC, int(kbits),
                torch.cuda.current_stream().cuda_stream)
+    if trace:
+        torch.cuda.synchronize()      # localize a fault to THIS call rather than a later one
+        sys.stderr.write(f"[radiance.escha] gemm ok M={M} IC={IC} OC={OC}\n")
     del nblk
     return out.view(*x.shape[:-1], OC)
 
@@ -118,6 +136,16 @@ def _quant_config_cls():
         def __init__(self, layer_meta: dict):
             super().__init__()
             self.layer_meta = layer_meta or {}
+            # Match on the SUFFIX from "layers." onward, not the full path. layer_meta is written
+            # in CHECKPOINT namespace ("model.language_model.layers.0.mlp.gate_proj") while vLLM
+            # asks with its own module path, and the two arrangements differ for this
+            # architecture. Keying on the tail makes the lookup independent of that.
+            self._by_tail = {self._tail(n): m for n, m in self.layer_meta.items()}
+
+        @staticmethod
+        def _tail(name: str) -> str:
+            i = name.find("layers.")
+            return name[i:] if i >= 0 else name.rpartition(".")[2]
 
         def __repr__(self):
             ks = {}
@@ -170,7 +198,7 @@ def _quant_config_cls():
 
         def is_coded(self, prefix: str) -> bool:
             names = self._names_for(prefix)
-            hit = [n for n in names if n in self.layer_meta]
+            hit = [n for n in names if self._tail(n) in self._by_tail]
             if hit and len(hit) != len(names):
                 # A partly-coded merge would need a mixed quantized/dense GEMM pair; the
                 # checkpoint does not do this, and silently treating it as dense would be wrong.
@@ -180,13 +208,27 @@ def _quant_config_cls():
             return bool(hit)
 
         def kbits_for(self, prefix: str):
-            return [int(self.layer_meta[n]["K"]) for n in self._names_for(prefix)]
+            return [int(self._by_tail[self._tail(n)]["K"]) for n in self._names_for(prefix)]
+
+        def out_features_for(self, prefix: str):
+            return [int(self._by_tail[self._tail(n)]["out_features"])
+                    for n in self._names_for(prefix)]
 
         def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+            # Install the int8 embedding shim HERE, not at registration. Registration runs from
+            # inside vllm.model_executor.layers.quantization.__init__, where importing the model
+            # loader re-enters a half-built vllm.config:
+            #   ImportError: cannot import name 'ModelConfig' from partially initialized module
+            # By the time a layer asks for its quant method vLLM is fully up, and model
+            # construction still precedes weight loading, so the shim is in place in time.
+            _install_weight_shim()
             from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
             if not isinstance(layer, LinearBase):
                 return None
-            if not self.is_coded(prefix):
+            coded = self.is_coded(prefix)
+            if os.environ.get("RADIANCE_ESCHA_TRACE"):
+                sys.stderr.write(f"[radiance.escha] route {prefix} coded={coded}\n")
+            if not coded:
                 return UnquantizedLinearMethod()
             return _linear_method_cls()(self, prefix)
 
@@ -222,35 +264,56 @@ def _linear_method_cls():
                            input_size, output_size, params_dtype, **extra_weight_attrs):
             from vllm.distributed import get_tensor_model_parallel_world_size
             tp = get_tensor_model_parallel_world_size()
-            nshard = len(output_partition_sizes)
-            if nshard != len(self.kbits):
-                raise ValueError(
-                    f"escha: {self.prefix} has {nshard} output partitions but "
-                    f"{len(self.kbits)} coded source tensors {self.kbits}")
+            # One shard per SOURCE TENSOR, which is not one per output partition: the GDN
+            # in_proj_qkvz has four partitions (q, k, v, z) but only two coded tensors, because
+            # in_proj_qkv covers q+k+v. Each source tensor is one GEMM, so shards are counted
+            # from the sources and each shard's width is taken from its own code tensor later.
+            nshard = len(self.kbits)
             if input_size_per_partition % _HAD:
                 raise ValueError(
                     f"escha: {self.prefix} K per rank ({input_size_per_partition}) is not a "
                     f"multiple of {_HAD}; the incoherence transform is blocked at 128 and a "
                     f"shard boundary inside a block would change the transform itself.")
-            for i, oc in enumerate(output_partition_sizes):
-                if oc % _HAD:
-                    raise ValueError(
-                        f"escha: {self.prefix} shard {i} N per rank ({oc}) is not a multiple of "
-                        f"{_HAD}; same reason as K above, on the output transform.")
-
-            layer.escha_ic = input_size_per_partition
-            layer.escha_oc = list(output_partition_sizes)
-            layer.escha_kbits = list(self.kbits)
-            # Which axis is sharded decides which tensors get sliced. Inferring it from the sizes
-            # is ambiguous at TP=1 (both tests pass), so ask the layer what it is.
             from vllm.model_executor.layers.linear import RowParallelLinear
             layer.escha_row_parallel = isinstance(layer, RowParallelLinear)
+            layer.escha_ic = input_size_per_partition
+            layer.escha_parts = list(output_partition_sizes)
+            layer.escha_oc_total = sum(output_partition_sizes)
+            # Per-rank width of each SOURCE tensor, from layer_meta. Needed to turn vLLM's
+            # partition-index shard ids back into a source index -- see _shard_index.
+            # Row-parallel shards the INPUT, so its output width is the full one; column-parallel
+            # shards the output and each source contributes out_features/tp per rank.
+            _div = 1 if layer.escha_row_parallel else tp
+            layer.escha_src_w = [w // _div for w in self.quant_config.out_features_for(self.prefix)]
+            # Which output partitions each source tensor covers. Usually one, but the GDN
+            # in_proj_qkv is ONE tensor spanning q, k and v -- and that distinction decides how it
+            # is sharded: a single contiguous narrow would hand rank 0 all of q, all of k and a
+            # slice of v instead of each projection's own slice.
+            groups, j, acc = [], 0, 0
+            for w in layer.escha_src_w:
+                g = []
+                while acc < w and j < len(layer.escha_parts):
+                    g.append(layer.escha_parts[j]); acc += layer.escha_parts[j]; j += 1
+                if acc != w:
+                    raise ValueError(f"escha: {self.prefix} output partitions "
+                                     f"{layer.escha_parts} do not group into source widths "
+                                     f"{layer.escha_src_w}")
+                groups.append(g); acc = 0
+            layer.escha_src_parts = groups
+            layer.escha_kbits = list(self.kbits)
+            # Which axis is sharded decides which tensors get sliced. Inferring it from the
+            # sizes is ambiguous at TP=1 (both tests pass), so the layer type decides; it is set
+            # above, before the source widths that depend on it.
             layer.escha_raw = [dict() for _ in range(nshard)]
             layer.escha_prefix = self.prefix
 
             # Placeholders so vLLM can resolve the checkpoint names; the real tensors have
             # per-shard shapes (K=2 and K=3 shards differ in the code tensor's last dim), so they
             # cannot live in one parameter and are collected by the loader below instead.
+            if os.environ.get("RADIANCE_ESCHA_TRACE"):
+                sys.stderr.write(f"[radiance.escha] create_weights {self.prefix} "
+                                 f"ic={input_size_per_partition} oc={list(output_partition_sizes)} "
+                                 f"K={self.kbits} row={layer.escha_row_parallel}\n")
             for suffix in SUFFIXES:
                 p = torch.nn.Parameter(torch.empty(0), requires_grad=False)
                 set_weight_attrs(p, {"weight_loader": self._make_loader(layer, suffix)})
@@ -258,42 +321,74 @@ def _linear_method_cls():
 
         # ---------------------------------------------------------------- loading
         def _shard_index(self, layer, shard_id):
+            """vLLM's shard id -> index of the SOURCE TENSOR it belongs to.
+
+            Three forms turn up. A name ("gate"/"up"/"q") maps directly. An int or a TUPLE of ints
+            is a partition index, and partitions are finer than sources: the GDN in_proj_qkvz has
+            partitions (q, k, v, z) but in_proj_qkv supplies the first three, so vLLM passes
+            (0, 1, 2) for one tensor. Those are resolved by turning the lowest partition index
+            into a column offset and asking which source's span contains it.
+            """
             if shard_id is None:
                 return 0
-            if isinstance(shard_id, int):
-                return shard_id
             names = self.quant_config._names_for(self.prefix)
             leaves = [n.rpartition(".")[2] for n in names]
-            for i, leaf in enumerate(leaves):
-                if shard_id == leaf or shard_id == leaf.replace("_proj", ""):
+            if isinstance(shard_id, str):
+                for i, leaf in enumerate(leaves):
+                    if shard_id == leaf or shard_id == leaf.replace("_proj", ""):
+                        return i
+                raise ValueError(f"escha: {self.prefix} unknown shard id {shard_id!r} "
+                                 f"(expected one of {leaves})")
+            first = min(shard_id) if isinstance(shard_id, (tuple, list)) else int(shard_id)
+            off = sum(layer.escha_parts[:first])
+            acc = 0
+            for i, w in enumerate(layer.escha_src_w):
+                if off < acc + w:
                     return i
-            raise ValueError(f"escha: {self.prefix} unknown shard id {shard_id!r} "
-                             f"(expected one of {leaves})")
+                acc += w
+            raise ValueError(f"escha: {self.prefix} shard id {shard_id!r} -> column {off} falls "
+                             f"outside the source widths {layer.escha_src_w}")
 
         def _make_loader(self, layer, suffix):
             def loader(param, loaded_weight, shard_id=None, *args, **kwargs):
                 from vllm.distributed import (get_tensor_model_parallel_rank,
                                               get_tensor_model_parallel_world_size)
                 del param, args, kwargs
+                if os.environ.get("RADIANCE_ESCHA_TRACE"):
+                    sys.stderr.write(f"[radiance.escha] load {layer.escha_prefix}.{suffix} "
+                                     f"shard={shard_id!r} shape={tuple(loaded_weight.shape)}\n")
                 i = self._shard_index(layer, shard_id)
                 t = loaded_weight
                 tp = get_tensor_model_parallel_world_size()
                 r = get_tensor_model_parallel_rank()
                 if tp > 1:
                     row = layer.escha_row_parallel
-                    if suffix == "escha_code":
-                        # [IC//16, OC//16, 16K]: whichever axis this layer shards, shard it in
-                        # TILE units. Both param and checkpoint are in the same units, so the
-                        # divisor cancels -- but the 128-block transform still requires the slice
-                        # to be 128-aligned, which create_weights asserted.
-                        ax = 0 if row else 1
-                        per = t.shape[ax] // tp
-                        t = t.narrow(ax, r * per, per)
-                    elif (suffix in IC_SIDE) == bool(row):
-                        # IC-side tensors shard only on row-parallel; OC-side only on column.
-                        per = t.shape[0] // tp
-                        t = t.narrow(0, r * per, per)
-                layer.escha_raw[i][suffix] = t.contiguous().clone()
+                    if row:
+                        # Row-parallel: the input axis is sharded and every source covers exactly
+                        # one projection, so a contiguous narrow is right.
+                        if suffix == "escha_code" or suffix in IC_SIDE:
+                            per = t.shape[0] // tp
+                            t = t.narrow(0, r * per, per)
+                    else:
+                        # Column-parallel: slice each of the source's output partitions
+                        # separately and re-concatenate, because a source may span several.
+                        if suffix == "escha_code" or suffix in OC_SIDE:
+                            ax = 1 if suffix == "escha_code" else 0
+                            unit = _TILE if suffix == "escha_code" else 1
+                            off, pieces = 0, []
+                            for w in layer.escha_src_parts[i]:
+                                full = w * tp
+                                pieces.append(t.narrow(ax, (off + r * w) // unit, w // unit))
+                                off += full
+                            t = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=ax)
+                # Move to the worker's GPU HERE. vLLM hands weight loaders CPU tensors and
+                # normally they are copied into a pre-allocated device parameter; these are kept
+                # as plain tensors, so without this they stay on the host and the kernels get a
+                # host pointer -- which surfaces as a GPU memory fault naming escha_pre_quant and
+                # nothing else. Transferring per shard also avoids holding every shard in host
+                # RAM at once.
+                dev = torch.device("cuda", torch.cuda.current_device())
+                layer.escha_raw[i][suffix] = t.contiguous().to(dev, copy=True)
             return loader
 
         def process_weights_after_loading(self, layer) -> None:
@@ -317,10 +412,12 @@ def _linear_method_cls():
                     raise ValueError(
                         f"escha: {layer.escha_prefix} shard {i} code IC={c.shape[0] * _TILE} "
                         f"!= partition IC={layer.escha_ic}")
-                if c.shape[1] * _TILE != layer.escha_oc[i]:
+                oc_i = c.shape[1] * _TILE
+                if oc_i % _HAD:
                     raise ValueError(
-                        f"escha: {layer.escha_prefix} shard {i} code OC={c.shape[1] * _TILE} "
-                        f"!= partition OC={layer.escha_oc[i]}")
+                        f"escha: {layer.escha_prefix} shard {i} N per rank ({oc_i}) is not a "
+                        f"multiple of {_HAD}; the output transform is blocked at 128 and a shard "
+                        f"boundary inside a block would change the transform itself.")
                 code.append(c.view(torch.uint8).view(torch.int32).contiguous())
                 rout.append(raw["escha_rout"].to(torch.float16).contiguous())
                 s_out.append(raw["escha_s_out"].to(torch.float32).contiguous())
@@ -332,6 +429,11 @@ def _linear_method_cls():
                 rin.append(raw["escha_rin"].to(torch.float16).contiguous())
                 s_in.append(raw["escha_s_in"].to(torch.float32).contiguous())
 
+            got = sum(c.shape[1] * _TILE for c in code)
+            if got != layer.escha_oc_total:
+                raise ValueError(
+                    f"escha: {layer.escha_prefix} shards cover N={got} but the layer's partitions "
+                    f"total {layer.escha_oc_total}")
             for s in SUFFIXES:
                 if hasattr(layer, s):
                     delattr(layer, s)
@@ -405,7 +507,6 @@ def _install_weight_shim():
 def register():
     """Register the escha method with vLLM's quantization registry."""
     from vllm.model_executor.layers.quantization import register_quantization_config
-    _install_weight_shim()
     cls = _quant_config_cls()
     try:
         register_quantization_config("escha")(cls)
