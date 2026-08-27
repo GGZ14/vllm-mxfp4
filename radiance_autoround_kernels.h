@@ -144,38 +144,52 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
     // Measured worth far more than the single FMA per WMMA that the fold itself costs -- at M=40
     // the ablation attributed 29% of runtime to the scale, and the arithmetic can only account
     // for a few percent of that.
-    const float sc = (ABLATE & 2) ? 1.f
-                                  : ((n_lane < N) ? __half2float(S[(size_t)s * N + n_lane]) : 0.f);
+    // CLAMP, NEVER PREDICATE. A bounds-predicated load lands in its own s_and_saveexec region,
+    // and the compiler cannot carry a COUNTED s_wait_loadcnt across an exec-mask merge -- so it
+    // emits s_wait_loadcnt 0x0 after every one. As predicated code this loop was six serialised
+    // memory round trips per slab (1 scale + 2 A + 4 W at DTM=3), with the A staging nested two
+    // deep, where one round trip would do. It is also what made the hoist below a no-op: the ISA
+    // was `global_load_d16_b16` followed immediately by `s_wait_loadcnt 0x0`, so the scale never
+    // actually overlapped the staging it was hoisted above.
+    // Clamping is safe: columns past N are dropped by `n_lane < N` in the epilogue and rows past
+    // M by `m < M`, and a clamped read returns real finite data -- never the 0xFF byte that is
+    // e4m3 NaN. Bit-identical to the predicated form on every gated shape.
+    const float sc = (ABLATE & 2)
+                         ? 1.f
+                         : __half2float(S[(size_t)s * N + (n_lane < N ? n_lane : N - 1)]);
 #pragma unroll
     for (int off = 0; off < DEC_MTILE * DTM * DBK; off += DNTHREADS * 16) {
       const int idx = off + tid * 16;
       if (idx < DEC_MTILE * DTM * DBK) {
         const int r = idx / DBK, c = idx % DBK;
-        uint4_t v = uint4_t{0, 0, 0, 0};
-        if (r < M) v = *(const uint4_t *)(A + (size_t)r * K + k0 + c);
-        *(uint4_t *)(&sA[r * DASTR + c]) = v;
+        const int rc = r < M - 1 ? r : M - 1;          // clamp, see the note on sc above
+        *(uint4_t *)(&sA[r * DASTR + c]) = *(const uint4_t *)(A + (size_t)rc * K + k0 + c);
       }
     }
-    // TWO uint32 of codes per thread per pass: 16 codes -> 16 e4m3 bytes.
-    //
-    // Eight bytes per thread, not four. A 4-byte global read halves the bytes moved per load
-    // instruction and this project has already paid for that lesson once -- a 4-byte-per-thread
-    // fragment-order staging cost 14-25% of prefill until it was widened to read two adjacent
-    // lane slots. The MXFP4 kernel reads 8 bytes per thread here for the same reason.
-    // Both halves stay 8-byte aligned: kw is a multiple of 16 (K is a multiple of 128) and
-    // DWSTR = DBK+8 is a multiple of 8, so no 16-byte store alignment is assumed.
+    // Weight staging width, in uint32 per thread. 4 bytes was 11% slower than 8; AR_DEC_WU
+    // exists to ask whether 16 is better still, since decode sits at ~81% of the DRAM roofline
+    // and what is left is memory efficiency rather than ALU.
+#ifndef AR_DEC_WU
+#define AR_DEC_WU 2
+#endif
 #pragma unroll
-    for (int off = 0; off < BND * (DBK / 16); off += DNTHREADS) {
+    for (int off = 0; off < BND * (DBK / (8 * AR_DEC_WU)); off += DNTHREADS) {
       const int idx = off + tid;
-      const int r = idx / (DBK / 16), c = idx % (DBK / 16), gn = n0 + r;
-      uint2_t wv = uint2_t{0u, 0u};
-      if (gn < N) wv = *(const uint2_t *)(W + (size_t)gn * kw + k0 / 8 + c * 2);
-      if constexpr (ABLATE & 1) {
-        *(uint2_t *)(&sW[r * DWSTR + c * 16]) = uint2_t{wv[0], wv[0]};
-        *(uint2_t *)(&sW[r * DWSTR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
-      } else {
-        *(uint2_t *)(&sW[r * DWSTR + c * 16]) = ar_unpack8(wv[0]);
-        *(uint2_t *)(&sW[r * DWSTR + c * 16 + 8]) = ar_unpack8(wv[1]);
+      const int r = idx / (DBK / (8 * AR_DEC_WU)), c = idx % (DBK / (8 * AR_DEC_WU));
+      const int gn = n0 + r;
+      const int gc = gn < N - 1 ? gn : N - 1;          // clamp, see the note on sc above
+      const unsigned int *src = W + (size_t)gc * kw + k0 / 8 + c * AR_DEC_WU;
+      unsigned char *dst = &sW[r * DWSTR + c * 8 * AR_DEC_WU];
+#pragma unroll
+      for (int u = 0; u < AR_DEC_WU; u += 2) {
+        const uint2_t wv = *(const uint2_t *)(src + u);
+        if constexpr (ABLATE & 1) {
+          *(uint2_t *)(dst + u * 8) = uint2_t{wv[0], wv[0]};
+          *(uint2_t *)(dst + u * 8 + 8) = uint2_t{wv[1], wv[1]};
+        } else {
+          *(uint2_t *)(dst + u * 8) = ar_unpack8(wv[0]);
+          *(uint2_t *)(dst + u * 8 + 8) = ar_unpack8(wv[1]);
+        }
       }
     }
     __syncthreads();
@@ -244,6 +258,25 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
     __syncthreads();
   }
 
+  // At DKS==1 the accumulator already holds the whole K range, so the partial buffer, the
+  // threadfence, the atomic and the reduction pass are all pure overhead. That overhead is not
+  // small: partial traffic is DKS*M*N floats, constant in the weight stream but LINEAR IN M --
+  // 11.1 MB against gate_up's 44.6 MB of weights at M=40, 17.8 MB at M=64. Choosing DKS by shape
+  // is the launcher's job (see split_k_for in radiance_autoround.hip); this is the path that
+  // makes DKS==1 actually free. Bit-identical to the DKS==1 reduction path, which summed one term.
+  if constexpr (DKS == 1) {
+    if (n_lane < N) {
+#pragma unroll
+      for (int i = 0; i < DTM; ++i)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int m = i * 16 + kb8 + e;
+          if (m < M) C[(size_t)m * N + n_lane] = (__bf16)(acc[i][e] * As[m]);
+        }
+    }
+    return;
+  }
+
   if (n_lane < N) {
 #pragma unroll
     for (int i = 0; i < DTM; ++i)
@@ -305,8 +338,12 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
 #ifndef AR_WM
 #define AR_WM 4
 #endif
+#ifndef AR_WN
 #define AR_WN 2
+#endif
+#ifndef AR_BK
 #define AR_BK 64
+#endif
 #define AR_PAD 8
 #define AR_ASTR (AR_BK + AR_PAD)
 #define AR_NWAVE (AR_WM * AR_WN)
@@ -362,24 +399,28 @@ __global__ __launch_bounds__(AR_NTHREADS) void ar_int4_fp8_gemm_prefill(
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
       const int g = k0 / AR_GROUP;
-      sc[j] = (ABLATE & 2) ? 1.f
-                           : ((ncol[j] < N) ? __half2float(S[(size_t)g * N + ncol[j]]) : 0.f);
+      // Clamped, not predicated -- see the note in the decode kernel. As predicated code this
+      // slab's seven staging loads (2 scale + 4 A + 1 W) each sat alone in an s_and_saveexec
+      // region with its own s_wait_loadcnt 0x0: seven serialised memory round trips per k-slab.
+      // Clamped, they issue back to back under a single wait.
+      sc[j] = (ABLATE & 2)
+                  ? 1.f
+                  : __half2float(S[(size_t)g * N + (ncol[j] < N ? ncol[j] : N - 1)]);
     }
 #pragma unroll
     for (int off = 0; off < AR_BMF * AR_BK; off += AR_NTHREADS * 16) {
       const int idx = off + tid * 16;
-      const int r = idx / AR_BK, c = idx % AR_BK, gm = m0 + r;
-      uint4_t v = uint4_t{0, 0, 0, 0};
-      if (gm < M) v = *(const uint4_t *)(Ab + (r * K + c));
-      *(uint4_t *)(&sA[r * AR_ASTR + c]) = v;
+      const int r = idx / AR_BK, c = idx % AR_BK;
+      const int rc = r < M - 1 - m0 ? r : M - 1 - m0;              // clamp, never predicate
+      *(uint4_t *)(&sA[r * AR_ASTR + c]) = *(const uint4_t *)(Ab + (rc * K + c));
     }
     // Eight bytes of codes per thread, as in the decode kernel -- see the note there.
 #pragma unroll
     for (int off = 0; off < BNF_T * (AR_BK / 16); off += AR_NTHREADS) {
       const int idx = off + tid;
-      const int r = idx / (AR_BK / 16), c = idx % (AR_BK / 16), gn = n0 + r;
-      uint2_t wv = uint2_t{0u, 0u};
-      if (gn < N) wv = *(const uint2_t *)(Wb + (size_t)r * kw + c * 2);
+      const int r = idx / (AR_BK / 16), c = idx % (AR_BK / 16);
+      const int rc = r < N - 1 - n0 ? r : N - 1 - n0;              // clamp, never predicate
+      const uint2_t wv = *(const uint2_t *)(Wb + (size_t)rc * kw + c * 2);
       if constexpr (ABLATE & 1) {
         *(uint2_t *)(&sW[r * AR_ASTR + c * 16]) = uint2_t{wv[0], wv[0]};
         *(uint2_t *)(&sW[r * AR_ASTR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
@@ -395,6 +436,19 @@ __global__ __launch_bounds__(AR_NTHREADS) void ar_int4_fp8_gemm_prefill(
       // so the temp accumulator is TN tiles rather than AR_TM*TN. That is 48 fewer VGPRs at
       // TM=4/TN=2, which is the difference between 8 and 10 waves/SIMD. The price is re-reading
       // the sW fragments once per i instead of once per slab.
+      // The W fragments do not depend on i, so read them ONCE per slab rather than once per
+      // M-fragment. As written before, the ISA re-issued the same eight ds_load_2addr_b64
+      // (offset pairs {0,144},{2,146},{4,148},{6,150}) four times over: 32 of the slab's 32 LDS
+      // instructions where 20 suffice. Costs 6 VGPRs (122 -> 128) and does not move occupancy.
+      int2_t wfa[AR_BK / 16][TN];
+#pragma unroll
+      for (int step = 0; step < AR_BK / 16; ++step)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          const unsigned char *p =
+              &sW[(wn * TN * 16 + j * 16 + col) * AR_ASTR + step * 16 + kb8];
+          wfa[step][j][0] = *(const int *)p; wfa[step][j][1] = *(const int *)(p + 4);
+        }
 #pragma unroll
       for (int i = 0; i < AR_TM; ++i) {
         floatx8 t[TN];
@@ -404,19 +458,14 @@ __global__ __launch_bounds__(AR_NTHREADS) void ar_int4_fp8_gemm_prefill(
           for (int e = 0; e < 8; ++e) t[j][e] = 0.f;
 #pragma unroll
         for (int step = 0; step < AR_BK / 16; ++step) {
-          const int kk = step * 16 + kb8;
-          int2_t af, wf[TN];
-          const unsigned char *pa = &sA[(wm * AR_TM * 16 + i * 16 + col) * AR_ASTR + kk];
+          int2_t af;
+          const unsigned char *pa =
+              &sA[(wm * AR_TM * 16 + i * 16 + col) * AR_ASTR + step * 16 + kb8];
           af[0] = *(const int *)pa; af[1] = *(const int *)(pa + 4);
-#pragma unroll
-          for (int j = 0; j < TN; ++j) {
-            const unsigned char *p = &sW[(wn * TN * 16 + j * 16 + col) * AR_ASTR + kk];
-            wf[j][0] = *(const int *)p; wf[j][1] = *(const int *)(p + 4);
-          }
           __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
           for (int j = 0; j < TN; ++j)
-            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wf[j], t[j]);
+            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wfa[step][j], t[j]);
         }
 #pragma unroll
         for (int j = 0; j < TN; ++j)

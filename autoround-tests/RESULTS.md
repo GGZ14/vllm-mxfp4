@@ -82,6 +82,10 @@ is the signature of a bandwidth-bound kernel and is what we want. M=40/64 (DTM 3
 doubles, so those shapes have become compute-bound and are the place to tune if batched decode
 matters.
 
+> **Superseded, 2026-08-26.** M=40/64 was never compute-bound. It was split-K partial traffic,
+> which is linear in M, plus serialised staging. See "Branchless staging and the split-K policy"
+> below; M=40 gate_up is now 95.2 us against the old 124.1.
+
 ### The absolute GB/s in this harness are cache-fed, not DRAM-fed
 
 R9700 L3 (Infinity Cache) is **65536 KB = 64 MB**, confirmed from `rocminfo`. The gate_up weight
@@ -142,6 +146,9 @@ that. Decode, us, DRAM-resident:
 **The int4 decode kernel is now faster than MXFP4 at every shape and batch measured**, by up to
 12.3%. Prefill remains 1.12-1.23x slower.
 
+> **Superseded, 2026-08-26.** Both numbers moved a long way -- see the section below. Decode is
+> 0.70-0.94x MXFP4 and prefill 1.00-1.08x.
+
 ### Fix 1: stage 8 bytes of weight per thread, not 4
 
 The staging loop read one uint32 per thread. MXFP4's reads a u64. A 4-byte global load halves the
@@ -187,7 +194,7 @@ of 9 -- cannot pay for moving activations from e4m3 to int8 and the accuracy tha
   than DTM=3 (159.0 vs 155.5 on gate_up), so the M=40 gap was never a tile-selection problem.
 - **Decode IMAJOR**: neutral (105.7 -> 105.6). Kept only because prefill needs it.
 
-### Why prefill stays ~1.2x
+### Why prefill stays ~1.2x  (WRONG -- see the 2026-08-26 section)
 
 MXFP4's scale is a power of two, so it folds into the weight byte exactly and its prefill inner
 loop is pure WMMA with no temp accumulator at all. An arbitrary fp16 group scale cannot fold that
@@ -196,6 +203,117 @@ pow2-scale conversion measured at +41.5% weight error. So the rescale is not rem
 acceptable quality. Fully ablating both unpack and scale still leaves prefill ~9% short, and the
 remainder is the IMAJOR restructuring's extra LDS reads. Roughly 15-20% at prefill is the price of
 the format on this hardware; decode, where bytes/weight dominates, goes the other way.
+
+> **This conclusion was wrong.** The rescale is real, but it is not what cost 15-20%. Nearly all
+> of the gap was a codegen accident in the staging loop, and the ablation could not see it because
+> `-unpack` and `-scale` leave the staging LOADS in place -- and the loads were the problem. With
+> branchless staging the same kernel, same tile, same rescale, same arithmetic, bit-identical
+> output reaches 1.00-1.08x of MXFP4. An ablation bounds only what it actually removes.
+
+## Branchless staging and the split-K policy (2026-08-26)
+
+Both kernels got faster from two changes that touch no arithmetic. Every decode and prefill
+variant below is **bit-identical** to what it replaced on every gated shape, and the shipped
+`./run.sh` gate still passes 0 failures.
+
+### The defect: a bounds predicate costs a full memory round trip
+
+A staging load written as `if (gm < M) v = *(...)` lands inside an `s_and_saveexec_b32` /
+`s_cbranch_execz` region. The compiler cannot carry a COUNTED `s_wait_loadcnt N` across an
+exec-mask merge, so it emits `s_wait_loadcnt 0x0` -- wait for everything -- after every single
+one. The shipped ISA was `load -> s_wait_loadcnt 0x0 -> ds_store`, repeated:
+
+| kernel | staging loads per k-slab | round trips paid |
+|---|--:|--:|
+| prefill | 2 scale + 4 A + 1 W | **7** |
+| decode, DTM=3 | 1 scale + 2 A + 4 W (A nested two deep) | **6** |
+
+One would do. It also silently voided the decode kernel's scale hoist: the source issues the
+group-scale load above the staging deliberately, but the ISA was `global_load_d16_b16` followed
+immediately by `s_wait_loadcnt 0x0`, so it never overlapped anything.
+
+The fix is to **clamp the index rather than predicate the load** (`rc = r < M-1 ? r : M-1`).
+Safe because the epilogue already drops rows past M and columns past N, and a clamped read
+returns real finite data -- never the `0xFF` byte that is e4m3 NaN. All seven loads then issue
+back to back under one wait. As a bonus, decode DTM=4 drops 177 -> 142 VGPR (the predicated form
+needed registers to carry the zero-initialised values across the branches) and occupancy goes
+8 -> 10.
+
+A second, smaller prefill fix stacks on it: IMAJOR re-read the eight W fragments once per
+M-fragment (the ISA showed offset pairs `{0,144},{2,146},{4,148},{6,150}` four times over).
+Hoisting them out of the `i` loop costs 6 VGPRs, 122 -> 128, and leaves occupancy at 10.
+
+### Split-K is not free, and its cost is linear in M
+
+The decode kernel's partial buffer costs `DKS*M*N` floats of write-then-read traffic. That is
+constant in the weight stream but **linear in M**: 11.1 MB against gate_up's 44.6 MB of weights
+at M=40, 17.8 MB at M=64. The reduction also serialises onto the ONE block per n-range that
+finishes last, while the other `DKS-1` have exited. So the split that pays for itself at M=5 is a
+large loss at M=64 -- and on gate_up, which is 136 n-blocks before any split at all, it never
+paid. `DKS==1` now skips the partial buffer, the threadfence, the atomic and the reduction pass
+entirely and writes C directly.
+
+`split_k_for()` in `radiance_autoround.hip` takes the smallest split that still fills the machine
+and shrinks it further as M grows. It picks the best measured cell in all fifteen shape/M
+combinations.
+
+### Decode, us, idle GPU, NCOPY=3 (`decopt.hip`)
+
+| shape | M | mxfp4 | shipped | branchless DKS=4 | DKS=2 | DKS=1 | best vs shipped |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| gate_up | 5 | 97.0 | 93.3 | 87.3 | 85.8 | **83.1** | **0.890x** |
+| gate_up | 16 | 102.3 | 99.6 | 93.7 | 89.5 | **84.0** | **0.843x** |
+| gate_up | 40 | 124.5 | 124.1 | 116.3 | 108.1 | **95.2** | **0.767x** |
+| gate_up | 64 | 168.6 | 159.2 | 144.8 | 132.9 | **118.4** | **0.744x** |
+| down | 5 | 32.5 | 30.8 | **25.7** | 28.7 | 41.9 | **0.835x** |
+| down | 40 | 55.2 | 54.3 | **46.4** | 48.5 | 64.1 | **0.855x** |
+| down | 64 | 86.9 | 83.9 | 66.0 | **62.3** | 78.9 | **0.743x** |
+| out | 16 | 22.8 | 22.1 | **19.2** | 20.3 | 26.0 | **0.866x** |
+| out | 64 | 50.8 | 48.5 | 42.3 | **40.7** | 49.0 | **0.839x** |
+
+Note how sharply DKS wants to differ by shape: DKS=1 is the best cell on gate_up at every M and
+the WORST on down and out, where 40 n-blocks cannot fill the GPU alone.
+
+### Prefill, us, idle GPU, NCOPY=3 (`preopt.hip`)
+
+| shape | M | shipped | branchless | +W-hoist | mxfp4 | was vs mxfp4 | now |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| gate_up | 512 | 681.7 | 616.1 | **589.3** | 585.3 | 1.165x | **1.007x** |
+| gate_up | 2048 | 2367.1 | 2246.5 | **2122.4** | 2041.1 | 1.160x | **1.040x** |
+| gate_up | 4096 | 4577.6 | 4415.0 | **4159.9** | 3912.0 | 1.170x | **1.063x** |
+| down | 512 | 478.6 | 323.0 | 334.1 | 385.7 | 1.241x | **0.866x** |
+| down | 2048 | 1300.0 | 1161.0 | **1098.8** | 1092.6 | 1.190x | **1.006x** |
+| down | 4096 | 2390.3 | 2209.3 | **2114.9** | 2010.5 | 1.189x | **1.052x** |
+
+### Measured and rejected
+
+- **`s_setprio(1)` around the WMMA run**: a loss at every prefill shape, up to +11%.
+- **Register prefetch of the next k-slab across the WMMA run**: no gain once staging is
+  branchless, and +18 VGPR. The point of a prefetch is to overlap the load latency, and one
+  batched round trip at occupancy 10 already is overlapped.
+- **Prefill tile sweep (AR_WN x TN in {2,4}^2)**: INCONCLUSIVE, not rejected. A server came up
+  mid-sweep and the fixed MXFP4 reference drifted 35% between builds. `tilebench.hip` templates
+  WN so all four tiles land in one binary and interleave; it needs a rerun on an idle GPU.
+
+### Hardware facts established while looking (`gfx1201`, ROCm 7.14 / clang 23)
+
+- **No direct-to-LDS DMA.** `__builtin_amdgcn_global_load_lds` needs the `vmem-to-lds-load-insts`
+  target feature, which gfx1201 does not have; the compile is a hard error. Staging on RDNA4 must
+  round-trip through VGPRs. The CDNA-style async-copy pipeline is not an option here.
+- **No wider fp8 WMMA.** `wmma_f32_16x16x16_fp8_fp8_w32_gfx12` is the only fp8 shape; there is no
+  16x16x32 fp8 and no fp8 `swmmac`.
+- `wmma_i32_16x16x32_iu4_w32_gfx12` DOES exist, but it needs int4 activations (W4A4), which
+  confirms the earlier rejection of the iu4 path from a different direction.
+- `s_prefetch_data` is available and emits. Untested for value.
+
+### Still open
+
+- The prefill epilogue is untouched: 64 scattered 2-byte `global_store_d16_hi_b16`, each with its
+  own exec-mask save/restore and 64-bit address math, plus 55 `v_cmp_u_f32` from the bf16
+  convert's NaN handling. About 1/80th of runtime at K=5120, and the sloppiest code in the kernel.
+- The tile sweep above.
+- `cmp.hip` still launches decode at a hardcoded DKS=4, so its decode column shows only the
+  branchless gain, not the split-K policy. The policy is exercised through the module dispatch.
 
 ## vLLM integration
 
@@ -229,7 +347,10 @@ worker, not in a throwaway interpreter.
    `--gpu-memory-utilization 0.98` on both GPUs and there is no room beside it.
 2. **No quality measurement.** Which is the only axis on which this format can win. Needs
    `ppl.py` and the GSM8K 500q gate against the MXFP4 reference of 8.3706.
-3. **M=40 decode remains 1.43x** and is not explained by register pressure. Unresolved.
+3. ~~**M=40 decode remains 1.43x** and is not explained by register pressure. Unresolved.~~
+   **Resolved 2026-08-26**: split-K partial traffic (linear in M) plus six serialised staging
+   round trips per slab. Neither is register pressure. M=40 gate_up is now 95.2 us against the
+   old 124.1.
 4. **All timings were taken with the production server running.** Interleaving makes the A/B fair
    -- both kernels pay the same contention -- but the absolute microseconds are inflated.
 

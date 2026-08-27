@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipMalloc(&dW, hW.size() * 4));
         HIP_CHECK(hipMalloc(&dS, hS.size() * 2));
         HIP_CHECK(hipMalloc(&dAs, M * 4));
-        HIP_CHECK(hipMalloc(&dP, (size_t)DKS * M * N * 4));
+        HIP_CHECK(hipMalloc(&dP, (size_t)4 * M * N * 4));   // widest split
         HIP_CHECK(hipMalloc(&dCnt, nblk * 4));
         HIP_CHECK(hipMalloc(&dC, (size_t)M * N * 2));
         HIP_CHECK(hipMemcpy(dA, hA.data(), (size_t)M * K, hipMemcpyHostToDevice));
@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
       float *dAs, *dP;
       int *dCnt;
       __bf16 *dC;
-      constexpr int DWN = 8, DKS = 4, BND = DWN * 16;
+      constexpr int DWN = 8, BND = DWN * 16;
       const int nblk = (N + BND - 1) / BND;
       // Poison the output and one extra row: an M-padded kernel writing row 15 of a 5-row output
       // is an out-of-bounds write that a relative-error check would happily pass.
@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
       HIP_CHECK(hipMalloc(&dW, hW.size() * 4));
       HIP_CHECK(hipMalloc(&dS, hS.size() * 2));
       HIP_CHECK(hipMalloc(&dAs, M * 4));
-      HIP_CHECK(hipMalloc(&dP, (size_t)DKS * M * N * 4));
+      HIP_CHECK(hipMalloc(&dP, (size_t)4 * M * N * 4));   // widest split of the KS sweep
       HIP_CHECK(hipMalloc(&dCnt, nblk * 4));
       HIP_CHECK(hipMalloc(&dC, (size_t)Cpad * N * 2));
       HIP_CHECK(hipMemcpy(dA, hA.data(), (size_t)M * K, hipMemcpyHostToDevice));
@@ -187,14 +187,19 @@ int main(int argc, char **argv) {
       HIP_CHECK(hipMemcpy(dC, poison.data(), poison.size() * 2, hipMemcpyHostToDevice));
 
       const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;
-      const dim3 grid(nblk, 1, DKS), block(DWN * 32);
-#define AR_LAUNCH(TM_)                                                                    \
-      hipLaunchKernelGGL((ar_int4_fp8_gemm_decode<DWN, DKS, TM_>), grid, block, 0, 0, dA, \
+      // Sweep every split-K width split_k_for() can return. DKS==1 takes a separate early-return
+      // path that writes C directly and never touches the partial buffer, the threadfence or the
+      // atomic; it is the width the launcher picks for gate_up (136 n-blocks), so leaving it
+      // ungated would mean the shipped decode path is the one path never checked.
+      for (int KS : {1, 2, 4}) {
+      const dim3 grid(nblk, 1, KS), block(DWN * 32);
+#define AR_LAUNCH(KS_, TM_)                                                                \
+      hipLaunchKernelGGL((ar_int4_fp8_gemm_decode<DWN, KS_, TM_>), grid, block, 0, 0, dA,   \
                          dW, dS, dAs, dP, dCnt, dC, M, N, K)
-      if (tm == 1) AR_LAUNCH(1);
-      else if (tm == 2) AR_LAUNCH(2);
-      else if (tm == 3) AR_LAUNCH(3);
-      else AR_LAUNCH(4);
+#define AR_BY_TM(KS_)                                                                      \
+      do { if (tm == 1) AR_LAUNCH(KS_, 1); else if (tm == 2) AR_LAUNCH(KS_, 2);             \
+           else if (tm == 3) AR_LAUNCH(KS_, 3); else AR_LAUNCH(KS_, 4); } while (0)
+      if (KS == 1) AR_BY_TM(1); else if (KS == 2) AR_BY_TM(2); else AR_BY_TM(4);
       HIP_CHECK(hipDeviceSynchronize());
 
       std::vector<unsigned short> hC((size_t)Cpad * N);
@@ -219,8 +224,11 @@ int main(int argc, char **argv) {
 
       const bool pass = rel < 5e-3 && touched == 0;
       if (!pass) ++failures;
-      printf("  %-9s N=%-6d K=%-6d M=%-3d rel=%.2e  rows-past-M-touched=%-6d %s\n", sh.name, N, K,
-             M, rel, touched, pass ? "OK" : "FAIL");
+      printf("  %-9s N=%-6d K=%-6d M=%-3d KS=%d rel=%.2e  rows-past-M-touched=%-6d %s\n", sh.name,
+             N, K, M, KS, rel, touched, pass ? "OK" : "FAIL");
+      HIP_CHECK(hipMemcpy(dC, poison.data(), poison.size() * 2, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemset(dCnt, 0, nblk * 4));
+      }   // KS
 
       hipFree(dA); hipFree(dW); hipFree(dS); hipFree(dAs);
       hipFree(dP); hipFree(dCnt); hipFree(dC);
@@ -272,7 +280,6 @@ int main(int argc, char **argv) {
             ref[(size_t)m * N + n] = tot * hAs[m];
           }
         unsigned char *dA; unsigned int *dW; __half *dS; float *dAs; __bf16 *dC;
-        constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
         const int Cpad = M + 4;
         HIP_CHECK(hipMalloc(&dA, (size_t)M * K));
         HIP_CHECK(hipMalloc(&dW, hW.size() * 4));
@@ -285,11 +292,20 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipMemcpy(dAs, hAs.data(), M * 4, hipMemcpyHostToDevice));
         std::vector<unsigned short> poison((size_t)Cpad * N, 0x7FC0);
         HIP_CHECK(hipMemcpy(dC, poison.data(), poison.size() * 2, hipMemcpyHostToDevice));
+        // Sweep both N-tile widths: the launcher picks TN=4 above AR_TN4_MIN_M, so TN=4 is a
+        // shipped path and must be gated, not just benchmarked.
+        for (int TNv : {2, 4}) {
+        const int BNF_T = AR_WN * TNv * 16;
         const dim3 g((N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), b(AR_NTHREADS);
-        if (imajor)
-          hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<TN, true>), g, b, 0, 0, dA, dW, dS, dAs, dC, M, N, K);
+        if (TNv == 4) {
+          if (imajor)
+            hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<4, true>), g, b, 0, 0, dA, dW, dS, dAs, dC, M, N, K);
+          else
+            hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<4, false>), g, b, 0, 0, dA, dW, dS, dAs, dC, M, N, K);
+        } else if (imajor)
+          hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<2, true>), g, b, 0, 0, dA, dW, dS, dAs, dC, M, N, K);
         else
-          hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<TN, false>), g, b, 0, 0, dA, dW, dS, dAs, dC, M, N, K);
+          hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<2, false>), g, b, 0, 0, dA, dW, dS, dAs, dC, M, N, K);
         HIP_CHECK(hipDeviceSynchronize());
         std::vector<unsigned short> hC((size_t)Cpad * N);
         HIP_CHECK(hipMemcpy(hC.data(), dC, hC.size() * 2, hipMemcpyDeviceToHost));
@@ -308,8 +324,10 @@ int main(int argc, char **argv) {
             if (hC[(size_t)m * N + n] != 0x7FC0) ++touched;
         const bool pass = rel < 5e-3 && touched == 0;
         if (!pass) ++failures;
-        printf("  %-8s N=%-5d K=%-5d M=%-4d rel=%.2e  rows-past-M-touched=%-5d %s\n", sh.name, N, K,
-               M, rel, touched, pass ? "OK" : "FAIL");
+        printf("  %-8s N=%-5d K=%-5d M=%-4d TN=%d rel=%.2e  rows-past-M-touched=%-5d %s\n",
+               sh.name, N, K, M, TNv, rel, touched, pass ? "OK" : "FAIL");
+        HIP_CHECK(hipMemcpy(dC, poison.data(), poison.size() * 2, hipMemcpyHostToDevice));
+        }   // TNv
         hipFree(dA); hipFree(dW); hipFree(dS); hipFree(dAs); hipFree(dC);
       }
     }
@@ -432,17 +450,19 @@ int main(int argc, char **argv) {
       HIP_CHECK(hipEventCreate(&e0));
       HIP_CHECK(hipEventCreate(&e1));
       float gbest = 1e30f, rbest = 1e30f;
+      // The bench fixes KS at the widest split; split_k_for()'s shape-dependent choice is
+      // measured separately in decopt/tilebench, not here.
+#define AR_BLAUNCH(TM_)                                                                    \
+      hipLaunchKernelGGL((ar_int4_fp8_gemm_decode<DWN, DKS, TM_>), grid, block, 0, 0, dA,   \
+                         dW, dS, dAs, dP, dCnt, dC, M, N, K)
+#define AR_BBY_TM                                                                          \
+      do { if (tm == 1) AR_BLAUNCH(1); else if (tm == 2) AR_BLAUNCH(2);                     \
+           else if (tm == 3) AR_BLAUNCH(3); else AR_BLAUNCH(4); } while (0)
       for (int rep = 0; rep < 3; ++rep) {
-        for (int w = 0; w < 3; ++w) {
-          if (tm == 1) AR_LAUNCH(1); else if (tm == 2) AR_LAUNCH(2);
-          else if (tm == 3) AR_LAUNCH(3); else AR_LAUNCH(4);
-        }
+        for (int w = 0; w < 3; ++w) AR_BBY_TM;
         HIP_CHECK(hipDeviceSynchronize());
         HIP_CHECK(hipEventRecord(e0));
-        for (int it = 0; it < 20; ++it) {
-          if (tm == 1) AR_LAUNCH(1); else if (tm == 2) AR_LAUNCH(2);
-          else if (tm == 3) AR_LAUNCH(3); else AR_LAUNCH(4);
-        }
+        for (int it = 0; it < 20; ++it) AR_BBY_TM;
         HIP_CHECK(hipEventRecord(e1));
         HIP_CHECK(hipEventSynchronize(e1));
         float ms;
@@ -470,7 +490,8 @@ int main(int argc, char **argv) {
     hipFree(dW); hipFree(dS); hipFree(dA); hipFree(dAs);
     hipFree(dP); hipFree(dCnt); hipFree(dC); hipFree(dSink);
   }
-#undef AR_LAUNCH
+#undef AR_BLAUNCH
+#undef AR_BBY_TM
 
   // ---------------- prefill benchmark ----------------
   // Prefill is compute-bound, so the figure of merit is TFLOP/s against the fp8 WMMA ceiling
