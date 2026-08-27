@@ -103,6 +103,8 @@ exec /opt/radiance_entrypoint.sh $MODEL \
   --max-num-seqs $MAXSEQS \
   --max-num-batched-tokens $CHUNK \
   --trust-remote-code \
+  --kv-cache-dtype fp8 --mamba-cache-mode align --enable-prefix-caching \
+  --attention-backend R4D --no-async-scheduling \
   --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
   \"\${SPECARGS[@]}\" $EXTRA
 "
