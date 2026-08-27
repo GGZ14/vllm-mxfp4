@@ -350,6 +350,24 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
 #define AR_NTHREADS (AR_NWAVE * 32)
 #define AR_BMF (AR_WM * AR_TM * 16)
 
+// Measurement hook only. The (__bf16) cast costs 5 VALU on gfx1201 -- bfe / or / cmp_u / add3 /
+// cndmask -- because it does round-to-nearest-even AND NaN propagation, and gfx1201 has no
+// hardware f32->bf16 convert (cvt_pk_bf16_f32 is CDNA-only). AR_BF16_TRUNC replaces it with a
+// bare truncation so the delta bounds what any cheaper conversion could buy. It is WRONG to ship:
+// truncation roughly doubles the output rounding error.
+__device__ __forceinline__ __bf16 ar_f2bf(float x) {
+#ifdef AR_BF16_TRUNC
+  unsigned int u;
+  __builtin_memcpy(&u, &x, 4);
+  const unsigned short h = (unsigned short)(u >> 16);
+  __bf16 r;
+  __builtin_memcpy(&r, &h, 2);
+  return r;
+#else
+  return (__bf16)x;
+#endif
+}
+
 template <int TN, bool IMAJOR, int ABLATE = 0>
 __global__ __launch_bounds__(AR_NTHREADS) void ar_int4_fp8_gemm_prefill(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
@@ -541,7 +559,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void ar_int4_fp8_gemm_prefill(
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
           const int r = i * 16 + kb8 + e;
-          Cb[(size_t)(r * N + ncol[j])] = (__bf16)(acc[i][j][e] * Asb[r]);
+          Cb[(size_t)(r * N + ncol[j])] = ar_f2bf(acc[i][j][e] * Asb[r]);
         }
     return;
   }

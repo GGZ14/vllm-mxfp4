@@ -464,6 +464,9 @@ gfx1201; it is not an int4 deficiency. In serving, prefill at the 8k chunk size 
 | DTM selection | closed: ceil(M/16) is right |
 | iu8 / iu4 int WMMA | closed: unpack is 2-6% of decode, cannot pay for int8 activations |
 | decode IMAJOR | closed: neutral |
+| prefill epilogue: hoisted base + full-tile fast path | **shipped**, 3.3-4.5% |
+| cheaper f32->bf16 conversion | closed: truncation saves 0-0.5% |
+| hardware f32->bf16 convert | closed: does not exist on gfx1201 (cvt_pk_bf16_f32 is CDNA-only) |
 
 ## The residual serving gap is the DRAFTER, not the kernel
 
@@ -492,3 +495,28 @@ doubt; the exact ratio is approximate.
 checkpoint's own int4 MTP head (which holds acceptance at 1.911/draft at SPEC=4, but MTP is worth
 less than DFlash2 here: 86.2 vs 140.9 t/s) or a DFlash2 drafter distilled against the AutoRound
 weights. Neither is kernel work.
+
+## The bf16 conversion: identified, measured, rejected
+
+The per-kernel ISA showed a group of ops that looked like a lever: `v_cmp_u_f32` + `v_bfe_u32` +
+`v_or_b32` + `v_add3_u32` + `v_cndmask_b32`, about 5 VALU per output element. That is what a plain
+`(__bf16)` cast compiles to on gfx1201 -- round-to-nearest-even AND NaN propagation -- and there is
+no hardware convert to replace it with: `__builtin_amdgcn_cvt_pk_bf16_f32` does not exist for this
+target, it is CDNA-only.
+
+Replacing it with a bare truncation (WRONG to ship -- it roughly doubles output rounding error)
+measures the ceiling on any cheaper conversion:
+
+| shape | M | shipped RNE | truncating | delta |
+|---|--:|--:|--:|--:|
+| gate_up | 2048 | 1760.6 | 1761.1 | 0.0% |
+| gate_up | 4096 | 3566.5 | 3548.2 | -0.5% |
+| down | 4096 | 1796.1 | 1793.6 | -0.1% |
+
+0-0.5%. The reason is structural and worth remembering when reading a static ISA census: the
+epilogue is fully unrolled so it DOMINATES the instruction listing (64 stores at TN=4), but it
+executes ONCE per block against ~80 iterations of the main loop. Static instruction counts point at
+the epilogue; runtime does not. The epilogue's predication was worth 3.3-4.5% because
+`s_and_saveexec` serialises, not because the epilogue is a large share of the work.
+
+`AR_BF16_TRUNC` is left in place, defaults off, so the result stays re-measurable.
