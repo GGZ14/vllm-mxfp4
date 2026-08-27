@@ -89,6 +89,7 @@ def escha_linear(x: torch.Tensor, code: torch.Tensor, rin: torch.Tensor, rout: t
 
     A = torch.empty((M, IC), device=dev, dtype=torch.uint8)
     As = torch.empty(M, device=dev, dtype=torch.float32)
+    amax = torch.empty(M, device=dev, dtype=torch.float32)
     C = torch.empty((M, OC), device=dev, dtype=torch.bfloat16)
     out = torch.empty((M, OC), device=dev, dtype=torch.bfloat16)
     trace = os.environ.get("RADIANCE_ESCHA_TRACE")
@@ -96,7 +97,7 @@ def escha_linear(x: torch.Tensor, code: torch.Tensor, rin: torch.Tensor, rout: t
         sys.stderr.write(f"[radiance.escha] gemm M={M} IC={IC} OC={OC} K={kbits} nblk={nblk}\n")
     ext.launch(x2.data_ptr(), code.data_ptr(), rin.data_ptr(), rout.data_ptr(),
                s_in.data_ptr(), s_out.data_ptr(), A.data_ptr(), As.data_ptr(),
-               C.data_ptr(), out.data_ptr(), M, OC, IC, int(kbits),
+               amax.data_ptr(), C.data_ptr(), out.data_ptr(), M, OC, IC, int(kbits),
                torch.cuda.current_stream().cuda_stream)
     if trace:
         torch.cuda.synchronize()      # localize a fault to THIS call rather than a later one

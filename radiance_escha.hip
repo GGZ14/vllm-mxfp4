@@ -44,8 +44,8 @@ static int prefill_min_m() {
 
 // Full layer. A/As/C are caller-owned scratch; out may alias nothing.
 static void launch(uintptr_t x, uintptr_t code, uintptr_t rin, uintptr_t rout, uintptr_t s_in,
-                   uintptr_t s_out, uintptr_t A, uintptr_t As, uintptr_t C, uintptr_t out,
-                   int M, int N, int K, int Kbits, uintptr_t stream) {
+                   uintptr_t s_out, uintptr_t A, uintptr_t As, uintptr_t amax, uintptr_t C,
+                   uintptr_t out, int M, int N, int K, int Kbits, uintptr_t stream) {
   hipStream_t st = reinterpret_cast<hipStream_t>(stream);
   const auto *xp = reinterpret_cast<const __bf16 *>(x);
   const auto *cp = reinterpret_cast<const unsigned int *>(code);
@@ -55,10 +55,16 @@ static void launch(uintptr_t x, uintptr_t code, uintptr_t rin, uintptr_t rout, u
   const auto *sop = reinterpret_cast<const float *>(s_out);
   auto *Ap = reinterpret_cast<unsigned char *>(A);
   auto *Asp = reinterpret_cast<float *>(As);
+  auto *amaxp = reinterpret_cast<float *>(amax);
   auto *Cp = reinterpret_cast<__bf16 *>(C);
   auto *op = reinterpret_cast<__bf16 *>(out);
 
-  hipLaunchKernelGGL(escha_pre_quant, dim3(M), dim3(ESCHA_HAD), 0, st, xp, sip, rip, Ap, Asp, M, K);
+  // Two launches: the per-token amax is a reduction over the whole row, so it must complete
+  // before anything can be quantized against it.
+  const dim3 preg((K + ESCHA_HAD - 1) / ESCHA_HAD, M), blk(ESCHA_HAD);
+  HIP_CHECK(hipMemsetAsync(amaxp, 0, (size_t)M * sizeof(float), st));
+  hipLaunchKernelGGL(escha_pre_amax, preg, blk, 0, st, xp, sip, rip, amaxp, M, K);
+  hipLaunchKernelGGL(escha_pre_quant, preg, blk, 0, st, xp, sip, rip, amaxp, Ap, Asp, M, K);
 
   constexpr int DWN = ESCHA_DEC_DWN, BND = DWN * 16;
   const int nblk = (N + BND - 1) / BND;
@@ -104,7 +110,8 @@ static void launch(uintptr_t x, uintptr_t code, uintptr_t rin, uintptr_t rout, u
     }
   }
 
-  hipLaunchKernelGGL(escha_post_rot, dim3(M), dim3(ESCHA_HAD), 0, st, Cp, rop, sop, op, M, N);
+  hipLaunchKernelGGL(escha_post_rot, dim3((N + ESCHA_HAD - 1) / ESCHA_HAD, M), blk, 0, st,
+                     Cp, rop, sop, op, M, N);
 }
 
 PYBIND11_MODULE(radiance_escha_kernel, m) {

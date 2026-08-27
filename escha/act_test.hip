@@ -49,8 +49,11 @@ int main() {
     HIP_CHECK(hipMemcpy(dSin, hsin.data(), IC * 4, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(dSout, hsout.data(), OC * 4, hipMemcpyHostToDevice));
 
-    hipLaunchKernelGGL(escha_pre_quant, dim3(M), dim3(ESCHA_HAD), 0, 0,
-                       dX, dSin, dRin, dA, dAs, M, IC);
+    float *dAmax; HIP_CHECK(hipMalloc(&dAmax, M * 4)); HIP_CHECK(hipMemset(dAmax, 0, M * 4));
+    hipLaunchKernelGGL(escha_pre_amax, dim3((IC + ESCHA_HAD - 1) / ESCHA_HAD, M),
+                       dim3(ESCHA_HAD), 0, 0, dX, dSin, dRin, dAmax, M, IC);
+    hipLaunchKernelGGL(escha_pre_quant, dim3((IC + ESCHA_HAD - 1) / ESCHA_HAD, M),
+                       dim3(ESCHA_HAD), 0, 0, dX, dSin, dRin, dAmax, dA, dAs, M, IC);
     const bool dec = M <= 64;
     if (dec) {
       const int tm = (M + 15) / 16, KS = escha_decode_split_k(nblk, IC / 16);
@@ -68,8 +71,8 @@ int main() {
       if (K == 2) hipLaunchKernelGGL((escha_gemm_prefill<2, 2, 8>), g, b, 0, 0, dA, dW, dAs, dC, M, OC, IC);
       else        hipLaunchKernelGGL((escha_gemm_prefill<2, 3, 8>), g, b, 0, 0, dA, dW, dAs, dC, M, OC, IC);
     }
-    hipLaunchKernelGGL(escha_post_rot, dim3(M), dim3(ESCHA_HAD), 0, 0,
-                       dC, dRout, dSout, dY, M, OC);
+    hipLaunchKernelGGL(escha_post_rot, dim3((OC + ESCHA_HAD - 1) / ESCHA_HAD, M),
+                       dim3(ESCHA_HAD), 0, 0, dC, dRout, dSout, dY, M, OC);
     HIP_CHECK(hipDeviceSynchronize());
 
     std::vector<unsigned short> got((size_t)M * OC);
@@ -86,7 +89,7 @@ int main() {
     printf("%-4d %-6d %-6d %-6d %-9s %10.2e  %s\n", K, M, IC, OC, dec ? "decode" : "prefill",
            rel, ok ? "OK" : "FAIL");
     hipFree(dW); hipFree(dX); hipFree(dRin); hipFree(dRout); hipFree(dSin); hipFree(dSout);
-    hipFree(dA); hipFree(dAs); hipFree(dP); hipFree(dCnt); hipFree(dC); hipFree(dY);
+    hipFree(dA); hipFree(dAs); hipFree(dAmax); hipFree(dP); hipFree(dCnt); hipFree(dC); hipFree(dY);
   }
   fclose(f);
   printf("\nact gate: %s\n", bad ? "FAIL" : "PASS");
