@@ -267,3 +267,156 @@ __global__ __launch_bounds__(DWN * 32) void escha_gemm_decode(
       C[(size_t)m * N + nn] = (__bf16)s;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Prefill GEMM.   C[M,N] = Ah[M,K] @ decode(code)[K,N] * As[m]
+//
+// WHY THIS ONE TAKES THE fp8 PIPE AND THE DECODE KERNEL DOES NOT. Prefill here is entirely
+// compute-bound: at M=8192 on gate_up it is 1.46 TFLOP against 27.5 MB of weights, so the weight
+// stream is 0.6% of the compute time and the WMMA rate IS the ceiling. gfx1201 runs fp8 WMMA at
+// 412 TF/s against f16's 207, so converting the decoded weights to e4m3 is worth a clean 2x.
+//
+// That conversion is a numerics change, so it was measured rather than assumed: rounding the
+// decoded weights to e4m3 and re-running the reconstruction against the fp8 base adds
+// 0.19% / 0.59% / 0.28% relative on the three projections tested. The two errors add in
+// quadrature and e4m3's ~3.6% RMS is far inside a trellis error of 0.22-0.45, so it is free.
+// (mxfp4_work/escha/fp8_cost.py.)
+//
+// THE DECODE IS FREE HERE, unlike in the decode kernel. BMF=256 means each decoded weight feeds
+// 256 MACs, so ~4 ALU of trellis decode is ~0.016 ALU per MAC. Decode once per slab into LDS and
+// the codec stops mattering -- which is why this kernel can afford a codebook the decode kernel
+// has to think about.
+#define EP_TM 4
+#define EP_WM 4
+#define EP_WN 2
+#define EP_BK 64
+#define EP_PAD 8
+#define EP_STR (EP_BK + EP_PAD)
+#define EP_NWAVE (EP_WM * EP_WN)
+#define EP_NTHREADS (EP_NWAVE * 32)
+#define EP_BMF (EP_WM * EP_TM * 16)
+
+__device__ __forceinline__ unsigned int escha_pk_e4m3(float a, float b) {
+  return __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);   // two e4m3 in the low 16 bits
+}
+
+template <int TN, int K>
+__global__ __launch_bounds__(EP_NTHREADS) void escha_gemm_prefill(
+    const unsigned char *__restrict__ A, const unsigned int *__restrict__ code,
+    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int Kdim) {
+  constexpr int BNF = EP_WN * TN * 16;
+  constexpr int WORDS = 256 * K / 32;
+  constexpr int NT = BNF / 16, KT = EP_BK / 16;      // tiles per slab
+  __shared__ unsigned char sA[EP_BMF * EP_STR];
+  __shared__ unsigned char sW[BNF * EP_STR];
+
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int wm = wave / EP_WN, wn = wave % EP_WN;
+  const int col = lane & 15, kb8 = (lane >> 4) * 8;
+  const int m0 = blockIdx.y * EP_BMF, n0 = blockIdx.x * BNF;
+  const int ntiles = N / 16;
+
+  floatx8 acc[EP_TM][TN];
+#pragma unroll
+  for (int i = 0; i < EP_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+
+  int ncol[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) ncol[j] = n0 + wn * TN * 16 + j * 16 + col;
+
+  for (int k0 = 0; k0 < Kdim; k0 += EP_BK) {
+    // A tile: 16 B per thread. Clamped, never predicated -- a bounds-predicated load sits in its
+    // own s_and_saveexec region and forces a counted s_wait_loadcnt after each one.
+    const unsigned char *__restrict__ Ab = A + (size_t)m0 * Kdim + k0;
+#pragma unroll
+    for (int off = 0; off < EP_BMF * EP_BK; off += EP_NTHREADS * 16) {
+      const int idx = off + tid * 16;
+      const int r = idx / EP_BK, c = idx % EP_BK;
+      const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
+      *(uint4_t *)(&sA[r * EP_STR + c]) = *(const uint4_t *)(Ab + (size_t)rc * Kdim + c);
+    }
+    // Weights: NT*KT tiles this slab, one wave at a time. Each lane decodes 8 consecutive symbols
+    // from a single 64-bit merge, converts them to e4m3 in pairs, and writes them transposed to
+    // [n][k] so the fragment read below is contiguous in k.
+#pragma unroll
+    for (int t = wave; t < NT * KT; t += EP_NWAVE) {
+      const int nt = t / KT, ktl = t % KT;
+      const int gn = n0 / 16 + nt, gk = k0 / 16 + ktl;
+      const unsigned int *w =
+          code + ((size_t)gk * ntiles + (gn < ntiles ? gn : ntiles - 1)) * WORDS;
+      unsigned int st[8];
+      escha_states8<K>(w, lane, st);
+#pragma unroll
+      for (int j = 0; j < 8; j += 2) {
+        int r0, c0, r1, c1;
+        escha_tile_pos(lane, j, &r0, &c0);
+        escha_tile_pos(lane, j + 1, &r1, &c1);
+        const __half2 d = escha_decode2(st[j], st[j + 1]);
+        const unsigned int p = escha_pk_e4m3(__half2float(__low2half(d)),
+                                             __half2float(__high2half(d)));
+        sW[(nt * 16 + c0) * EP_STR + ktl * 16 + r0] = (unsigned char)(p & 0xFF);
+        sW[(nt * 16 + c1) * EP_STR + ktl * 16 + r1] = (unsigned char)((p >> 8) & 0xFF);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int step = 0; step < EP_BK / 16; ++step) {
+      const int kk = step * 16 + kb8;
+      int2_t af[EP_TM], wf[TN];
+#pragma unroll
+      for (int i = 0; i < EP_TM; ++i) {
+        const unsigned char *p = &sA[(wm * EP_TM * 16 + i * 16 + col) * EP_STR + kk];
+        af[i][0] = *(const int *)p; af[i][1] = *(const int *)(p + 4);
+      }
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        const unsigned char *p = &sW[(wn * TN * 16 + j * 16 + col) * EP_STR + kk];
+        wf[j][0] = *(const int *)p; wf[j][1] = *(const int *)(p + 4);
+      }
+      // Fence the k-step: without it the compiler hoists every step's fragment loads above the
+      // first WMMA and the register shuffling that keeps four steps live costs more than the
+      // prefetch buys. Worth 1.8-3.4% on the MXFP4 GEMM.
+      __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+      for (int i = 0; i < EP_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+
+  // Epilogue: wave-uniform base indexed by a 32-bit offset so the compiler emits the SADDR form,
+  // and a branch-free path for blocks entirely inside M and N. Worth 3.3-8.0% on the int4 and
+  // MXFP4 kernels; only the last row-block and column-block are ragged on a real prefill.
+  __bf16 *__restrict__ Cb = C + (size_t)(m0 + wm * EP_TM * 16) * N;
+  const float *__restrict__ Asb = As + m0 + wm * EP_TM * 16;
+  const bool full = (m0 + wm * EP_TM * 16 + (EP_TM - 1) * 16 + kb8 + 7 < M) &&
+                    (ncol[TN - 1] < N);
+  if (full) {
+#pragma unroll
+    for (int i = 0; i < EP_TM; ++i)
+#pragma unroll
+      for (int j = 0; j < TN; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int r = i * 16 + kb8 + e;
+          Cb[r * N + ncol[j]] = (__bf16)(acc[i][j][e] * Asb[r]);
+        }
+    return;
+  }
+#pragma unroll
+  for (int i = 0; i < EP_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = m0 + wm * EP_TM * 16 + i * 16 + kb8 + e;
+        if (m < M && ncol[j] < N) C[(size_t)m * N + ncol[j]] = (__bf16)(acc[i][j][e] * As[m]);
+      }
+}
