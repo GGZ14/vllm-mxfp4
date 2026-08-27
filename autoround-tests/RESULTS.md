@@ -1,0 +1,258 @@
+# AutoRound int4 W4A8 kernel for gfx1201
+
+Target checkpoint: `Frozenlock/Qwen3.8-27B-int4-AutoRound` (18.70 GB, downloaded to
+`~/models/Qwen3.8-27B-AutoRound-int4`).
+
+## What the checkpoint actually is
+
+| field | value |
+|---|---|
+| packing | `auto_round:auto_gptq` — `qweight` [K/8, N] i32, `qzeros` [K/128, N/8] i32, `scales` [K/128, N] f16 |
+| bits / group | 4 / 128 |
+| sym | **true** — every `qzeros` word is `0x77777777`, i.e. nibble 7, i.e. zero = 8 everywhere |
+| `g_idx` | **absent** — no activation reordering, so groups are contiguous along K |
+| unquantized | 99 `linear_attn.in_proj_a` / `in_proj_b` tensors held at bf16 |
+| bits/weight | 4 + 16/128 + 4/128 ≈ **4.156** vs MXFP4's 4.25 |
+
+Two of these decide the whole kernel design:
+
+**Symmetric with a constant zero of 8** means code `c` in 0..15 represents the integer `c - 8` in
+[-8, 7], and every one of those sixteen integers is EXACTLY representable in e4m3. So the zero
+point folds into the unpack table and never enters the matmul — no correction term, no activation
+row-sums, which is what a general asymmetric GPTQ kernel has to carry. Proven in `lut.py`.
+
+**group_size 128 equals the tuned decode slab `DBK`**, so a group boundary IS a slab boundary. The
+rescale lands on the `__syncthreads()` that already exists and the inner 8-step WMMA loop is
+untouched. Better still, in the gfx12 16x16x16 wave32 C layout a lane's N index is `lane & 15`,
+identical across all eight of its accumulator slots — so a lane needs ONE scale per group, not
+eight: one f16 load and 8 `v_fmac_f32` per slab, about 1 VALU per WMMA.
+
+## Correctness
+
+`./run.sh` — 60/60 pass. M in {1,2,3,5,8,9,13,16,17,32,40,64} x five shapes including N=48,
+N not a multiple of BND, and K not a multiple of DKS*DBK.
+
+`rel ≈ 1.8e-3` uniformly, which is the bf16 output rounding floor (2^-9), not kernel error.
+`rows-past-M-touched = 0` everywhere: the destination is poisoned with bf16 NaN and four rows past
+M are asserted untouched, because an M-padded kernel writing row 15 of a 5-row output is an
+out-of-bounds write that a relative-error check passes happily.
+
+Resource usage: 75-104 VGPRs, 38-40 SGPRs, **0 spills**, occupancy 12 waves/SIMD, LDS 21764 B/block.
+
+## v_perm_b32 on gfx1201 — measured, not assumed
+
+The unpack needs a 16-entry table, but `v_perm_b32` addresses only 8 bytes. Two attempts failed
+before the selector semantics were measured (`permprobe.hip`):
+
+| sel | behaviour on gfx1201 |
+|---|---|
+| 0-3 | byte 0..3 of **S1** (the second argument) |
+| 4-7 | byte 0..3 of **S0** (the first argument) |
+| 8-12 | 0x00 in the probe, but **11 is data-dependent** |
+| 13-15 | **0xFF unconditionally**, even with no MSB set anywhere in the pool |
+
+- Attempt 1 drove the unwanted table half's selector into 8..11 expecting `0x00`. It got `0xFF`,
+  which is **e4m3 NaN**, and the entire GEMM returned NaN.
+- Attempt 2 built the blend mask by sign-replication. It got the byte lanes crossed — and no
+  uniform-code test can see that, because uniform codes make cross-byte mixing invisible. It passed
+  `lutest.hip` (uniform codes) and failed only under codes varying in both n and k.
+
+The shipped version uses **only selector values 0..7**, and builds the 0xFF/0x00 mask from a
+2-entry pool indexed by bit3. `unpacktest.hip` gates all eight nibbles of 4096 random words.
+
+Lesson worth keeping: a uniform-value test cannot detect a permutation. The one-hot diagnostic in
+`--diag` (mode 2, code varying in BOTH n and k) is what localized this; modes 0 and 1, each varying
+one axis, both passed while the kernel was wrong.
+
+## Speed
+
+`./run.sh --bench`. **Measured with the production server up** — contention is real, but the
+roofline probe is interleaved with the GEMM in the same loop, so the FRACTION self-normalizes.
+
+| shape | N | K | M=5 | M=8 | M=16 | M=40 | M=64 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| gate_up | 17408 | 5120 | 57.8% | 56.5% | 54.8% | 29.4% | 26.5% |
+| down | 5120 | 8704 | 72.9% | 72.1% | 69.3% | 34.9% | 30.7% |
+| out | 5120 | 5120 | 88.9% | 86.9% | 81.1% | 42.7% | 36.7% |
+
+(% of the interleaved streaming roofline.)
+
+Decode-band time is essentially flat in M — gate_up runs 68.0 us at M=5 and 73.7 us at M=16 — which
+is the signature of a bandwidth-bound kernel and is what we want. M=40/64 (DTM 3 and 4) roughly
+doubles, so those shapes have become compute-bound and are the place to tune if batched decode
+matters.
+
+### The absolute GB/s in this harness are cache-fed, not DRAM-fed
+
+R9700 L3 (Infinity Cache) is **65536 KB = 64 MB**, confirmed from `rocminfo`. The gate_up weight
+buffer is 17408 x 5120 / 2 + scales = **44.6 MB**, so it sits entirely in cache and is re-read 20
+times per timing loop. That is why the table reports 675 GB/s against a 635 GB/s DRAM peak — over
+100% of DRAM, which is the known artifact, not a result. In real serving the model's ~14 GB of
+weights cannot be cache-resident, so absolute decode bandwidth will be lower. The percentages are
+still a fair efficiency measure because the probe shares the residency; the absolute GB/s are not.
+
+## Prefill kernel
+
+Same tile as the MXFP4 folded kernel (BMF=256 via AR_TM=4, BK=64, PAD=8, LDS 23040 B -- byte
+identical, so 2 blocks/CU is preserved). The one structural difference is forced by the format:
+MXFP4 folds its block exponent into the weight byte and has no rescale at all, while an fp16 group
+scale cannot be folded that way.
+
+group_size 128 with BK=64 means a group is exactly TWO SLABS. Two variants were built and both are
+correctness-gated:
+
+| variant | temp accumulator | VGPR | occupancy |
+|---|---|--:|--:|
+| group temp | AR_TM x TN tiles, folded once per group | 183 | 8 |
+| **IMAJOR** (shipped) | TN tiles, folded once per slab | **123** | **10** |
+
+IMAJOR is valid because both slabs of a group carry the SAME scale, so folding per slab is
+arithmetically identical: s*(P1+P2) either way. It costs re-reading the sW fragments once per
+M-fragment. For reference the MXFP4 folded kernel is 116 VGPR at occupancy 10, so IMAJOR reaches
+parity on registers.
+
+Correctness: 27/27 against an fp64 CPU reference (M up to 512, N=64/200/256, K not a multiple of
+BK*2), plus prefill-vs-decode agreement at M=64 on all three production shapes at rel ~1e-5. The
+decode path was gated against fp64 first, so that cross-check pins prefill to a known-good path at
+a real shape without needing an M*N*K double-precision reference.
+
+## Head to head against the shipped MXFP4 kernel
+
+`cmp.hip` compiles BOTH kernel families into one binary and interleaves them in a single timing
+loop. Its argument rotates over that many weight buffers so the working set can be pushed past the
+64 MB Infinity Cache; NCOPY=3 is 131 MB on gate_up, DRAM-resident, which is the case that matches
+serving. (`mk_mxfp4_header.py` derives the MXFP4 header from the shipped .hip rather than
+committing a copy that could drift.)
+
+The first build was 8-15% slower than MXFP4 at decode. Two fixes, both found by ablation, reversed
+that. Decode, us, DRAM-resident:
+
+| shape | M | first build | shipped | mxfp4 | ratio |
+|---|--:|--:|--:|--:|--:|
+| gate_up | 8 | 103.9 | **92.7** | 96.0 | **0.966x** |
+| gate_up | 40 | 135.7 | **125.4** | 124.5 | 1.007x |
+| gate_up | 64 | 174.4 | **158.8** | 167.9 | **0.945x** |
+| down | 8 | 38.4 | **30.8** | 34.8 | **0.885x** |
+| down | 16 | 41.1 | **33.6** | 38.3 | **0.877x** |
+| down | 40 | 78.4 | **50.4** | 54.6 | **0.923x** |
+| down | 64 | 92.7 | **76.7** | 87.2 | **0.880x** |
+| out | 8 | 24.3 | **20.5** | 21.4 | **0.960x** |
+| out | 40 | 39.9 | **33.1** | 33.3 | **0.994x** |
+
+**The int4 decode kernel is now faster than MXFP4 at every shape and batch measured**, by up to
+12.3%. Prefill remains 1.12-1.23x slower.
+
+### Fix 1: stage 8 bytes of weight per thread, not 4
+
+The staging loop read one uint32 per thread. MXFP4's reads a u64. A 4-byte global load halves the
+bytes moved per instruction, and this repo had already paid for that exact lesson once -- a
+4-byte-per-thread fragment-order staging cost 14-25% of prefill until it was widened to two
+adjacent lane slots. Reading a uint2 and unpacking 16 codes per thread is worth **-11% decode**
+(gate_up M=8 103.9 -> 94.0) and flipped the ranking on its own. Both LDS halves stay 8-byte
+aligned, so no 16-byte store alignment is assumed.
+
+### Fix 2: issue the group-scale load before staging
+
+The scale load sat after the `__syncthreads()`, immediately ahead of the WMMA run, so its latency
+was exposed. It depends on nothing the staging computes, so hoisting it above the A and W staging
+gives it the whole stage plus the barrier to land. Worth **-22% at M=40** (down 64.3 -> 50.4) and
+1-2% elsewhere.
+
+That M=40 case is the one the ablation flagged hardest: `-scale` was removing 29% of runtime there
+while the fold itself is only one FMA per WMMA. Arithmetic could not account for it, which is what
+identified the stall as load latency rather than the multiply.
+
+### The ablation that found both
+
+`abl.hip` builds variants that skip the unpack (writing raw code bytes) or the scale load and fold.
+Each is WRONG but leaves memory traffic and WMMA count untouched, so the delta bounds what the
+corresponding optimisation could buy. Post-fix, decode:
+
+| shape | M | full | -unpack | -scale | -both | mxfp4 |
+|---|--:|--:|--:|--:|--:|--:|
+| gate_up | 8 | 96.0 | 93.8 | 92.5 | 90.5 | 97.0 |
+| down | 40 | 66.6 | 61.9 | **47.5** | 43.3 | 54.6 |
+
+The `-scale` column at M=40 is what pointed at fix 2. It also settles a tempting idea: the unpack
+is worth only 2-10% at decode and **0.5% at prefill** (where staging is amortised ~16x), so
+switching the weight leg to `v_wmma_i32_16x16x16_iu8` -- where a nibble unpacks in 2 ops instead
+of 9 -- cannot pay for moving activations from e4m3 to int8 and the accuracy that would cost.
+**iu4 at 830 TF/s is likewise not reachable**: it needs int4 activations, i.e. W4A4.
+
+### Things measured and rejected
+
+- **Tile split at fixed BMF=256**: AR_TM=4/AR_WM=4 wins. TM=2/WM=8 is 2-7% worse; TM=8/WM=2 spills
+  at 256 VGPR and is 1.5x worse.
+- **DTM choice at M=33..48**: the launcher's `ceil(M/16)` rule is right. DTM=4 at M=40 is slower
+  than DTM=3 (159.0 vs 155.5 on gate_up), so the M=40 gap was never a tile-selection problem.
+- **Decode IMAJOR**: neutral (105.7 -> 105.6). Kept only because prefill needs it.
+
+### Why prefill stays ~1.2x
+
+MXFP4's scale is a power of two, so it folds into the weight byte exactly and its prefill inner
+loop is pure WMMA with no temp accumulator at all. An arbitrary fp16 group scale cannot fold that
+way without rounding the product to e4m3's four significant bits -- which is precisely the lossy
+pow2-scale conversion measured at +41.5% weight error. So the rescale is not removable at
+acceptable quality. Fully ablating both unpack and scale still leaves prefill ~9% short, and the
+remainder is the IMAJOR restructuring's extra LDS reads. Roughly 15-20% at prefill is the price of
+the format on this hardware; decode, where bytes/weight dominates, goes the other way.
+
+## vLLM integration
+
+`radiance_autoround.py` registers an `auto-round` quantization config and routes linears to the
+kernel through a `radiance::autoround_linear` custom op. The op owns the whole dispatch because a
+shape branch written in `apply()` is data-dependent and splits the torch.compile graph at every
+linear -- the MXFP4 path measured that at ~30% of decode.
+
+Verified against the real checkpoint config, single-process TP group:
+
+- config parses: `group_size=128, sym=True, unquantized_modules=99`
+- routing: `in_proj_a` / `in_proj_b` -> `UnquantizedLinearMethod`, everything else -> the kernel
+- `create_weights` at down_proj TP=2 (K 17408 -> 8704): qweight (1088, 5120) i32,
+  scales (68, 5120) f16, qzeros (68, 640) i32 -- all shard correctly via vLLM's own parameter
+  classes
+- `process_weights_after_loading` transposes qweight to (5120, 1088) = [N, K/8], which is what the
+  kernel reads, and keeps scales at fp16 rather than casting to bf16 (bf16 has three fewer mantissa
+  bits and would quantize the scale itself)
+- the asymmetry guard fires on a non-0x77777777 qzeros: the kernel folds a CONSTANT zero of 8 into
+  its table and must refuse a checkpoint it would be silently wrong for
+
+`run_autoround.sh` builds the module into the image and serves. Registration happens through a
+`sitecustomize.py` shim in site-packages so the decorator runs in the engine process AND every TP
+worker, not in a throwaway interpreter.
+
+## What this does NOT yet establish
+
+
+1. **The model has never been served.** Everything above is kernel-level and load-path-level. An
+   end-to-end BetterBench run needs the production MXFP4 server stopped, because it holds
+   `--gpu-memory-utilization 0.98` on both GPUs and there is no room beside it.
+2. **No quality measurement.** Which is the only axis on which this format can win. Needs
+   `ppl.py` and the GSM8K 500q gate against the MXFP4 reference of 8.3706.
+3. **M=40 decode remains 1.43x** and is not explained by register pressure. Unresolved.
+4. **All timings were taken with the production server running.** Interleaving makes the A/B fair
+   -- both kernels pay the same contention -- but the absolute microseconds are inflated.
+
+## Expectation to hold onto
+
+Both this kernel and the MXFP4 one are bandwidth-bound at decode, so what separates them is
+bits/weight: **4.156 vs 4.25, about 2.3%**. Unpack cleverness and rescale cost both hide under the
+weight stream (at 635 GB/s and ~2.4 GHz there are ~31 VALU slots per streamed byte and this kernel
+needs ~5). So the honest ceiling for this format over MXFP4 at single-stream decode is low single
+digit percent. If AutoRound wins, it should be expected to win on QUALITY, not speed.
+
+## Files
+
+| file | role |
+|---|---|
+| `ar_kernels.h` | the decode and prefill kernels -- shared by the harness and the shipped module |
+| `ar_harness.hip` | correctness gate + `--diag` one-hot probe + `--bench` |
+| `cmp.hip` / `cmp.sh` | head-to-head against the MXFP4 kernels in one binary; arg = NCOPY |
+| `radiance_autoround.hip` | pybind module (decode/prefill dispatch, split-K scratch) |
+| `radiance_autoround.py` | vLLM `auto-round` quant config + linear method |
+| `run_autoround.sh` | build-and-serve launcher |
+| `lut.py` | derives and verifies the int4-sym -> e4m3 table, emits the constants |
+| `lutest.hip` | device gate for the 16-entry table (uniform codes) |
+| `unpacktest.hip` | device gate for all 8 nibbles of random words — the test that matters |
+| `permprobe.hip` | ground-truth map of v_perm_b32 selector semantics on gfx1201 |
+| `run.sh` / `lutest.sh` / `unpacktest.sh` / `permprobe.sh` | build+run in the radiance image |
