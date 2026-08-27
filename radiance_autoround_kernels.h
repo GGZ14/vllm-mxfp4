@@ -101,8 +101,17 @@ __device__ __forceinline__ uint2_t ar_unpack8(unsigned int wv) {
 // decode kernel (smallest tile that covers M -- a wider tile computes rows nobody asked for).
 // ABLATE is a measurement hook, not a feature. Bit 0 skips the int4->e4m3 unpack (writing raw
 // code bytes, so the answer is wrong but the memory traffic and WMMA count are unchanged); bit 1
-// skips the group scale load and fold. Together they bound how much any unpack or rescale
-// optimisation could possibly buy, which is the only honest way to decide whether to chase one.
+// skips the group scale load and fold; bit 2 skips the LDS round-trip for the WEIGHT -- the global
+// read and unpack still happen, but the result stays in a register and feeds the WMMA directly
+// instead of going out to sW and back. Together they bound how much any unpack, rescale or
+// register-resident-weight optimisation could possibly buy, which is the only honest way to decide
+// whether to chase one.
+//
+// Bit 2 exists because at DTM=1 -- single-stream decode, the common case -- each staged weight
+// byte is read exactly ONCE by exactly one wave. There is no reuse, so the LDS write, the barrier
+// and the LDS read are pure overhead, and a fragment-order weight layout (as libr4d and the MXFP4
+// WPERM path use) would let the global load land straight in the fragment register. This measures
+// the ceiling on that before the layout change is built.
 template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0>
 __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
@@ -135,6 +144,8 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
   for (int i = 0; i < DTM; ++i)
 #pragma unroll
     for (int e = 0; e < 8; ++e) acc[i][e] = 0.f;
+
+  unsigned int wsink = 0u;   // ABLATE & 4 only; keeps the elided weight loads live
 
   for (int s = s_lo; s < s_hi; ++s) {
     const int k0 = s * DBK;
@@ -183,7 +194,12 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
 #pragma unroll
       for (int u = 0; u < AR_DEC_WU; u += 2) {
         const uint2_t wv = *(const uint2_t *)(src + u);
-        if constexpr (ABLATE & 1) {
+        if constexpr (ABLATE & 4) {
+          // Global read and unpack still happen; the result never reaches LDS. XOR-ed into a sink
+          // that is consumed below, so the load cannot be dead-code eliminated.
+          const uint2_t a0 = ar_unpack8(wv[0]), a1 = ar_unpack8(wv[1]);
+          wsink ^= a0[0] ^ a0[1] ^ a1[0] ^ a1[1];
+        } else if constexpr (ABLATE & 1) {
           *(uint2_t *)(dst + u * 8) = uint2_t{wv[0], wv[0]};
           *(uint2_t *)(dst + u * 8 + 8) = uint2_t{wv[1], wv[1]};
         } else {
@@ -242,9 +258,13 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
         af[i][0] = *(const int *)pa;
         af[i][1] = *(const int *)(pa + 4);
       }
-      const unsigned char *pw = &sW[(wave * 16 + col) * DWSTR + kk];
-      wf[0] = *(const int *)pw;
-      wf[1] = *(const int *)(pw + 4);
+      int2_t wfr;
+      if constexpr (ABLATE & 4) { wfr[0] = (int)(0x38383838u ^ kk); wfr[1] = wfr[0]; }
+      else {
+        const unsigned char *pw = &sW[(wave * 16 + col) * DWSTR + kk];
+        wfr[0] = *(const int *)pw; wfr[1] = *(const int *)(pw + 4);
+      }
+      wf = wfr;
 #pragma unroll
       for (int i = 0; i < DTM; ++i)
         g[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, g[i]);
@@ -277,6 +297,9 @@ __global__ __launch_bounds__(DWN * 32) void ar_int4_fp8_gemm_decode(
     return;
   }
 
+  if constexpr (ABLATE & 4) {
+    if (wsink == 0xFFFFFFFFu) sW[0] = 1;   // never true; consumes the sink
+  }
   if (n_lane < N) {
 #pragma unroll
     for (int i = 0; i < DTM; ++i)
