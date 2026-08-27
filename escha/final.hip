@@ -30,9 +30,7 @@ int main() {
     HIP_CHECK(hipMalloc(&dP, (size_t)8 * Mmax * N * 4));
     HIP_CHECK(hipMalloc(&dCnt, (N / 32 + 16) * 4)); HIP_CHECK(hipMemset(dCnt, 0, (N / 32 + 16) * 4));
     HIP_CHECK(hipMalloc(&dC, (size_t)Mmax * N * 2));
-    // Tuned: DKS=4 for gate_up (544 WGs), DKS=8 for down (320) -- N=5120 gives only 40 blocks at
-    // DKS=1, which leaves 24 of the 64 CUs idle for the whole GEMM.
-    const int KS = (N >= 17408) ? 4 : 8;
+    const int KS = escha_decode_split_k(N / 128, K / 16);
     for (int M : {8, 40, 64}) {
       const int tm = (M + 15) / 16;
       hipEvent_t e0, e1; HIP_CHECK(hipEventCreate(&e0)); HIP_CHECK(hipEventCreate(&e1));

@@ -560,6 +560,29 @@ __global__ __launch_bounds__(WM * EP_WN * 32) void escha_gemm_prefill(
       }
 }
 
+// Split-K selection for the decode kernel.
+//
+// This is the single largest tuning lever and it cannot be read off N. The `down` shape is N=5120,
+// which at BND=128 is 40 workgroups on a 64-CU part -- 24 CUs idle for the whole GEMM, and DKS=8
+// there is worth 1.8x. But an N-based rule is overfit: at the SAME nblk=40, K=4352 wants DKS=4
+// while K=8704 wants DKS=8, because what is being divided is k-work, not columns.
+//
+// Two forces set the optimum, and the constants below are fitted to 18 measured (nblk, ktiles, M)
+// points spanning the TP=1 and TP=2 per-GPU shapes:
+//   * each split must keep enough k-tiles to be worth its own block -- below ~36 the fixed cost
+//     per workgroup stops being amortized;
+//   * the split writes DKS*M*N fp32 partials and reads them back, a cost linear in DKS, so past
+//     roughly 576 workgroups the extra parallelism no longer pays for the traffic.
+// The fit needs no M term and lands within 2.0% of the measured optimum on every point, exact on
+// 14 of 18. Raising DEC_KS_MAX beyond 8 was not measured and must not be assumed.
+__device__ __host__ __forceinline__ int escha_decode_split_k(int nblk, int ktiles) {
+  constexpr int T = 36, WG_CAP = 576, KS_MAX = 8;
+  int ks = 1;
+  for (int c = 2; c <= KS_MAX; c <<= 1)
+    if (ktiles / c >= T && nblk * c <= WG_CAP) ks = c;
+  return ks;
+}
+
 // =================================================================================================
 // DECODE ON THE FP8 PIPE
 //

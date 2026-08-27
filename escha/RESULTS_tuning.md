@@ -42,17 +42,44 @@ like it won the `down` shape. It does not. Best-of is compared to best-of throug
 | block | DWN=8 (BND=128), 256 threads | EP_WN=2, TN=2 (BNF=64), 8 waves |
 | k-block | KB=4 | EP_BK=64 |
 | M tile | DTM = ceil(M/16) | TM=8 (512 rows); TM=4 when that starves the grid |
-| split-K | **DKS=4 for N≥17408, DKS=8 for N=5120** | n/a |
+| split-K | **`escha_decode_split_k(nblk, ktiles)`** — see below | n/a |
 | resources | 49–82 VGPR, 11.5–18.4 KB LDS, occ 14–16 | 142 VGPR (TM=4) / 230 (TM=8), occ 10 / 6 |
+
+## The split-K rule
+
+Largest single lever, and it cannot be read off N. `down` is N=5120, which at BND=128 is 40
+workgroups on a 64-CU part — 24 CUs idle for the whole GEMM, and DKS=8 there is worth 1.8×. But an
+N-keyed rule is overfit: at the *same* nblk=40, K=4352 wants DKS=4 while K=8704 wants DKS=8,
+because what is being divided is k-work, not columns.
+
+Two forces set the optimum. Each split must keep enough k-tiles to amortize its own workgroup; and
+the split writes `DKS*M*N` fp32 partials and reads them back, a cost linear in DKS. Fitting both
+against 18 measured `(nblk, ktiles, M)` points — spanning TP=1 and TP=2 per-GPU shapes — gives
+
+```
+ks = largest power of two <= 8 with  ktiles/ks >= 36  and  nblk*ks <= 576
+```
+
+which needs **no M term**, is exact on 14 of the 18 points and within **2.0%** on the rest. Harness
+is `ksfit.hip`; the rule ships as `escha_decode_split_k()`.
+
+| N | K | best ks (measured) | rule |
+|---|---|---|---|
+| 2560 | 5120 | 8, 8, 8 | 8 |
+| 5120 | 4352 | 4, 4, 4 | 4 |
+| 5120 | 8704 | 8, 8, 4 | 8 |
+| 8704 | 4352 | 8, 4, 4 | 4 |
+| 8704 | 5120 | 8, 8, 4 | 8 |
+| 17408 | 5120 | 4, 4, 4 | 4 |
+
+(three entries per cell = M of 8, 40, 64)
 
 ## What moved the numbers
 
 Found by censusing the **loop body** of the emitted ISA — the whole-kernel census hides the loop
 under prologue and epilogue and reads far too low.
 
-1. **Split-K (the single largest win: `down` 110 → 60 µs).** `down` is N=5120, and at BND=128 that
-   is **40 workgroups on a 64-CU part — 24 CUs idle for the entire GEMM**. Neither block width nor
-   k-split can be assumed; both are swept per shape and per M.
+1. **Split-K (the single largest win: `down` 110 → 60 µs).** Covered above.
 2. **K-blocking the weight fetch.** The original loop staged one 16-wide k-tile between two
    barriers, so each wave had a single weight load in flight — MLP of 1, and 106 GB/s against a
    635 GB/s roofline. Both K=2 and K=3 need exactly two dwords per lane per tile and tiles are
