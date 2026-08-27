@@ -377,3 +377,87 @@ digit percent. If AutoRound wins, it should be expected to win on QUALITY, not s
 | `unpacktest.hip` | device gate for all 8 nibbles of random words — the test that matters |
 | `permprobe.hip` | ground-truth map of v_perm_b32 selector semantics on gfx1201 |
 | `run.sh` / `lutest.sh` / `unpacktest.sh` / `permprobe.sh` | build+run in the radiance image |
+
+---
+
+# Final tuning state (2026-08-27)
+
+## Decode is at the memory wall
+
+Measured in one binary against a streaming probe on the SAME rotated DRAM-resident buffers, so the
+denominator is what the machine actually delivers rather than the 635 GB/s spec figure. gate_up is
+the shape to trust: 263 MB working set, fully past the 64 MB Infinity Cache, DKS=1 as shipped.
+(`down` and `out` report >100% of their probe because at 138 MB and 78 MB they still take partial
+cache hits -- their probe is not a valid ceiling, and quoting those numbers would be wrong.)
+
+| shape | M | kernel GB/s | achievable stream | **% of achievable** |
+|---|--:|--:|--:|--:|
+| gate_up | 5 | 548.1 | 573.8 | **95.5%** |
+| gate_up | 8 | 546.1 | 580.1 | **94.1%** |
+
+Two independent lines of evidence agree that this is the end:
+  * 95.5% of achievable streaming bandwidth leaves 4.5%.
+  * Ablating the unpack AND the scale fold entirely -- wrong answers, identical traffic -- recovers
+    only 3-6%.
+
+Against the shipped MXFP4 kernel, decode is **8-14% faster at every production shape** (MXFP4 runs
+at 73-75% of the spec peak where we run at 86%).
+
+## Prefill is at the shape's ceiling, and it is a SHARED ceiling
+
+| kernel | M | TFLOP/s | % of 355 peak |
+|---|--:|--:|--:|
+| int4 TN=4 | 2048 | 198.5 | 55.9% |
+| MXFP4 | 2048 | 206.9 | 58.3% |
+| int4 TN=4 | 4096 | 196.7 | 55.4% |
+| MXFP4 | 4096 | 197.3 | **55.6%** |
+
+At M=4096 the two are within 0.2 points of each other. 55-58% is what this GEMM shape reaches on
+gfx1201; it is not an int4 deficiency. In serving, prefill at the 8k chunk size now BEATS MXFP4
+(4435 vs 4299 t/s).
+
+## Every lever, and its verdict
+
+| lever | verdict |
+|---|---|
+| weight staging 4 -> 8 B/thread | **shipped**, -11% decode |
+| staging 8 -> 16 B/thread | closed: identical (87.2 vs 87.2 us) |
+| hoist group-scale load above staging | **shipped**, -22% at M=40 |
+| clamp instead of predicate | **shipped** (removes s_wait_loadcnt per load) |
+| DKS==1 fast path + shape-aware split-K | **shipped** |
+| W-fragment hoist out of the prefill i-loop | **shipped** |
+| IMAJOR prefill (TN temp tiles) | **shipped**, 183 -> 123 VGPR |
+| TN=4 above M=2048 | **shipped**, prefill +8% at 8k |
+| BK 32 / 64 / 128 | closed: within 0.5% normalised |
+| TM/WM split at fixed BMF | closed: 4/4 optimal, 8/2 spills |
+| DTM selection | closed: ceil(M/16) is right |
+| iu8 / iu4 int WMMA | closed: unpack is 2-6% of decode, cannot pay for int8 activations |
+| decode IMAJOR | closed: neutral |
+
+## The residual serving gap is the DRAFTER, not the kernel
+
+Serving decode is 140.9 t/s against MXFP4's 167.3, even though our kernel is faster per step. The
+cause is acceptance, and it is measurable. Same DFlash2-FP8 drafter, same SPEC=7, same box:
+
+| target | accepted / draft | rate |
+|---|--:|--:|
+| MXFP4 | 3.673 | 52.5% |
+| AutoRound int4 | 2.718 | 38.8% |
+
+The drafter was built against the MXFP4 lineage, and the AutoRound checkpoint is genuinely a
+different set of weights -- its `post_attention_layernorm` differs from the FP8 reference on 99.6%
+of channels, by no scale or offset (see the AWQ-fold investigation earlier in this file). So the
+drafter predicts the MXFP4 target far better.
+
+The arithmetic closes: acceptance ratio 1.35x, our per-step advantage 1.08-1.14x, net 1.19x in
+MXFP4's favour -- which is exactly the observed 167.3/140.9. Nothing is unexplained, and none of
+the remainder is the kernel.
+
+Caveat on those two acceptance figures: they come from different prompt distributions (an ad-hoc
+mixed corpus at n=967 against BetterBench's 29-prompt corpus at n=32,774). The direction is not in
+doubt; the exact ratio is approximate.
+
+**To close the decode gap the lever is a drafter matched to this target** -- either the
+checkpoint's own int4 MTP head (which holds acceptance at 1.911/draft at SPEC=4, but MTP is worth
+less than DFlash2 here: 86.2 vs 140.9 t/s) or a DFlash2 drafter distilled against the AutoRound
+weights. Neither is kernel work.
