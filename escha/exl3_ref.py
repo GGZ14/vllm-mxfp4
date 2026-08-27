@@ -48,9 +48,12 @@ def decode_3inst(state, cb=1):
     else:
         raise ValueError(cb)
     x = ((x & np.uint32(0x8FFF8FFF)) ^ np.uint32(0x3B603B60)).astype(np.uint32)
-    lo = (x & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float32)
-    hi = (x >> 16).astype(np.uint16).view(np.float16).astype(np.float32)
-    return lo + hi
+    lo = (x & 0xFFFF).astype(np.uint16).view(np.float16)
+    hi = (x >> 16).astype(np.uint16).view(np.float16)
+    # The add is fp16, NOT fp32. CUDA does __hadd here, so widening first would make the reference
+    # disagree with every real decoder by up to half an fp16 ulp -- which the bit-exact device gate
+    # duly caught (got 2.90234 vs want 2.90137). Harmless for correlation, fatal for a bit gate.
+    return (lo + hi).astype(np.float32)
 
 
 def tile_states(words, K):
