@@ -26,6 +26,9 @@ if [ ! -d "$HOSTMODEL" ]; then
   exit 1
 fi
 
+# podman will not create a bind-mount source, it errors with statfs ENOENT.
+mkdir -p "$HOME/.radiance-cache-autoround"
+
 EXTRA=""
 [ "$EAGER" = "1" ] && EXTRA="$EXTRA --enforce-eager"
 
@@ -54,21 +57,11 @@ cd /ar
 hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 \
   \$(python3 -m pybind11 --includes) radiance_autoround.hip -o \"\$SP\"/radiance_autoround_kernel.so
 cp radiance_autoround.py \"\$SP\"/
-# The @register_quantization_config('auto-round') decorator must run inside the ENGINE process,
-# not a throwaway one, and in every TP worker. A sitecustomize module in site-packages is
-# imported automatically by every interpreter that has that path, which covers the engine and
-# each spawned worker without touching vLLM's own source.
-printf '%s\n' \
-  'try:' \
-  '    import radiance_autoround  # registers the auto-round quantization config' \
-  'except Exception as e:' \
-  '    import sys' \
-  '    sys.stderr.write("[radiance.autoround] registration failed: %r\\n" % (e,))' \
-  > "$SP"/sitecustomize.py
+python3 patch_autoround.py
 # Leave /ar before exec: it is a bind mount and precedes site-packages on sys.path, so a stale
 # .so built there would shadow the one just compiled into site-packages.
 cd /
-exec /opt/radiance_entrypoint.sh _ $MODEL \
+exec /opt/radiance_entrypoint.sh $MODEL \
   --served-model-name Qwen3.8-AutoRound \
   --host 0.0.0.0 --port $PORT \
   --tensor-parallel-size $TP \

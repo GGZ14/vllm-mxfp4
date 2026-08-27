@@ -26,13 +26,18 @@ import sys
 
 import torch
 
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+# Only what registration itself needs may be imported at module scope.
+#
+# patch_autoround.py imports this module from the END of vLLM's quantization package __init__,
+# which is the one point that is both after `register_quantization_config` exists and before
+# ModelConfig resolves the checkpoint's quant_method. At that moment `vllm.config` is still
+# partially initialized, so pulling in vllm.model_executor.layers.linear here raises
+# ImportError("cannot import name 'get_current_vllm_config' ... circular import"). Everything that
+# reaches into the model-executor layers is therefore deferred to first use, and the linear method
+# is built by a factory rather than declared at import time -- the same shape radiance_mxfp4.py
+# uses for its kernel class, for the same reason.
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import (QuantizationConfig,
-                                                                 QuantizeMethodBase)
-from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 import radiance_autoround_kernel as _ext
 
@@ -96,6 +101,8 @@ def autoround_linear(x: torch.Tensor, qweight: torch.Tensor,
     N, K = qweight.shape[0], qweight.shape[1] * PACK
     x2 = x.reshape(-1, K)
     M = x2.shape[0]
+    from vllm import _custom_ops as ops
+
     _ensure_scratch(x.device)
     x_fp8, x_scale = ops.scaled_fp8_quant(x2, scale=None, use_per_token_if_dynamic=True)
     x_scale = x_scale.view(-1).float().contiguous()
@@ -118,19 +125,47 @@ def _(x, qweight, scales):
     return torch.empty((*x.shape[:-1], qweight.shape[0]), device=x.device, dtype=torch.bfloat16)
 
 
+_traced = {"q": 0, "u": 0}
+
+
+def _trace(prefix: str, quantized: bool) -> None:
+    """Print the first few routing decisions of each kind, then go quiet.
+
+    Routing is the part of this integration with no compile-time check on it, and getting it
+    wrong fails late and confusingly during weight load. A handful of lines at startup makes the
+    split visible without flooding a 64-layer model's log.
+    """
+    k = "q" if quantized else "u"
+    _traced[k] += 1
+    n = _traced[k]
+    # First few of each kind, then powers-of-ten, so the split is visible on a 64-layer model
+    # without flooding the log. A cap alone hid a real bug once: the vision tower used up the
+    # whole budget and the language layers being misrouted never showed.
+    if n <= 3 or n in (10, 100, 400, 1000):
+        sys.stderr.write(
+            f"[radiance.autoround] {'kernel' if quantized else 'bf16  '} #{n:<4} {prefix}\n")
+
+
 @register_quantization_config("auto-round")
 class AutoRoundConfig(QuantizationConfig):
     """int4 g128 symmetric, W4A8 through the radiance gfx1201 kernel."""
 
-    def __init__(self, group_size: int, sym: bool, fp16_patterns: list[str]):
+    def __init__(self, group_size: int, sym: bool, fp16_patterns: list[str],
+                 quantize_blocks: list[str]):
         super().__init__()
         self.group_size = group_size
         self.sym = sym
         self.fp16_patterns = fp16_patterns
         self._fp16_re = [re.compile(p) for p in fp16_patterns]
+        # Only these prefixes were quantized. Everything else -- the whole qwen2.5-VL vision
+        # tower, lm_head, the norms -- is plain bf16 in the checkpoint and must be routed to
+        # vLLM's unquantized method. Without this the vision tower's proj (K=576) reaches
+        # create_weights and trips the group-size check, because 576 is not a multiple of 128.
+        self.quantize_blocks = quantize_blocks
 
     def __repr__(self):
         return (f"AutoRoundConfig(group_size={self.group_size}, sym={self.sym}, "
+                f"blocks={self.quantize_blocks}, "
                 f"unquantized_modules={len(self.fp16_patterns)})")
 
     @classmethod
@@ -170,76 +205,158 @@ class AutoRoundConfig(QuantizationConfig):
         # quantized and must go to the unquantized linear method.
         fp16 = [k for k, v in (config.get("extra_config") or {}).items()
                 if int(v.get("bits", bits)) >= 16]
-        return cls(group_size, bool(sym), fp16)
+        # "model.language_model.layers,mtp.layers" -- the only blocks AutoRound touched.
+        blocks = [b.strip() for b in
+                  str(config.get("block_name_to_quantize", "")).split(",") if b.strip()]
+        return cls(group_size, bool(sym), fp16, blocks)
+
+    def _in_quantized_block(self, prefix: str) -> bool:
+        """Is this module inside a block AutoRound actually quantized?
+
+        `block_name_to_quantize` names CHECKPOINT paths ("model.language_model.layers,mtp.layers"),
+        while the prefix vLLM passes here is its own MODULE path, and for this architecture the two
+        do not line up -- vLLM applies an hf_to_vllm_mapper, and the observed vLLM prefixes are
+        things like "visual.blocks.0.attn.qkv" with no "model." at all. Matching the two literally
+        sent EVERY linear to the unquantized method, and loading then died on
+        `'MergedColumnParallelLinear' object has no attribute 'data'`, because vLLM's
+        `getattr(self, name, self)` falls back to the LAYER when `qweight` is not a registered
+        parameter.
+
+        So use the structural fact instead of the name mapping: AutoRound quantized the decoder
+        blocks and nothing else, and every decoder linear -- language model or MTP -- sits under a
+        "layers.<idx>." component, while the qwen2.5-VL tower sits under "visual" and lm_head and
+        the norms have no "layers" component at all. Individual exceptions inside the decoder
+        (in_proj_a / in_proj_b) are handled separately by extra_config.
+
+        This matters beyond tidiness: the vision merger's proj has K=576, which is not a multiple
+        of the 128 group size, so letting it reach create_weights trips the group check.
+        """
+        if not self.quantize_blocks:
+            return True
+        parts = prefix.split(".")
+        if "visual" in parts:
+            return False
+        return "layers" in parts
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+        """Claim auto-round checkpoints before vLLM's INC config does.
+
+        vLLM ships an INC (Intel Neural Compressor) config whose override maps quant_method
+        "auto-round" straight to "inc", and INC refuses to run on ROCm -- "inc quantization is
+        currently not supported in rocm" -- so without this the engine dies in ModelConfig before a
+        single layer is built. ModelConfig probes CUSTOM registered methods before the built-in
+        override list, and "auto-round" is not in the QuantizationMethods literal, so claiming it
+        here wins the race without patching vLLM.
+
+        Only claim what this kernel actually supports; anything else falls through to whatever vLLM
+        would have done, rather than being taken over and then failing later at load.
+        """
+        if hf_quant_cfg.get("quant_method") != "auto-round":
+            return None
+        if hf_quant_cfg.get("bits") != 4 or hf_quant_cfg.get("group_size") != GROUP:
+            return None
+        if not hf_quant_cfg.get("sym", False):
+            return None
+        return cls.get_name()
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
         if not isinstance(layer, LinearBase):
             return None
+        # Outside the quantized blocks -> bf16 in the checkpoint.
+        if not self._in_quantized_block(prefix):
+            _trace(prefix, False)
+            return UnquantizedLinearMethod()
+        # Inside them, extra_config can still hold individual modules at higher precision.
         for rx in self._fp16_re:
             if rx.fullmatch(prefix) or rx.search(prefix):
+                _trace(prefix, False)
                 return UnquantizedLinearMethod()
-        return AutoRoundLinearMethod(self)
+        _trace(prefix, True)
+        return _linear_method_cls()(self)
 
 
-class AutoRoundLinearMethod(LinearMethodBase):
+_LINEAR_METHOD_CLS = None
 
-    def __init__(self, quant_config: AutoRoundConfig):
-        self.quant_config = quant_config
 
-    def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
-                       input_size, output_size, params_dtype, **extra_weight_attrs):
-        del input_size, output_size
-        out_part = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        g = self.quant_config.group_size
+def _linear_method_cls():
+    """Build the linear method on first use.
 
-        if input_size_per_partition % g:
-            raise ValueError(
-                f"K per partition ({input_size_per_partition}) is not a multiple of the group "
-                f"size ({g}); the group structure would straddle a TP shard boundary.")
+    Declaring it at module scope would need LinearMethodBase and the parameter classes as base
+    classes at import time, which is exactly the circular import described at the top of the file.
+    By the time a layer asks for a quant method, vLLM is fully initialized.
+    """
+    global _LINEAR_METHOD_CLS
+    if _LINEAR_METHOD_CLS is not None:
+        return _LINEAR_METHOD_CLS
 
-        # Layouts are the AutoGPTQ ones and the parameter classes are vLLM's own, so TP sharding
-        # is handled by the loader: input_dim=0 shards along K, output_dim=1 shards along N.
-        # desc_act is off for this checkpoint, so scales shard with K rather than being replicated.
-        qweight = PackedvLLMParameter(
-            data=torch.empty(input_size_per_partition // PACK, out_part, dtype=torch.int32),
-            input_dim=0, output_dim=1, packed_dim=0, packed_factor=PACK,
-            weight_loader=weight_loader)
-        # fp16 deliberately, not params_dtype: the checkpoint stores F16 scales and bf16 has three
-        # fewer mantissa bits, so casting them to bf16 would quantize the scale itself.
-        scales = GroupQuantScaleParameter(
-            data=torch.empty(input_size_per_partition // g, out_part, dtype=torch.float16),
-            input_dim=0, output_dim=1, weight_loader=weight_loader)
-        qzeros = PackedvLLMParameter(
-            data=torch.empty(input_size_per_partition // g, out_part // PACK, dtype=torch.int32),
-            input_dim=0, output_dim=1, packed_dim=1, packed_factor=PACK,
-            weight_loader=weight_loader)
+    from vllm.model_executor.layers.linear import LinearMethodBase
+    from vllm.model_executor.parameter import (GroupQuantScaleParameter, PackedvLLMParameter)
 
-        layer.register_parameter("qweight", qweight)
-        layer.register_parameter("scales", scales)
-        layer.register_parameter("qzeros", qzeros)
+    class AutoRoundLinearMethod(LinearMethodBase):
 
-    def process_weights_after_loading(self, layer) -> None:
-        # Assert the symmetry the kernel's folded zero point depends on, before anything else.
-        z = layer.qzeros.data.view(torch.int32)
-        if z.numel():
-            bad = (z != torch.tensor(0x77777777, dtype=torch.int32, device=z.device)).sum()
-            if int(bad):
+        def __init__(self, quant_config: AutoRoundConfig):
+            self.quant_config = quant_config
+
+        def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
+                           input_size, output_size, params_dtype, **extra_weight_attrs):
+            del input_size, output_size
+            out_part = sum(output_partition_sizes)
+            weight_loader = extra_weight_attrs.get("weight_loader")
+            g = self.quant_config.group_size
+
+            if input_size_per_partition % g:
                 raise ValueError(
-                    f"AutoRound checkpoint is not symmetric: {int(bad)} of {z.numel()} qzeros "
-                    "words differ from 0x77777777 (zero != 8). This kernel folds a CONSTANT zero "
-                    "of 8 into its unpack table and would be silently wrong here.")
-        del layer.qzeros
-        layer.qzeros = None
+                    f"K per partition ({input_size_per_partition}) is not a multiple of the group "
+                    f"size ({g}); the group structure would straddle a TP shard boundary.")
 
-        # The kernel reads the weight as [N, K/8] so a wave's read walks one row contiguously;
-        # the checkpoint's [K/8, N] would stride by N between consecutive k.
-        qw = layer.qweight.data
-        layer.qweight = torch.nn.Parameter(qw.t().contiguous(), requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data.contiguous(), requires_grad=False)
+            # Layouts are the AutoGPTQ ones and the parameter classes are vLLM's own, so TP sharding
+            # is handled by the loader: input_dim=0 shards along K, output_dim=1 shards along N.
+            # desc_act is off for this checkpoint, so scales shard with K rather than being replicated.
+            qweight = PackedvLLMParameter(
+                data=torch.empty(input_size_per_partition // PACK, out_part, dtype=torch.int32),
+                input_dim=0, output_dim=1, packed_dim=0, packed_factor=PACK,
+                weight_loader=weight_loader)
+            # fp16 deliberately, not params_dtype: the checkpoint stores F16 scales and bf16 has three
+            # fewer mantissa bits, so casting them to bf16 would quantize the scale itself.
+            scales = GroupQuantScaleParameter(
+                data=torch.empty(input_size_per_partition // g, out_part, dtype=torch.float16),
+                input_dim=0, output_dim=1, weight_loader=weight_loader)
+            qzeros = PackedvLLMParameter(
+                data=torch.empty(input_size_per_partition // g, out_part // PACK, dtype=torch.int32),
+                input_dim=0, output_dim=1, packed_dim=1, packed_factor=PACK,
+                weight_loader=weight_loader)
 
-    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        out = torch.ops.radiance.autoround_linear(x, layer.qweight, layer.scales)
-        if bias is not None:
-            out = out + bias
-        return out
+            layer.register_parameter("qweight", qweight)
+            layer.register_parameter("scales", scales)
+            layer.register_parameter("qzeros", qzeros)
+
+        def process_weights_after_loading(self, layer) -> None:
+            # Assert the symmetry the kernel's folded zero point depends on, before anything else.
+            z = layer.qzeros.data.view(torch.int32)
+            if z.numel():
+                bad = (z != torch.tensor(0x77777777, dtype=torch.int32, device=z.device)).sum()
+                if int(bad):
+                    raise ValueError(
+                        f"AutoRound checkpoint is not symmetric: {int(bad)} of {z.numel()} qzeros "
+                        "words differ from 0x77777777 (zero != 8). This kernel folds a CONSTANT zero "
+                        "of 8 into its unpack table and would be silently wrong here.")
+            del layer.qzeros
+            layer.qzeros = None
+
+            # The kernel reads the weight as [N, K/8] so a wave's read walks one row contiguously;
+            # the checkpoint's [K/8, N] would stride by N between consecutive k.
+            qw = layer.qweight.data
+            layer.qweight = torch.nn.Parameter(qw.t().contiguous(), requires_grad=False)
+            layer.scales = torch.nn.Parameter(layer.scales.data.contiguous(), requires_grad=False)
+
+        def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+            out = torch.ops.radiance.autoround_linear(x, layer.qweight, layer.scales)
+            if bias is not None:
+                out = out + bias
+            return out
+
+    _LINEAR_METHOD_CLS = AutoRoundLinearMethod
+    return _LINEAR_METHOD_CLS
