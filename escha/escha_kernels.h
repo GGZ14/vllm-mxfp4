@@ -430,6 +430,11 @@ template <int TN, int K, int TM = EP_TM, int WM = EP_WM>
 __global__ __launch_bounds__(WM * EP_WN * 32) void escha_gemm_prefill(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ code,
     const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int Kdim) {
+  // TM*TN accumulators of 8 floats each is the whole register budget. TM=8/TN=4 needs 256 VGPRs
+  // before a single fragment is live and spills 1146 of them -- and a spilling kernel does not
+  // merely run slow, it holds the clocks down for whatever is measured after it. Refuse to build
+  // the configuration rather than discover it in a benchmark.
+  static_assert(TM * TN <= 16, "TM*TN accumulators exceed the register budget; this will spill");
   constexpr int BNF = EP_WN * TN * 16, BMF = WM * TM * 16;
   constexpr int NWAVE = WM * EP_WN, NTHREADS = NWAVE * 32;
   constexpr int WORDS = 256 * K / 32;
@@ -575,7 +580,7 @@ __global__ __launch_bounds__(WM * EP_WN * 32) void escha_gemm_prefill(
 //     3 blocks/CU to 5.
 // Activations arrive already quantized per token, matching the W4A8 serving path and the MXFP4
 // decode kernel's signature exactly.
-template <int DWN, int DKS, int DTM, int K, int KB = 4, int PAD = 8>
+template <int DWN, int DKS, int DTM, int K, int KB = 4, int PAD = 8, bool MUL24 = false>
 __global__ __launch_bounds__(DWN * 32) void escha_gemm_decode_fp8(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ code,
     const float *__restrict__ As, float *__restrict__ P, int *__restrict__ cnt,
@@ -646,7 +651,7 @@ __global__ __launch_bounds__(DWN * 32) void escha_gemm_decode_fp8(
 #pragma unroll
       for (int j = 0; j < 8; j += 2) {
         const int dr = (j & 2) ? 8 : 0, dc = (j >= 4) ? 8 : 0;
-        const __half2 d = escha_decode2<>(st[j], st[j + 1]);
+        const __half2 d = escha_decode2<MUL24>(st[j], st[j + 1]);
         // The trellis pair lands on adjacent rows of one column, and sW is transposed to [n][k],
         // so the two e4m3 bytes are contiguous: one ds_write_b16 per pair.
         const unsigned int p = escha_pk_e4m3(__half2float(__low2half(d)),

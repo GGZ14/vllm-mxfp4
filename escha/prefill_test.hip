@@ -43,6 +43,10 @@ int main() {
 
     for (int TN : {2, 4})
      for (int tm8 = 0; tm8 < 2; ++tm8) {
+      // TM=8 is only built at TN=2: TM*TN=32 accumulators spill 1146 VGPRs and the kernel's
+      // static_assert refuses to compile it. Skipping it here keeps the gate honest about which
+      // configurations actually exist rather than silently testing a narrower set.
+      if (tm8 && TN == 4) continue;
       const int BNF = EP_WN * TN * 16;
       if (N % BNF) continue;
       HIP_CHECK(hipMemset(dC, 0, (size_t)M * N * 2));
@@ -64,8 +68,7 @@ int main() {
         HIP_CHECK(hipMemset(dCnt, 0, ((N + 127) / 128) * 4));
         if (K == 2) { if (TN == 2) DTM(1, 2); else DTM(4, 2); }
         else        { if (TN == 2) DTM(1, 3); else DTM(4, 3); }
-      } else if (tm8) { if (K == 2) { if (TN == 2) L8(2, 2); else L8(4, 2); }
-                        else { if (TN == 2) L8(2, 3); else L8(4, 3); } }
+      } else if (tm8) { if (K == 2) L8(2, 2); else L8(2, 3); }
       else if (K == 2) { if (TN == 2) L(2, 2); else L(4, 2); }
       else        { if (TN == 2) L(2, 3); else L(4, 3); }
 #undef L
