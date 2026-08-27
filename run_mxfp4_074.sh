@@ -197,7 +197,11 @@ EXTRA=${EXTRA:-}
 # MODELS is bind-mounted at /models below, so SNAP must live somewhere under it.
 MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
-if [ ! -f "$SNAP/config.json" ]; then
+# -f follows symlinks, so a checkpoint assembled as a symlink farm into the HF cache fails
+# this test on the HOST even though it resolves fine in the container, where the cache is
+# bind-mounted at /root/.cache/huggingface. Accept a dangling symlink too and let the
+# container be the judge; a genuinely absent checkpoint still has neither.
+if [ ! -f "$SNAP/config.json" ] && [ ! -L "$SNAP/config.json" ]; then
   echo "no checkpoint at $SNAP" >&2
   echo >&2
   echo "Build it from AMD's MXFP4 release (one-off, ~15 min, needs the fp8 MTP head -- the stock" >&2
@@ -222,6 +226,15 @@ esac
 
 if [ "$R4D_ATTN" = "1" ]; then ATTN=R4D; else ATTN=ROCM_AITER_UNIFIED_ATTN; fi
 
+# Async scheduling overlaps the host's scheduling work with GPU execution, which is the standard
+# answer to a large launch gap. vLLM refuses it together with disable_padded_drafter_batch, so the
+# two are one switch here. The unpad lever is worth ~+50% single-stream on the 27B hybrids under
+# MTP, where the drafter runs a SERIAL loop of forwards and the padding is paid once per position.
+# Under dflash the drafter emits the whole block in one graphed pass, so it is worth re-testing
+# which side of that trade wins.
+ASYNC=${ASYNC:-0}
+if [ "$ASYNC" = 1 ]; then ASYNC_FLAG="--async-scheduling"; UNPAD=false; else ASYNC_FLAG="--no-async-scheduling"; UNPAD=true; fi
+
 # Speculative config, built here so the drafter path is validated before podman is invoked rather
 # than surfacing as an HF repo-id error inside the worker.
 if [ "$SPEC_METHOD" = dflash ]; then
@@ -238,9 +251,9 @@ if [ "$SPEC_METHOD" = dflash ]; then
   esac
   # disable_padded_drafter_batch is the single-stream lever (~+50% on the 27B hybrids) and the
   # image bakes the vLLM unpad patch it relies on; it applies to dflash as well as mtp.
-  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$CDRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$DRAFT_ATTN\",\"disable_padded_drafter_batch\":true}"
+  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$CDRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$DRAFT_ATTN\",\"disable_padded_drafter_batch\":$UNPAD}"
 else
-  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":true}"
+  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":$UNPAD}"
 fi
 
 # The AR size gate compares the raw bf16 byte count: CHUNK x hidden(5120) x 2. Derive it rather
@@ -337,7 +350,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     --max-model-len "$MAXLEN" --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "$SPEC_CFG" \
-    --no-async-scheduling $EXTRA \
+    $ASYNC_FLAG $EXTRA \
     --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
     --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
     --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja
