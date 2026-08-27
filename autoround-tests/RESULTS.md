@@ -403,6 +403,37 @@ Two independent lines of evidence agree that this is the end:
 Against the shipped MXFP4 kernel, decode is **8-14% faster at every production shape** (MXFP4 runs
 at 73-75% of the spec peak where we run at 86%).
 
+## Prefill: the epilogue was the last real lever (2026-08-27)
+
+The per-kernel ISA census (`isa.hip` + `isa_census.py`) showed where the instruction budget went,
+and it was not arithmetic:
+
+| kernel | total | wmma | addr64 pairs | s_and_saveexec | 64-bit shifts |
+|---|--:|--:|--:|--:|--:|
+| decode DTM=1 | 563 | 8 | 19 (3.4%) | 1 (0.2%) | 14 |
+| prefill TN=2 | 2713 | 32 | 142 (5.2%) | 95 (3.5%) | 132 (4.9%) |
+
+Decode was already clean -- the clamp-not-predicate work did that. Prefill was spending ~16% of its
+instructions on 64-bit addressing and exec-mask predication, in a kernel that is compute-bound at
+~56% of peak. The cause was the epilogue: AR_TM*TN*8 = 64 individually bounds-tested stores, each
+with a full `(size_t)m * N + n` address.
+
+Two fixes, both in the epilogue: hoist a wave-uniform base so the compiler emits the SADDR form
+with a 32-bit offset, and take a branch-free fast path when the block lies entirely inside M and N
+(on a real prefill only the last row-block and column-block are ragged). Worth **3.3-4.5%**:
+
+| shape | M | MXFP4 | shipped TN=4 | ratio |
+|---|--:|--:|--:|--:|
+| gate_up | 2048 | 1768.2 | **1762.8** | **0.997x** |
+| gate_up | 4096 | 3680.8 | **3568.0** | **0.969x** |
+| down | 4096 | 1780.3 | 1800.9 | 1.012x |
+
+Note the STATIC instruction count went UP (2713 -> 3368) because the fallback epilogue is still
+compiled. What matters is the path executed, and the fast path is the one that runs.
+
+**int4 prefill now beats MXFP4 on the largest shape**, at 57.6-58.3% of the 355 TF/s peak against
+MXFP4's 55.9-58.2%.
+
 ## Prefill is at the shape's ceiling, and it is a SHARED ceiling
 
 | kernel | M | TFLOP/s | % of 355 peak |

@@ -27,7 +27,7 @@
 //                        runs. Costs ASTEPS*4 + WSTEPS*2 + TN VGPRs.
 // OPT bit 3  SETPRIO     raise wave priority across the WMMA run.
 #pragma once
-#include "ar_kernels.h"
+#include "../radiance_autoround_kernels.h"
 
 // WN (waves along N) is a template parameter so a single translation unit can hold several tile
 // shapes and interleave them in one timing loop. Comparing tiles across separate binaries is not

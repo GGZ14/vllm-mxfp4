@@ -24,7 +24,7 @@
 //                        17.8 MB at M=64. That is the term the shipped kernel pays for split-K
 //                        parallelism it may not need: gate_up is 136 n-blocks before any split.
 #pragma once
-#include "ar_kernels.h"
+#include "../radiance_autoround_kernels.h"
 
 template <int DWN, int DKS, int DTM, int OPT>
 __global__ __launch_bounds__(DWN * 32) void ar_decode_opt(

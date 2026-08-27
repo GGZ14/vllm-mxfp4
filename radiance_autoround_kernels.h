@@ -516,6 +516,35 @@ __global__ __launch_bounds__(AR_NTHREADS) void ar_int4_fp8_gemm_prefill(
     }
   }
 
+  // Epilogue. Two things matter here and neither is arithmetic.
+  //
+  // ADDRESSES. `C[(size_t)m * N + ncol[j]]` is a full 64-bit address per element, and there are
+  // AR_TM*TN*8 of them -- the ISA showed 142 v_add_co_u32/v_add_co_ci pairs and 132 64-bit shifts
+  // in a kernel with only 32 WMMA. Hoisting a wave-uniform base and indexing it with a 32-bit
+  // offset lets the compiler keep the base in SGPRs and emit the SADDR form, so a lane pays one
+  // 32-bit add instead of a 64-bit add pair. Same trick the MXFP4 kernel uses for its staging
+  // bases, where it was worth 1.8-3.4%. The offset cannot overflow an int: it is at most
+  // (kb8 + (AR_TM-1)*16 + 7) * N + N <= 64 * 34816.
+  //
+  // PREDICATION. The bounds test put every one of those stores in its own s_and_saveexec region
+  // (95 of them). A block that lies entirely inside M and N needs no test at all, and on a real
+  // prefill nearly every block does -- only the last row-block and last column-block are ragged.
+  __bf16 *__restrict__ Cb = C + (size_t)(m0 + wm * AR_TM * 16) * N;
+  const float *__restrict__ Asb = As + m0 + wm * AR_TM * 16;
+  const bool full = (m0 + wm * AR_TM * 16 + (AR_TM - 1) * 16 + kb8 + 7 < M) &&
+                    (ncol[TN - 1] < N);
+  if (full) {
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+      for (int j = 0; j < TN; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int r = i * 16 + kb8 + e;
+          Cb[(size_t)(r * N + ncol[j])] = (__bf16)(acc[i][j][e] * Asb[r]);
+        }
+    return;
+  }
 #pragma unroll
   for (int i = 0; i < AR_TM; ++i)
 #pragma unroll

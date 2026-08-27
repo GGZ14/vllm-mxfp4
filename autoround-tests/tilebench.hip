@@ -14,8 +14,8 @@ int main(int argc, char **argv) {
   const int NCOPY = argc > 1 ? atoi(argv[1]) : 3;
   const Shape pshapes[] = {{17408, 5120, "gate_up"}, {5120, 8704, "down"}};
   const int pMs[] = {512, 2048, 4096};
-  printf("%-9s %-6s %9s %9s %9s %9s %9s %9s\n", "shape", "M", "mxfp4", "ship2x2",
-         "wn2tn2", "wn2tn4", "wn4tn2", "wn4tn4");
+  printf("%-9s %-6s %9s %9s %9s %9s %9s %9s\n", "shape", "M", "mxfp4", "ship TN2",
+         "ship TN4", "opt tn2", "opt tn4", "wn4tn4");
   for (const Shape &sh : pshapes) {
     const int N = sh.N, K = sh.K, kw = K / 8, G = K / AR_GROUP, Mmax = 4096;
     std::vector<unsigned int *> Wa(NCOPY); std::vector<unsigned char *> Wm(NCOPY);
@@ -37,9 +37,12 @@ int main(int argc, char **argv) {
       float t[6]; for (int i = 0; i < 6; ++i) t[i] = 1e30f; float ms;
       auto F0 = [&](int it) { hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_folded<2, false>), mg, mbk, 0, 0, dA, Wm[it % NCOPY], dWs, dWref, dAs, dC, M, N, K); };
       auto F1 = [&](int it) { hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<2, true>), dim3((N + 63) / 64, by), dim3(256), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
-      auto F2 = [&](int it) { hipLaunchKernelGGL((ar_prefill_opt<2, 3, 2>), dim3((N + 63) / 64, by), dim3(256), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
-      auto F3 = [&](int it) { hipLaunchKernelGGL((ar_prefill_opt<4, 3, 2>), dim3((N + 127) / 128, by), dim3(256), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
-      auto F4 = [&](int it) { hipLaunchKernelGGL((ar_prefill_opt<2, 3, 4>), dim3((N + 127) / 128, by), dim3(512), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
+      // F2 is now the SHIPPED kernel at TN=4 -- the path the launcher actually takes above
+      // RADIANCE_AR_TN4_MIN_M. The ar_prefill_opt copies below are kept only as the historical
+      // reference; they lack the epilogue fast path that is now shipped.
+      auto F2 = [&](int it) { hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<4, true>), dim3((N + 127) / 128, by), dim3(256), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
+      auto F3 = [&](int it) { hipLaunchKernelGGL((ar_prefill_opt<2, 3, 2>), dim3((N + 63) / 64, by), dim3(256), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
+      auto F4 = [&](int it) { hipLaunchKernelGGL((ar_prefill_opt<4, 3, 2>), dim3((N + 127) / 128, by), dim3(256), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
       auto F5 = [&](int it) { hipLaunchKernelGGL((ar_prefill_opt<4, 3, 4>), dim3((N + 255) / 256, by), dim3(512), 0, 0, dA, Wa[it % NCOPY], dS, dAs, dC, M, N, K); };
 #define TM(F, D) do { for (int it = 0; it < 2; ++it) F(it); HIP_CHECK(hipDeviceSynchronize()); \
         HIP_CHECK(hipEventRecord(e0)); for (int it = 0; it < 10; ++it) F(it); \
