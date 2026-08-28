@@ -50,10 +50,10 @@ int main() {
     HIP_CHECK(hipMemcpy(dSout, hsout.data(), OC * 4, hipMemcpyHostToDevice));
 
     float *dAmax; HIP_CHECK(hipMalloc(&dAmax, M * 4)); HIP_CHECK(hipMemset(dAmax, 0, M * 4));
-    hipLaunchKernelGGL(escha_pre_amax, dim3((IC + ESCHA_HAD - 1) / ESCHA_HAD, M),
-                       dim3(ESCHA_HAD), 0, 0, dX, dSin, dRin, dAmax, M, IC);
-    hipLaunchKernelGGL(escha_pre_quant, dim3((IC + ESCHA_HAD - 1) / ESCHA_HAD, M),
-                       dim3(ESCHA_HAD), 0, 0, dX, dSin, dRin, dAmax, dA, dAs, M, IC);
+    hipLaunchKernelGGL(escha_pre_amax, dim3((IC + ESCHA_HAD * ESCHA_ACT_WAVES - 1) / (ESCHA_HAD * ESCHA_ACT_WAVES), M),
+                       dim3(ESCHA_ACT_THREADS), 0, 0, dX, dSin, dRin, dAmax, M, IC);
+    hipLaunchKernelGGL(escha_pre_quant, dim3((IC + ESCHA_HAD * ESCHA_ACT_WAVES - 1) / (ESCHA_HAD * ESCHA_ACT_WAVES), M),
+                       dim3(ESCHA_ACT_THREADS), 0, 0, dX, dSin, dRin, dAmax, dA, dAs, M, IC);
     const bool dec = M <= 64;
     if (dec) {
       const int tm = (M + 15) / 16, KS = escha_decode_split_k(nblk, IC / 16);
@@ -71,8 +71,8 @@ int main() {
       if (K == 2) hipLaunchKernelGGL((escha_gemm_prefill<2, 2, 8>), g, b, 0, 0, dA, dW, dAs, dC, M, OC, IC);
       else        hipLaunchKernelGGL((escha_gemm_prefill<2, 3, 8>), g, b, 0, 0, dA, dW, dAs, dC, M, OC, IC);
     }
-    hipLaunchKernelGGL(escha_post_rot, dim3((OC + ESCHA_HAD - 1) / ESCHA_HAD, M),
-                       dim3(ESCHA_HAD), 0, 0, dC, dRout, dSout, dY, M, OC);
+    hipLaunchKernelGGL(escha_post_rot, dim3((OC + ESCHA_HAD * ESCHA_ACT_WAVES - 1) / (ESCHA_HAD * ESCHA_ACT_WAVES), M),
+                       dim3(ESCHA_ACT_THREADS), 0, 0, dC, dRout, dSout, dY, M, OC);
     HIP_CHECK(hipDeviceSynchronize());
 
     std::vector<unsigned short> got((size_t)M * OC);
