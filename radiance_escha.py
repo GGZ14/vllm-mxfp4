@@ -55,61 +55,56 @@ def _ensure_scratch(device, need_bytes):
     return _scratch[key]
 
 
-@torch.library.custom_op("radiance::escha_linear", mutates_args=())
-def escha_linear(x: torch.Tensor, code: torch.Tensor, rin: torch.Tensor, rout: torch.Tensor,
-                 s_in: torch.Tensor, s_out: torch.Tensor, kbits: int) -> torch.Tensor:
-    """One escha projection. Owns the dispatch so no shape branch is visible to dynamo.
+@torch.library.custom_op("radiance::escha_linear_into", mutates_args=("out",))
+def escha_linear_into(out: torch.Tensor, x: torch.Tensor, code: torch.Tensor, rin: torch.Tensor,
+                      rout: torch.Tensor, s_in: torch.Tensor, s_out: torch.Tensor,
+                      kbits: int, col0: int) -> None:
+    """One escha projection, written straight into its column slice of `out`.
 
-    vLLM compiles with a dynamic token dimension, so an `M <= 64` test written in apply() is a
-    data-dependent branch that splits the graph at every linear; the MXFP4 path measured that at
-    ~30% of decode throughput. Inside a registered custom op the body runs eagerly and the
-    prefill/decode choice is made in C++.
+    Owns the dispatch so no shape branch is visible to dynamo: vLLM compiles with a dynamic token
+    dimension, so an `M <= 64` test in apply() is a data-dependent branch that splits the graph at
+    every linear -- the MXFP4 path measured that at ~30% of decode throughput. Inside a registered
+    custom op the body runs eagerly and the prefill/decode choice is made in C++.
+
+    It writes into a caller-owned `out` rather than returning its own buffer because a merged
+    module runs one of these per source tensor, and concatenating the results afterwards costs a
+    full output-sized read plus write -- 570 MB on gate_up at M=8192.
     """
     IC = code.shape[0] * _TILE
     OC = code.shape[1] * _TILE
-    # The kernels index raw pointers with a row stride of IC/OC, so a non-contiguous or
-    # wrong-dtype activation walks off the allocation -- which shows up as a GPU memory fault
-    # inside escha_pre_quant rather than as anything that names the cause.
+    # The kernels index raw pointers with a fixed row stride, so a non-contiguous or wrong-dtype
+    # activation walks off the allocation -- which surfaces as a GPU memory fault inside
+    # escha_pre_quant and names nothing useful.
     x2 = x.reshape(-1, IC)
     if x2.dtype != torch.bfloat16:
         x2 = x2.to(torch.bfloat16)
     x2 = x2.contiguous()
     M = x2.shape[0]
     if M == 0:
-        return x.new_empty((*x.shape[:-1], OC), dtype=torch.bfloat16)
+        return
     if rin.numel() != IC or s_in.numel() != IC:
         raise ValueError(f"escha: rin/s_in length {rin.numel()}/{s_in.numel()} != IC {IC}")
     if rout.numel() != OC or s_out.numel() != OC:
         raise ValueError(f"escha: rout/s_out length {rout.numel()}/{s_out.numel()} != OC {OC}")
     dev = x.device
     ext = _load_ext()
-
-    nblk = (OC + 127) // 128
     _ensure_scratch(dev, max(8 * 64 * OC * 4, 1 << 20))
 
     A = torch.empty((M, IC), device=dev, dtype=torch.uint8)
     As = torch.empty(M, device=dev, dtype=torch.float32)
-    amax = torch.empty(M, device=dev, dtype=torch.float32)
+    amax = torch.zeros(M, device=dev, dtype=torch.float32)
     C = torch.empty((M, OC), device=dev, dtype=torch.bfloat16)
-    out = torch.empty((M, OC), device=dev, dtype=torch.bfloat16)
-    trace = os.environ.get("RADIANCE_ESCHA_TRACE")
-    if trace:
-        sys.stderr.write(f"[radiance.escha] gemm M={M} IC={IC} OC={OC} K={kbits} nblk={nblk}\n")
+    ldo = out.shape[-1]
+    o2 = out.reshape(-1, ldo)
     ext.launch(x2.data_ptr(), code.data_ptr(), rin.data_ptr(), rout.data_ptr(),
                s_in.data_ptr(), s_out.data_ptr(), A.data_ptr(), As.data_ptr(),
-               amax.data_ptr(), C.data_ptr(), out.data_ptr(), M, OC, IC, int(kbits),
-               torch.cuda.current_stream().cuda_stream)
-    if trace:
-        torch.cuda.synchronize()      # localize a fault to THIS call rather than a later one
-        sys.stderr.write(f"[radiance.escha] gemm ok M={M} IC={IC} OC={OC}\n")
-    del nblk
-    return out.view(*x.shape[:-1], OC)
+               amax.data_ptr(), C.data_ptr(), o2.data_ptr(), M, OC, IC, int(kbits),
+               ldo, int(col0), torch.cuda.current_stream().cuda_stream)
 
 
-@escha_linear.register_fake
-def _(x, code, rin, rout, s_in, s_out, kbits):
-    return torch.empty((*x.shape[:-1], code.shape[1] * _TILE), device=x.device,
-                       dtype=torch.bfloat16)
+@escha_linear_into.register_fake
+def _(out, x, code, rin, rout, s_in, s_out, kbits, col0):
+    return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -444,11 +439,17 @@ def _linear_method_cls():
             layer.escha_raw = None
 
         def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
-            outs = [torch.ops.radiance.escha_linear(
-                        x, layer.escha_code[i], layer.escha_rin[i], layer.escha_rout[i],
-                        layer.escha_s_in[i], layer.escha_s_out[i], layer.escha_kbits[i])
-                    for i in range(len(layer.escha_code))]
-            out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
+            # One buffer for the whole layer; each shard writes its own columns. A merged module
+            # is several coded tensors (gate K=2 and up K=3 cannot share a GEMM), and cat-ing
+            # their outputs afterwards is a full output-sized copy per layer.
+            out = torch.empty((*x.shape[:-1], layer.escha_oc_total), device=x.device,
+                              dtype=torch.bfloat16)
+            col = 0
+            for i in range(len(layer.escha_code)):
+                torch.ops.radiance.escha_linear_into(
+                    out, x, layer.escha_code[i], layer.escha_rin[i], layer.escha_rout[i],
+                    layer.escha_s_in[i], layer.escha_s_out[i], layer.escha_kbits[i], col)
+                col += layer.escha_code[i].shape[1] * _TILE
             if bias is not None:
                 out = out + bias
             return out

@@ -72,7 +72,7 @@ int main() {
       else        hipLaunchKernelGGL((escha_gemm_prefill<2, 3, 8>), g, b, 0, 0, dA, dW, dAs, dC, M, OC, IC);
     }
     hipLaunchKernelGGL(escha_post_rot, dim3((OC + ESCHA_HAD * ESCHA_ACT_WAVES - 1) / (ESCHA_HAD * ESCHA_ACT_WAVES), M),
-                       dim3(ESCHA_ACT_THREADS), 0, 0, dC, dRout, dSout, dY, M, OC);
+                       dim3(ESCHA_ACT_THREADS), 0, 0, dC, dRout, dSout, dY, M, OC, OC, 0);
     HIP_CHECK(hipDeviceSynchronize());
 
     std::vector<unsigned short> got((size_t)M * OC);

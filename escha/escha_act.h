@@ -125,9 +125,14 @@ __global__ __launch_bounds__(ESCHA_ACT_THREADS) void escha_pre_quant(
 
 // y [M, OC] bf16 (per-token scale already applied by the GEMM epilogue)
 //   -> Had128 -> * rout -> * s_out. Single pass: no scale to discover, so no barrier at all.
+// `ldo`/`col0` let a shard write straight into its slice of the layer's final output. A merged
+// module runs one chain per source tensor (gate is K=2, up is K=3, and their rin differ), and
+// concatenating the per-shard results afterwards costs a full output-sized read plus write --
+// 570 MB of traffic on gate_up at M=8192. Writing in place removes it entirely.
 __global__ __launch_bounds__(ESCHA_ACT_THREADS) void escha_post_rot(
     const __bf16 *__restrict__ y, const __half *__restrict__ rout,
-    const float *__restrict__ s_out, __bf16 *__restrict__ out, int M, int OC) {
+    const float *__restrict__ s_out, __bf16 *__restrict__ out, int M, int OC,
+    int ldo, int col0) {
   const int m = blockIdx.y, wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int blk = blockIdx.x * ESCHA_ACT_WAVES + wave;
   const int base = blk * ESCHA_HAD + lane * 4;
@@ -137,7 +142,7 @@ __global__ __launch_bounds__(ESCHA_ACT_THREADS) void escha_post_rot(
 #pragma unroll
   for (int r = 0; r < 4; ++r) v[r] = (float)yr[base + r];
   escha_fwht128_x4(v, lane);
-  __bf16 *__restrict__ o = out + (size_t)m * OC;
+  __bf16 *__restrict__ o = out + (size_t)m * ldo + col0;
 #pragma unroll
   for (int r = 0; r < 4; ++r)
     o[base + r] = (__bf16)(v[r] * (float)rout[base + r] * s_out[base + r]);

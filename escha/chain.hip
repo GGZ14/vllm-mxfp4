@@ -57,7 +57,7 @@ int main() {
         T(b[0], hipLaunchKernelGGL(escha_pre_amax, preg, blk, 0, 0, dX, dSin, dRin, dAmax, M, K));
         T(b[1], hipLaunchKernelGGL(escha_pre_quant, preg, blk, 0, 0, dX, dSin, dRin, dAmax, dA, dAs, M, K));
         T(b[2], GEMM);
-        T(b[3], hipLaunchKernelGGL(escha_post_rot, postg, blk, 0, 0, dC, dRout, dSout, dY, M, N));
+        T(b[3], hipLaunchKernelGGL(escha_post_rot, postg, blk, 0, 0, dC, dRout, dSout, dY, M, N, N, 0));
       }
 #undef T
 #undef GEMM
