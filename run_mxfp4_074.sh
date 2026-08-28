@@ -142,16 +142,25 @@ DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
 if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
 # The tuned drafter stack. The right default is NOT the same for both methods:
 #   mtp    -- 1. The 2-bit draft head with an exact rerank is a straight win here (+6.5% decode).
-#   dflash -- 0. FAST_DRAFT=1 CRASHES this drafter at load with an IndexError inside vLLM's
-#             rocm_unquantized_gemm_impl, so the int2 head and the int4 dflash weight path are both
-#             untested under dflash. Defaulting to 1 here meant `SPEC_METHOD=dflash ./run...` did
-#             not boot at all unless you already knew to pass FAST_DRAFT=0.
-if [ "$SPEC_METHOD" = dflash ]; then FAST_DRAFT=${FAST_DRAFT:-0}; else FAST_DRAFT=${FAST_DRAFT:-1}; fi
-if [ "$SPEC_METHOD" = dflash ] && [ "$FAST_DRAFT" != 0 ]; then
-  echo "[run] WARNING: FAST_DRAFT=$FAST_DRAFT with SPEC_METHOD=dflash is known to fail at load" >&2
-  echo "[run]          (IndexError in rocm_unquantized_gemm_impl). Set FAST_DRAFT=0 unless you are" >&2
-  echo "[run]          deliberately retesting that path." >&2
-fi
+#   dflash -- 1 as of 2026-08-27, WITH RERANK=64 (below). It used to be 0: FAST_DRAFT=1 crashed
+#             this drafter at load with an IndexError in vLLM's rocm_unquantized_gemm_impl. That
+#             was radiance_w4 freeing `layer.weight` to torch.empty(0) and DFlash2's fused
+#             context-KV precompute then slicing it -- `k = weight.shape[1]` on a 1-D tensor. It no
+#             longer fires because the pinned libr4d (b9e42ab) ships no w4a16 gemm_nt kernel, so
+#             radiance_w4 disables itself and only the int2 head arms. IF LIBR4D IS EVER REBUILT
+#             WITH r4d_gemm_w4a16_nt_m64, that crash path comes back and needs a guard in
+#             patch_dflash_mxfp4_kv.py for a converted (0-element) weight.
+#             Measured, ctx 0, 3 reps, interleaved A/B/A/B, dup-8gram 0.0% throughout:
+#               bf16 head        30.13 ms/step | acc/draft 1.904 |  96.4 tok/s
+#               int2 R=32        28.43         | acc/draft 1.804 |  98.6   (-5.3% acceptance)
+#               int2 R=64        28.66         | acc/draft 1.904 | 101.3   (+5.1%)
+if [ "$SPEC_METHOD" = dflash ]; then FAST_DRAFT=${FAST_DRAFT:-1}; else FAST_DRAFT=${FAST_DRAFT:-1}; fi
+# Rerank width. RADIANCE_DRAFT_RERANK caps the candidate pool a TOP-K caller can draw from, because
+# _radiance_topk_only blanks everything the rerank did not touch. mtp asks the head for an argmax
+# and 32 is ample; DFlash2 asks for selector_top_k=16 and 32 costs 5.3% of acceptance. 64 restores
+# it EXACTLY to the bf16 head's 1.904 for +0.23 ms, and 128/256 measure identical -- so the pool
+# saturates at 4x K, and this is a ceiling to raise with selector_top_k, not a free parameter.
+if [ "$SPEC_METHOD" = dflash ]; then RADIANCE_DRAFT_RERANK=${RADIANCE_DRAFT_RERANK:-64}; fi
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
@@ -283,7 +292,7 @@ AR_MAX_KB=$(( (CHUNK * 5120 * 2) / 1024 + 4096 ))
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
-echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL cache=$CACHE"
+echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL cache=$CACHE"
 
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
@@ -299,6 +308,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_PRESHUFFLE="${RADIANCE_PRESHUFFLE:-1}" -e RADIANCE_FUSE_RMS_QUANT="${RADIANCE_FUSE_RMS_QUANT:-1}" \
   -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_MXFP4_W4A8_MIN_M="$MIN_M" \
   -e RADIANCE_FAST_DRAFT="$FAST_DRAFT" -e RADIANCE_DRAFT_TAU="${RADIANCE_DRAFT_TAU:-0.20}" \
+  -e RADIANCE_DRAFT_RERANK="${RADIANCE_DRAFT_RERANK:-32}" \
   -e RADIANCE_MXFP4_DEBUG="${RADIANCE_MXFP4_DEBUG:-0}" \
   -e RADIANCE_MXFP4_PUREQUANT="${RADIANCE_MXFP4_PUREQUANT:-0}" \
   -e RADIANCE_MXFP4_SYNC="${RADIANCE_MXFP4_SYNC:-0}" \
@@ -351,7 +361,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py "$SP"/
+    # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
+    # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
+    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --

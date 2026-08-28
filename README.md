@@ -236,11 +236,20 @@ underfilled, while this kernel keeps split-K. GSM8K also ran **14% faster wall**
 on slightly *more* generated tokens.
 
 `run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `MIN_M` (0),
-`RADIANCE_MXFP4_DECODE_MAX_M` (64), `CHUNK` (8192), `GPU_UTIL` (0.98), and two whose default is
+`RADIANCE_MXFP4_DECODE_MAX_M` (64), `CHUNK` (8192), `GPU_UTIL` (0.98), and three whose default is
 keyed to `SPEC_METHOD`:
 
-* `FAST_DRAFT` -- **1 under mtp** (the int2 draft head, +6.5% decode), **0 under dflash**, where
-  setting it crashes the drafter at load with an `IndexError` in `rocm_unquantized_gemm_impl`.
+* `FAST_DRAFT` -- **1 under both** (the int2 draft head): +6.5% decode under mtp, +5.1% under
+  dflash. It was 0 under dflash until 2026-08-27, when it crashed the drafter at load with an
+  `IndexError` in `rocm_unquantized_gemm_impl` -- radiance_w4 frees `layer.weight` to
+  `torch.empty(0)` and DFlash2's fused context-KV precompute then slices it. That path is dormant
+  only because the pinned libr4d ships no `w4a16 gemm_nt` kernel, so radiance_w4 disables itself;
+  rebuilding libr4d with `r4d_gemm_w4a16_nt_m64` brings the crash back.
+* `RADIANCE_DRAFT_RERANK` -- **32 under mtp, 64 under dflash**. It is the size of the candidate
+  pool a top-k caller can draw from, not just a rescoring budget: `_radiance_topk_only` blanks
+  every entry the rerank did not touch. mtp wants an argmax and 32 is ample; DFlash2 asks for
+  `selector_top_k`=16 and 32 costs 5.3% of acceptance (acc/draft 1.904 -> 1.804). 64 restores it
+  exactly, for +0.23 ms/step; 128 and 256 measure identical. Raise it with `selector_top_k`.
 * `SPEC` -- **4 under mtp** (measurably better than 6 and 8 here), **7 under dflash** (the peak;
   5/6/8 measure 91.2/95.5/88.9 tok/s against 101.3).
 
