@@ -252,6 +252,15 @@ keyed to `SPEC_METHOD`:
   exactly, for +0.23 ms/step; 128 and 256 measure identical. Raise it with `selector_top_k`.
 * `SPEC` -- **4 under mtp** (measurably better than 6 and 8 here), **7 under dflash** (the peak;
   5/6/8 measure 91.2/95.5/88.9 tok/s against 101.3).
+* `RADIANCE_VERIFY_HEAD` -- **1 under dflash**, 0 under mtp. The int2 head applied to the TARGET's
+  verify `lm_head`, which the decode profile shows as one 2.02 ms bf16 GEMM per step, 5.9% of wall.
+  It reuses the drafter's int2 packing, so it costs no extra VRAM. BetterBench single pass: combined
+  decode 170.0 -> 174.9 t/s (+2.9%), all eight categories +2.7 to +3.4%, conc 1/2/4 +2.8/+2.5/+1.6%,
+  conc 8 neutral (48-request, 3-rep re-measurement: 499.6 -> 505.3, overlapping), prefill unchanged.
+  Output-equivalent on everything measured: GSM8K 500q greedy identical (486/500 both), 8/8 greedy
+  completions byte-identical, 24/24 seeded SAMPLED completions byte-identical at the serve's own
+  temperature 0.7 / top_p 0.95 / top_k 20. Per step it falls back to the exact bf16 head unless every
+  request is greedy or has `top_k <= RERANK/4` with `min_p` 0, and none asks for logprobs or grammar.
 
 `IMAGE` and `CACHE` default to `0.9.3` / `.radiance-cache-w4a8-093` and must move together --
 cache dirs validate on model + torch/Triton version and must not be shared across configurations.
