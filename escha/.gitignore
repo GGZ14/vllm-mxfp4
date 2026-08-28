@@ -1,0 +1,8 @@
+# Generated from the checkpoint by gen_*.py; large and re-creatable.
+*.bin
+*.log
+# Generated head-to-head header: a stripped copy of ../radiance_mxfp4_fp8.hip, rebuilt by bench.hip's
+# recipe rather than checked in twice.
+mxfp4_kernels.h
+isadump.*
+*.so

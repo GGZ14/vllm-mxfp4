@@ -1,6 +1,10 @@
 #!/bin/bash
-# EVALUATION (not production): native MXFP4 body on gfx1201 with the MTP drafter in FP8,
-# on radiance 0.7.4 (libr4d).
+# PRODUCTION launcher: native MXFP4 body on gfx1201 with an FP8 drafter, on radiance 0.9.3 (libr4d).
+#
+# The name still says 074 because that is what the file was called when it targeted the 0.7.4 image;
+# the defaults below track production and are what actually decide which server you get. The script
+# began as an evaluation harness for 0.7.4 and became the thing that starts the real server, which
+# is how its defaults came to lag two image versions behind what they launch.
 #
 # The 0.5.8 form of this run is run_mxfp4_minm.sh, kept as-is because it is the only way to
 # reproduce the baseline these numbers are measured against:
@@ -94,13 +98,15 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.7.4}
+# Image and cache MUST move together: cache dirs validate on model + torch/Triton version and must
+# not be shared across configurations. Both defaulted to 0.7.4 / -074 long after production moved to
+# 0.9.3 / -093, so anyone taking the defaults got a DIFFERENT server than the one being measured.
+IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 NAME=${NAME:-vllmmxfp4074}
 PORT=${PORT:-8080}
 CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-1}
-FAST_DRAFT=${FAST_DRAFT:-1}
-CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-074}
+CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
@@ -116,6 +122,10 @@ GPU_UTIL=${GPU_UTIL:-0.98}
 #             pass. Depth is fixed when its CUDA graph is captured, so DYNAMIC_DRAFT is inert and
 #             num_speculative_tokens becomes a real tuning knob again.
 SPEC_METHOD=${SPEC_METHOD:-mtp}
+# MODELS is bind-mounted at /models below, so SNAP and DRAFTER must live somewhere under it.
+# Resolved HERE rather than next to SNAP further down: DRAFTER's default dereferences it, and under
+# `set -u` that made an un-exported MODELS an "unbound variable" abort rather than a default.
+MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 # Drafter checkpoint for SPEC_METHOD=dflash. Must live under MODELS -- only MODELS is mounted.
 DRAFTER=${DRAFTER:-$MODELS/Qwen3.8-27B-DFlash2-FP8}
 # The drafter's own attention backend. It has to support FULL cuda graphs or vLLM logs "running the
@@ -130,6 +140,38 @@ DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
 #   ~0.10 by the seventh, so 7 is the documented starting point -- but each extra position widens
 #   BOTH the draft pass and the target's verify, so sweep it.
 if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
+# The tuned drafter stack. The right default is NOT the same for both methods:
+#   mtp    -- 1. The 2-bit draft head with an exact rerank is a straight win here (+6.5% decode).
+#   dflash -- 1 as of 2026-08-27, WITH RERANK=64 (below). It used to be 0: FAST_DRAFT=1 crashed
+#             this drafter at load with an IndexError in vLLM's rocm_unquantized_gemm_impl. That
+#             was radiance_w4 freeing `layer.weight` to torch.empty(0) and DFlash2's fused
+#             context-KV precompute then slicing it -- `k = weight.shape[1]` on a 1-D tensor. It no
+#             longer fires because the pinned libr4d (b9e42ab) ships no w4a16 gemm_nt kernel, so
+#             radiance_w4 disables itself and only the int2 head arms. IF LIBR4D IS EVER REBUILT
+#             WITH r4d_gemm_w4a16_nt_m64, that crash path comes back and needs a guard in
+#             patch_dflash_mxfp4_kv.py for a converted (0-element) weight.
+#             Measured, ctx 0, 3 reps, interleaved A/B/A/B, dup-8gram 0.0% throughout:
+#               bf16 head        30.13 ms/step | acc/draft 1.904 |  96.4 tok/s
+#               int2 R=32        28.43         | acc/draft 1.804 |  98.6   (-5.3% acceptance)
+#               int2 R=64        28.66         | acc/draft 1.904 | 101.3   (+5.1%)
+if [ "$SPEC_METHOD" = dflash ]; then FAST_DRAFT=${FAST_DRAFT:-1}; else FAST_DRAFT=${FAST_DRAFT:-1}; fi
+# Rerank width. RADIANCE_DRAFT_RERANK caps the candidate pool a TOP-K caller can draw from, because
+# _radiance_topk_only blanks everything the rerank did not touch. mtp asks the head for an argmax
+# and 32 is ample; DFlash2 asks for selector_top_k=16 and 32 costs 5.3% of acceptance. 64 restores
+# it EXACTLY to the bf16 head's 1.904 for +0.23 ms, and 128/256 measure identical -- so the pool
+# saturates at 4x K, and this is a ceiling to raise with selector_top_k, not a free parameter.
+# 80 rather than 64 under dflash: VERIFY_HEAD needs 4x the SAMPLER's top_k (20 here) as well as 4x
+# the drafter's selector_top_k (16). At 64 the verify gate rejects every sampled request and the
+# feature silently does nothing. The drafter is indifferent -- 64/128/256 measured identical.
+if [ "$SPEC_METHOD" = dflash ]; then RADIANCE_DRAFT_RERANK=${RADIANCE_DRAFT_RERANK:-80}; fi
+# int2 TARGET verify head. ON under dflash as of 2026-08-27: the profile shows the bf16 lm_head is
+# one 2.02 ms GEMM per step (5.9% of wall) and this reuses the drafter's int2 packing at zero extra
+# VRAM. BetterBench single pass, combined decode 170.0 -> 174.9 t/s (+2.9%) with all eight
+# categories +2.7 to +3.4%, conc 1/2/4 +2.8/+2.5/+1.6%, conc 8 neutral, prefill unchanged.
+# Output-equivalent on everything measured: GSM8K 500q greedy identical (486/500 both), 8/8 greedy
+# completions byte-identical, and 24/24 SEEDED SAMPLED completions byte-identical at the serve's own
+# temperature 0.7 / top_p 0.95 / top_k 20.
+if [ "$SPEC_METHOD" = dflash ]; then RADIANCE_VERIFY_HEAD=${RADIANCE_VERIFY_HEAD:-1}; fi
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
@@ -194,8 +236,6 @@ MIN_M=${MIN_M:-0}
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
 
-# MODELS is bind-mounted at /models below, so SNAP must live somewhere under it.
-MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
 # -f follows symlinks, so a checkpoint assembled as a symlink farm into the HF cache fails
 # this test on the HOST even though it resolves fine in the container, where the cache is
@@ -263,7 +303,7 @@ AR_MAX_KB=$(( (CHUNK * 5120 * 2) / 1024 + 4096 ))
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
-echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL cache=$CACHE"
+echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL cache=$CACHE"
 
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
@@ -279,6 +319,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_PRESHUFFLE="${RADIANCE_PRESHUFFLE:-1}" -e RADIANCE_FUSE_RMS_QUANT="${RADIANCE_FUSE_RMS_QUANT:-1}" \
   -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_MXFP4_W4A8_MIN_M="$MIN_M" \
   -e RADIANCE_FAST_DRAFT="$FAST_DRAFT" -e RADIANCE_DRAFT_TAU="${RADIANCE_DRAFT_TAU:-0.20}" \
+  -e RADIANCE_DRAFT_RERANK="${RADIANCE_DRAFT_RERANK:-32}" \
+  -e RADIANCE_VERIFY_HEAD="${RADIANCE_VERIFY_HEAD:-0}" \
+  -e RADIANCE_VERIFY_HEAD_MAX_M="${RADIANCE_VERIFY_HEAD_MAX_M:-32}" \
   -e RADIANCE_MXFP4_DEBUG="${RADIANCE_MXFP4_DEBUG:-0}" \
   -e RADIANCE_MXFP4_PUREQUANT="${RADIANCE_MXFP4_PUREQUANT:-0}" \
   -e RADIANCE_MXFP4_SYNC="${RADIANCE_MXFP4_SYNC:-0}" \
@@ -302,6 +345,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_KERNEL_N="${RADIANCE_MXFP4_KERNEL_N:-}" \
   -e RADIANCE_MXFP4_KERNEL_NK="${RADIANCE_MXFP4_KERNEL_NK:-}" \
   -e RADIANCE_MXFP4_CHECKALL="${RADIANCE_MXFP4_CHECKALL:-}" \
+  -e RADIANCE_MXFP4_MHIST="${RADIANCE_MXFP4_MHIST:-0}" \
+  -e RADIANCE_MXFP4_DECODE_KS="${RADIANCE_MXFP4_DECODE_KS:-}" \
+  -e RADIANCE_MXFP4_DECODE_BK="${RADIANCE_MXFP4_DECODE_BK:-}" \
   -e RADIANCE_MXFP4_CHECK_MAX_M="${RADIANCE_MXFP4_CHECK_MAX_M:-128}" \
   -e RADIANCE_MXFP4_PERBLOCK_NK="${RADIANCE_MXFP4_PERBLOCK_NK:-}" \
   -e RADIANCE_MXFP4_REFLINEAR="${RADIANCE_MXFP4_REFLINEAR:-0}" \
@@ -324,11 +370,15 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_dflash_calib.py
     python3 patch_dflash_mxfp4_kv.py
     python3 patch_rmsquant_fusion.py
+    python3 patch_verify_head.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py "$SP"/
+    # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
+    # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
+    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
+       radiance_verifyhead.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --

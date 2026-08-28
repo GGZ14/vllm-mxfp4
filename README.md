@@ -235,10 +235,37 @@ Batched gains most because at M=20-40 aiter's tuned band uses `NUM_KSPLIT=1`, wh
 underfilled, while this kernel keeps split-K. GSM8K also ran **14% faster wall** (375.5s -> 322.7s)
 on slightly *more* generated tokens.
 
-`run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `FAST_DRAFT`
-(default 1, the int2 draft head, +6.5% decode), `MIN_M` (0), `RADIANCE_MXFP4_DECODE_MAX_M` (48),
-`SPEC` (4 -- measurably better than 6 and 8 here, re-confirmed on this build), `CHUNK` (8192),
-`GPU_UTIL` (0.98).
+`run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `MIN_M` (0),
+`RADIANCE_MXFP4_DECODE_MAX_M` (64), `CHUNK` (8192), `GPU_UTIL` (0.98), and three whose default is
+keyed to `SPEC_METHOD`:
+
+* `FAST_DRAFT` -- **1 under both** (the int2 draft head): +6.5% decode under mtp, +5.1% under
+  dflash. It was 0 under dflash until 2026-08-27, when it crashed the drafter at load with an
+  `IndexError` in `rocm_unquantized_gemm_impl` -- radiance_w4 frees `layer.weight` to
+  `torch.empty(0)` and DFlash2's fused context-KV precompute then slices it. That path is dormant
+  only because the pinned libr4d ships no `w4a16 gemm_nt` kernel, so radiance_w4 disables itself;
+  rebuilding libr4d with `r4d_gemm_w4a16_nt_m64` brings the crash back.
+* `RADIANCE_DRAFT_RERANK` -- **32 under mtp, 64 under dflash**. It is the size of the candidate
+  pool a top-k caller can draw from, not just a rescoring budget: `_radiance_topk_only` blanks
+  every entry the rerank did not touch. mtp wants an argmax and 32 is ample; DFlash2 asks for
+  `selector_top_k`=16 and 32 costs 5.3% of acceptance (acc/draft 1.904 -> 1.804). 64 restores it
+  exactly, for +0.23 ms/step; 128 and 256 measure identical. Raise it with `selector_top_k`.
+* `SPEC` -- **4 under mtp** (measurably better than 6 and 8 here), **7 under dflash** (the peak;
+  5/6/8 measure 91.2/95.5/88.9 tok/s against 101.3).
+* `RADIANCE_VERIFY_HEAD` -- **1 under dflash**, 0 under mtp. The int2 head applied to the TARGET's
+  verify `lm_head`, which the decode profile shows as one 2.02 ms bf16 GEMM per step, 5.9% of wall.
+  It reuses the drafter's int2 packing, so it costs no extra VRAM. BetterBench single pass: combined
+  decode 170.0 -> 174.9 t/s (+2.9%), all eight categories +2.7 to +3.4%, conc 1/2/4 +2.8/+2.5/+1.6%,
+  conc 8 neutral (48-request, 3-rep re-measurement: 499.6 -> 505.3, overlapping), prefill unchanged.
+  Output-equivalent on everything measured: GSM8K 500q greedy identical (486/500 both), 8/8 greedy
+  completions byte-identical, 24/24 seeded SAMPLED completions byte-identical at the serve's own
+  temperature 0.7 / top_p 0.95 / top_k 20. Per step it falls back to the exact bf16 head unless every
+  request is greedy or has `top_k <= RERANK/4` with `min_p` 0, and none asks for logprobs or grammar.
+
+`IMAGE` and `CACHE` default to `0.9.3` / `.radiance-cache-w4a8-093` and must move together --
+cache dirs validate on model + torch/Triton version and must not be shared across configurations.
+`SPEC_METHOD` still defaults to `mtp`, so production is
+`MODELS=$HOME/models SPEC_METHOD=dflash ./run_mxfp4_074.sh`.
 
 ### The gated-delta-net NaN (fixed upstream)
 
