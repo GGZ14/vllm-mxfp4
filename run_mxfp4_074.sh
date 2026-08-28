@@ -37,11 +37,16 @@
 #   - RADIANCE_AR_MAX_KB is restored by patch_ar_maxbytes.py. Upstream hardcoded it at 48 MB,
 #     sized for its 4096-token chunk; at CHUNK=8192 the message is 80 MiB and every prefill
 #     reduction would silently fall back to RCCL. See that patch's docstring for the measurement.
-#   - --kv-cache-memory is NOT set. The 0.5.8 value (19105177314) was read off a 0.5.8 startup log
-#     and 0.7.4 has a different non-torch footprint (r4d scratch, a differently sized AR buffer).
-#     Re-derive it from vLLM's own "fit into requested memory" line in THIS build's log, taking the
-#     SMALLER of the two ranks -- TP0 carries more non-torch memory, and one value applies to both,
-#     so using TP1's number OOMs TP0.
+#   - --kv-cache-memory IS set now, to 18563072000 (17.29 GiB), but only when GPU_UTIL is the
+#     throughput default. Do NOT re-derive it from vLLM's "fit into requested memory" line: that
+#     number is computed against the GPU_UTIL budget (0.98 x 31.86 = 31.22 GiB), not against the
+#     card, and on 0.9.3 it suggests 15.47-15.61 GiB while the profiled run is already using 16.37
+#     and fits. Derive it from the card instead -- `rocm-smi --showmeminfo vram` INSIDE the
+#     container, under an 8-way 8192-chunk load, then hand KV everything but ~0.3 GiB. Measured:
+#     profiled 0.98 peaks at 30.64 of 31.86 GiB and the free 1.22 GiB stays free under load (KV is
+#     pre-allocated and the activation pool is reserved at profiling time), so 17.29 GiB peaks at
+#     31.57 with 0.29 free. Worth 892,799 -> 943,581 tokens. Re-derive after anything that moves
+#     weights, cudagraph sizes or CHUNK; getting it wrong OOMs at startup, not under load.
 #   - the chat template is deliberately unchanged for the parity run. Upstream re-derived
 #     qwen3.8-enhanced.jinja against the released official template (it was rendering booleans as
 #     True/False via `| string`); adopting that is a separate change, and doing it here would
@@ -115,6 +120,13 @@ CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093}
 # 31.54 GiB and fails at startup. 0.98 gives 857,399 KV tokens against 840,019 at 0.97 and
 # survives a full 260k-prefill sweep with no OOM.
 GPU_UTIL=${GPU_UTIL:-0.98}
+# Explicit KV cache size, which OVERRIDES GPU_UTIL and skips vLLM's memory profiling. Defaulted
+# only for the throughput GPU_UTIL, because the ppl.py prompt_logprobs transient above is exactly
+# what this eats: with KV pinned, GPU_UTIL=0.75 would no longer buy the headroom it exists to buy.
+# KV_MEM=0 forces profiling back on. See the --kv-cache-memory note in the header for re-deriving.
+KV_MEM=${KV_MEM:-}
+if [ -z "$KV_MEM" ] && [ "$GPU_UTIL" = "0.98" ]; then KV_MEM=18563072000; fi
+if [ "$KV_MEM" = "0" ]; then KV_MEM=""; fi
 # Which drafter to speculate with.
 #   mtp    -- the multi-token-prediction head inside the target checkpoint. One draft forward per
 #             speculative position, so RADIANCE_DYNAMIC_DRAFT can stop the loop early.
@@ -303,7 +315,7 @@ AR_MAX_KB=$(( (CHUNK * 5120 * 2) / 1024 + 4096 ))
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
-echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL cache=$CACHE"
+echo "[run] image=$IMAGE attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-profiled} cache=$CACHE"
 
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
@@ -371,6 +383,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_dflash_mxfp4_kv.py
     python3 patch_rmsquant_fusion.py
     python3 patch_verify_head.py
+    python3 patch_kv_group_size.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
@@ -398,6 +411,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     "$CSNAP" --served-model-name Qwen3.8 Qwen3.6 Qwen3.8-MXFP4 --host 0.0.0.0 --port "$PORT" \
     --kv-cache-dtype fp8 --tensor-parallel-size 2 \
     --gpu-memory-utilization "$GPU_UTIL" \
+    ${KV_MEM:+--kv-cache-memory "$KV_MEM"} \
     --max-model-len "$MAXLEN" --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "$SPEC_CFG" \
