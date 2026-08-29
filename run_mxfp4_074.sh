@@ -290,6 +290,19 @@ MIN_M=${MIN_M:-0}
 # mxfp4 quantization squashes NaN to a finite code. RADIANCE_MXFP4_SANITIZE (default 1) fixes it.
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
+# Cudagraph capture sizes; empty/none = vLLM's default list ([1,2,4] + multiples of 8).
+# Finer sizes (3,5,6,7,10,12,14) were tried 2026-08-29 to un-pad dynamic-width single streams and
+# measured NEUTRAL (181.3 vs 184.7 weighted, inside noise): the decode-band GEMMs are
+# weight-stream-bound and nearly M-invariant below M~16 (tier7: gate_up 88.5 us at M=5 vs 88.7
+# at M=8), so there was no single-stream width cost hiding behind the padding to recover --
+# dynamic width's value is batching, where M crosses real cost and split-K boundaries. The knob
+# stays for capture experiments; the default stays stock. SPEC=8 + dynamic width was measured in
+# the same session: single-stream 184.9 (even), conc-8 405-427 vs 444-461 (LOSES -- cold-start
+# batches run full width into the M=72>64 kernel cliff before the EMAs settle). 7 stays.
+CAPTURE_SIZES=${CAPTURE_SIZES:-none}
+if [ -n "$CAPTURE_SIZES" ] && [ "$CAPTURE_SIZES" != none ]; then
+  EXTRA="$EXTRA --compilation-config {\"cudagraph_capture_sizes\":$CAPTURE_SIZES}"
+fi
 # PROFILE_DIR=1 arms the torch profiler (vLLM 0.27 moved it from VLLM_TORCH_PROFILER_DIR to CLI
 # flags); traces land in $CACHE/prof, driven by POST /start_profile and /stop_profile.
 if [ -n "${PROFILE_DIR:-}" ]; then
