@@ -224,11 +224,13 @@ R4D_SO=${R4D_SO:-}
 # setting R4D_SO by hand still wins, so an existing checkout is never rebuilt behind your back.
 R4D_PIN=${R4D_PIN:-b9e42ab}
 R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
-# r4d_fp8_attn.patch adds the opt-in 8-bit prefill attention legs (R4D_ATTN_FP8 below) on top of
-# the pinned libr4d; the build cache key carries the suffix so patched and stock builds coexist.
-R4D_PATCH="$SCRIPT_DIR/r4d_fp8_attn.patch"
+# r4d_radiance_extras.patch carries this repo's libr4d additions on top of the pinned commit:
+# the 8-bit prefill attention legs (R4D_ATTN_FP8) and the fused GDN decode step
+# (RADIANCE_GDN_FUSED_UPDATE). The build cache key carries a suffix so patched and stock builds
+# coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
+R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-fp8attn"; fi
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx1"; fi
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -382,6 +384,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
+  -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \
   ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
   -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
   -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \

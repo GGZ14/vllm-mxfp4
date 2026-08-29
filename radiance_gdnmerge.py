@@ -126,6 +126,11 @@ def merge_model(model) -> None:
         radiance_aroverlap.install(model)
     except Exception as e:                          # noqa: BLE001
         _log(f"aroverlap install failed, serving without it: {e!r}")
+    try:
+        import radiance_gdn
+        radiance_gdn.init_fused_counter()           # before any CUDA-graph capture
+    except Exception as e:                          # noqa: BLE001
+        _log(f"gdn fused counter init failed: {e!r}")
     if not ENABLED:
         return
     # Fragment order (RADIANCE_MXFP4_WPERM=1) is fine to merge: permute_w is tile-local along N
