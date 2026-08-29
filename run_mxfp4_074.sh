@@ -176,6 +176,14 @@ DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
 #   better setting for prose-heavy or batch-throughput serving (conc-8 562 vs 544 aggregate);
 #   8 falls off DEC_MAX_TM at conc 8 (M=72>64, -25%). Tune acceptance-coupled knobs on the
 #   weighted mix, not on a single content class.
+#
+#   RADIANCE_DYNAMIC_WIDTH (patch_dynwidth.py, default ON) mostly dissolves this trade: the
+#   scheduler caps each request's VERIFY width from a per-request acceptance EMA (the DFlash2
+#   draft pass is one fixed-cost graphed block either way), so prose sequences verify ~4 wide
+#   while code keeps the full depth. Measured at base SPEC=7: weighted single-stream unchanged
+#   (184.7 vs 184.3) with code tok/update intact, and conc-8 recovers static SPEC=5's batch
+#   efficiency (steps 52-57 -> 46-47 ms, aggregate 391-413 -> 444-461 t/s). Lossless by
+#   construction -- verification preserves the distribution at any proposal length.
 if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
 # The tuned drafter stack. The right default is NOT the same for both methods:
 #   mtp    -- 1. The 2-bit draft head with an exact rerank is a straight win here (+6.5% decode).
@@ -282,6 +290,19 @@ MIN_M=${MIN_M:-0}
 # mxfp4 quantization squashes NaN to a finite code. RADIANCE_MXFP4_SANITIZE (default 1) fixes it.
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
+# Cudagraph capture sizes; empty/none = vLLM's default list ([1,2,4] + multiples of 8).
+# Finer sizes (3,5,6,7,10,12,14) were tried 2026-08-29 to un-pad dynamic-width single streams and
+# measured NEUTRAL (181.3 vs 184.7 weighted, inside noise): the decode-band GEMMs are
+# weight-stream-bound and nearly M-invariant below M~16 (tier7: gate_up 88.5 us at M=5 vs 88.7
+# at M=8), so there was no single-stream width cost hiding behind the padding to recover --
+# dynamic width's value is batching, where M crosses real cost and split-K boundaries. The knob
+# stays for capture experiments; the default stays stock. SPEC=8 + dynamic width was measured in
+# the same session: single-stream 184.9 (even), conc-8 405-427 vs 444-461 (LOSES -- cold-start
+# batches run full width into the M=72>64 kernel cliff before the EMAs settle). 7 stays.
+CAPTURE_SIZES=${CAPTURE_SIZES:-none}
+if [ -n "$CAPTURE_SIZES" ] && [ "$CAPTURE_SIZES" != none ]; then
+  EXTRA="$EXTRA --compilation-config {\"cudagraph_capture_sizes\":$CAPTURE_SIZES}"
+fi
 # PROFILE_DIR=1 arms the torch profiler (vLLM 0.27 moved it from VLLM_TORCH_PROFILER_DIR to CLI
 # flags); traces land in $CACHE/prof, driven by POST /start_profile and /stop_profile.
 if [ -n "${PROFILE_DIR:-}" ]; then
@@ -387,6 +408,11 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
   -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \
+  -e RADIANCE_DYNAMIC_WIDTH="${RADIANCE_DYNAMIC_WIDTH:-1}" \
+  -e RADIANCE_DYNW_ALPHA="${RADIANCE_DYNW_ALPHA:-0.35}" \
+  -e RADIANCE_DYNW_MARGIN="${RADIANCE_DYNW_MARGIN:-2}" \
+  -e RADIANCE_DYNW_MIN="${RADIANCE_DYNW_MIN:-2}" \
+  -e RADIANCE_DYNW_MIN_BATCH="${RADIANCE_DYNW_MIN_BATCH:-3}" \
   ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
   -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
   -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \
@@ -433,6 +459,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_verify_head.py
     python3 patch_kv_group_size.py
     python3 patch_gdn_merge_inproj.py
+    python3 patch_dynwidth.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
