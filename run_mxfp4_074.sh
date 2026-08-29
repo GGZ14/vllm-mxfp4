@@ -143,7 +143,9 @@ GPU_UTIL=${GPU_UTIL:-0.98}
 # what this eats: with KV pinned, GPU_UTIL=0.75 would no longer buy the headroom it exists to buy.
 # KV_MEM=0 forces profiling back on. See the --kv-cache-memory note in the header for re-deriving.
 KV_MEM=${KV_MEM:-}
-if [ -z "$KV_MEM" ] && [ "$GPU_UTIL" = "0.98" ]; then KV_MEM=18563072000; fi
+# The KV pin was derived at max_num_seqs=8's capture sizes and activation peak; any other
+# MAXSEQS re-profiles instead (re-derive a pin per the header procedure if 16 becomes standing).
+if [ -z "$KV_MEM" ] && [ "$GPU_UTIL" = "0.98" ] && [ "${MAXSEQS:-8}" = "8" ]; then KV_MEM=18563072000; fi
 if [ "$KV_MEM" = "0" ]; then KV_MEM=""; fi
 # Which drafter to speculate with.
 #   mtp    -- the multi-token-prediction head inside the target checkpoint. One draft forward per
@@ -279,6 +281,12 @@ fi
 #
 # Set it absurdly high to route everything to aiter -- only useful for bisecting.
 MIN_M=${MIN_M:-0}
+# The decode-kernel band must cover MAXSEQS x (SPEC+1) rows or the biggest verify batches fall
+# onto the prefill tile: 64 covers the 8-stream default exactly (dflash SPEC=7 -> 8x8), 128
+# covers 16 streams. Defaulted from MAXSEQS so the 8-and-under band routes IDENTICALLY to today.
+if [ "${MAXSEQS:-8}" -gt 8 ]; then
+  RADIANCE_MXFP4_DECODE_MAX_M=${RADIANCE_MXFP4_DECODE_MAX_M:-128}
+fi
 
 # All 304 linear layers run on the W4A8 kernel. RADIANCE_MXFP4_KERNEL_NK / _PERBLOCK_NK remain as
 # shape-level bisect tools (N:K pairs) but are unset by default.
