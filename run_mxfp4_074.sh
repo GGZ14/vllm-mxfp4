@@ -123,7 +123,13 @@ R4D_ATTN=${R4D_ATTN:-1}
 GDN_MERGE=${RADIANCE_GDN_MERGE_INPROJ:-1}
 # AR/GEMM overlap (radiance_aroverlap.py) changes the traced graph too -- same cache rule.
 AR_OVERLAP=${RADIANCE_AR_OVERLAP:-0}
-CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$([ "$GDN_MERGE" = 1 ] && echo -gdnm)$([ "$AR_OVERLAP" = 1 ] && echo -arov)}
+# Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
+# test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
+# single line of output. It bit exactly when a flag was 0.
+CACHE_SUF=""
+if [ "$GDN_MERGE" = 1 ]; then CACHE_SUF="$CACHE_SUF-gdnm"; fi
+if [ "$AR_OVERLAP" = 1 ]; then CACHE_SUF="$CACHE_SUF-arov"; fi
+CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
