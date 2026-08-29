@@ -166,15 +166,17 @@ DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
 #   mtp: measured on this build, 4 beats 8 at decode -- 59.8/60.2 tok/s against 53.1/58.6, because
 #   acceptance falls (42.1% -> 33.7%) faster than the deeper drafts pay for themselves. The 0.5.8
 #   baseline also ran 4, so this keeps the comparison honest as well as fast.
-#   dflash: the drafter's block_size is 8, and upstream measures per-position acceptance down to
-#   ~0.10 by the seventh, so 7 was the documented starting point and shipped for a while. Re-swept
-#   2026-08-29 AFTER the step-time work (branchless staging, gdnmerge, fp8 attention): with a
-#   25 ms step the wide verify no longer pays for positions that accept at ~0.1. Measured, 3 reps
-#   x conc 1/4/8, two independent runs for the winner: SPEC 4 and 5 tie (conc-8 aggregate ~462 vs
-#   ~455 t/s, conc-1 ~115 both), 6 and 7 decline monotonically (7 is -8..-13% aggregate at every
-#   level, conc-8 step 52-57 ms vs 45-50), and 8 falls off DEC_MAX_TM at conc 8 (M=72>64, -25%).
-#   5 keeps the higher tokens/step ceiling on high-acceptance content at equal measurements.
-if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-5}; else SPEC=${SPEC:-4}; fi
+#   dflash: the drafter's block_size is 8; 7 is the shipped default and the depth is
+#   CONTENT-DEPENDENT, so mind the corpus before re-tuning it. The 2026-08-29 sweep on
+#   bench_decode_conc said 5 (+8-13% aggregate at every level) -- but that corpus asks for
+#   deliberately non-repetitive prose, which is exactly the low-acceptance content where shallow
+#   drafts win. On BetterBench's weighted mix (code 0.30), same build, back to back: SPEC=7
+#   combined decode 184.3 t/s vs SPEC=5's 159.4 (+15.6% for 7) -- code/json/file_edit run
+#   tok/update 4.7-6.0 at depth 7 and the cap at 5 truncates precisely that tail. 5 remains the
+#   better setting for prose-heavy or batch-throughput serving (conc-8 562 vs 544 aggregate);
+#   8 falls off DEC_MAX_TM at conc 8 (M=72>64, -25%). Tune acceptance-coupled knobs on the
+#   weighted mix, not on a single content class.
+if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
 # The tuned drafter stack. The right default is NOT the same for both methods:
 #   mtp    -- 1. The 2-bit draft head with an exact rerank is a straight win here (+6.5% decode).
 #   dflash -- 1 as of 2026-08-27, WITH RERANK=64 (below). It used to be 0: FAST_DRAFT=1 crashed
