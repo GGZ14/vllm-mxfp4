@@ -413,6 +413,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_DYNW_MARGIN="${RADIANCE_DYNW_MARGIN:-2}" \
   -e RADIANCE_DYNW_MIN="${RADIANCE_DYNW_MIN:-2}" \
   -e RADIANCE_DYNW_MIN_BATCH="${RADIANCE_DYNW_MIN_BATCH:-3}" \
+  -e RADIANCE_AR_QNB="${RADIANCE_AR_QNB:-96}" \
+  -e RADIANCE_AR_QNT="${RADIANCE_AR_QNT:-1024}" \
   ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
   -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
   -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \
@@ -460,6 +462,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_kv_group_size.py
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
+    python3 patch_ar_geometry.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
