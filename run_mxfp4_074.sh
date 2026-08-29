@@ -111,7 +111,25 @@ NAME=${NAME:-vllmmxfp4074}
 PORT=${PORT:-8080}
 CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-1}
-CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093}
+# GDN in_proj merge (radiance_gdnmerge.py): in_proj_qkvz + in_proj_ba as ONE GEMM, removing 96
+# GEMM launches and 48 activation quants per forward. Measured 2026-08-29: single-stream decode
+# 26.25 -> 25.50 ms/step (-2.9%), prefill unchanged, all 48 layers merge; stacks with WPERM=1
+# for 24.55 ms/step (-6.5%) at a 3% prefill cost. Output drift is split-K reassociation only
+# (merged N crosses a dks boundary), same class as the decode kernel's own M-dependent split;
+# gated with GSM8K 500q paired.  Resolved EARLY because the CACHE default is keyed on it:
+# the merge changes the traced graph, and reusing a cache dir compiled without it replays a
+# graph that still calls the two ORIGINAL projections -- whose weights the merge freed --
+# and the engine dies at startup on an N=0 GEMM.
+GDN_MERGE=${RADIANCE_GDN_MERGE_INPROJ:-1}
+# AR/GEMM overlap (radiance_aroverlap.py) changes the traced graph too -- same cache rule.
+AR_OVERLAP=${RADIANCE_AR_OVERLAP:-0}
+# Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
+# test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
+# single line of output. It bit exactly when a flag was 0.
+CACHE_SUF=""
+if [ "$GDN_MERGE" = 1 ]; then CACHE_SUF="$CACHE_SUF-gdnm"; fi
+if [ "$AR_OVERLAP" = 1 ]; then CACHE_SUF="$CACHE_SUF-arov"; fi
+CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
@@ -148,9 +166,16 @@ DRAFT_ATTN=${DRAFT_ATTN:-TRITON_ATTN}
 #   mtp: measured on this build, 4 beats 8 at decode -- 59.8/60.2 tok/s against 53.1/58.6, because
 #   acceptance falls (42.1% -> 33.7%) faster than the deeper drafts pay for themselves. The 0.5.8
 #   baseline also ran 4, so this keeps the comparison honest as well as fast.
-#   dflash: the drafter's block_size is 8, and upstream measures per-position acceptance down to
-#   ~0.10 by the seventh, so 7 is the documented starting point -- but each extra position widens
-#   BOTH the draft pass and the target's verify, so sweep it.
+#   dflash: the drafter's block_size is 8; 7 is the shipped default and the depth is
+#   CONTENT-DEPENDENT, so mind the corpus before re-tuning it. The 2026-08-29 sweep on
+#   bench_decode_conc said 5 (+8-13% aggregate at every level) -- but that corpus asks for
+#   deliberately non-repetitive prose, which is exactly the low-acceptance content where shallow
+#   drafts win. On BetterBench's weighted mix (code 0.30), same build, back to back: SPEC=7
+#   combined decode 184.3 t/s vs SPEC=5's 159.4 (+15.6% for 7) -- code/json/file_edit run
+#   tok/update 4.7-6.0 at depth 7 and the cap at 5 truncates precisely that tail. 5 remains the
+#   better setting for prose-heavy or batch-throughput serving (conc-8 562 vs 544 aggregate);
+#   8 falls off DEC_MAX_TM at conc 8 (M=72>64, -25%). Tune acceptance-coupled knobs on the
+#   weighted mix, not on a single content class.
 if [ "$SPEC_METHOD" = dflash ]; then SPEC=${SPEC:-7}; else SPEC=${SPEC:-4}; fi
 # The tuned drafter stack. The right default is NOT the same for both methods:
 #   mtp    -- 1. The 2-bit draft head with an exact rerank is a straight win here (+6.5% decode).
@@ -201,20 +226,30 @@ R4D_SO=${R4D_SO:-}
 # setting R4D_SO by hand still wins, so an existing checkout is never rebuilt behind your back.
 R4D_PIN=${R4D_PIN:-b9e42ab}
 R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
+# r4d_radiance_extras.patch carries this repo's libr4d additions on top of the pinned commit:
+# the 8-bit prefill attention legs (R4D_ATTN_FP8) and the fused GDN decode step
+# (RADIANCE_GDN_FUSED_UPDATE). The build cache key carries a suffix so patched and stock builds
+# coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
+R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
+R4D_KEY="$R4D_PIN"
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx1"; fi
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
-  if [ ! -f "$R4D_CACHE/$R4D_PIN/r4d.so" ]; then
-    echo "[radiance] building libr4d $R4D_PIN in $IMAGE -- one time, a few minutes"
+  if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
+    echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
     rm -rf "$R4D_CACHE/.build"
     mkdir -p "$R4D_CACHE/.build"
     git clone -q https://codeberg.org/StillDeadcode/libr4d.git "$R4D_CACHE/.build"
     git -C "$R4D_CACHE/.build" checkout -q "$R4D_PIN"
+    if [ "$R4D_KEY" != "$R4D_PIN" ]; then
+      git -C "$R4D_CACHE/.build" apply "$R4D_PATCH"
+    fi
     podman run --rm --entrypoint bash -v "$R4D_CACHE/.build":/work:z -w /work \
       "$IMAGE" -c ./build.sh
     # publish only after a successful build, so an interrupted one is not cached as good
-    mv "$R4D_CACHE/.build" "$R4D_CACHE/$R4D_PIN"
+    mv "$R4D_CACHE/.build" "$R4D_CACHE/$R4D_KEY"
   fi
-  R4D_SO="$R4D_CACHE/$R4D_PIN"
-  echo "[radiance] libr4d $R4D_PIN -> $R4D_SO"
+  R4D_SO="$R4D_CACHE/$R4D_KEY"
+  echo "[radiance] libr4d $R4D_KEY -> $R4D_SO"
 fi
 # Where the hand-written W4A8 kernel takes over from aiter's W4A4 Triton path.
 # DEFAULT 0 = never fall back; our kernel serves every M. The comparison is `x.shape[0] > MIN_M`,
@@ -247,6 +282,12 @@ MIN_M=${MIN_M:-0}
 # mxfp4 quantization squashes NaN to a finite code. RADIANCE_MXFP4_SANITIZE (default 1) fixes it.
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
+# PROFILE_DIR=1 arms the torch profiler (vLLM 0.27 moved it from VLLM_TORCH_PROFILER_DIR to CLI
+# flags); traces land in $CACHE/prof, driven by POST /start_profile and /stop_profile.
+if [ -n "${PROFILE_DIR:-}" ]; then
+  mkdir -p "$CACHE/prof"
+  EXTRA="$EXTRA --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false"
+fi
 
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
 # -f follows symlinks, so a checkpoint assembled as a symlink farm into the HF cache fails
@@ -342,6 +383,13 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
+  -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
+  -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
+  -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
+  -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \
+  ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
+  -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
+  -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \
   -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" \
   -e RADIANCE_MXFP4_R4D_DECODE_MAX_M="${RADIANCE_MXFP4_R4D_DECODE_MAX_M:-0}" \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS="${RADIANCE_TOPK_TRITON_MIN_ROWS:-1}" \
@@ -384,6 +432,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_rmsquant_fusion.py
     python3 patch_verify_head.py
     python3 patch_kv_group_size.py
+    python3 patch_gdn_merge_inproj.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
@@ -391,7 +440,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
-       radiance_verifyhead.py "$SP"/
+       radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
@@ -412,7 +461,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     --kv-cache-dtype fp8 --tensor-parallel-size 2 \
     --gpu-memory-utilization "$GPU_UTIL" \
     ${KV_MEM:+--kv-cache-memory "$KV_MEM"} \
-    --max-model-len "$MAXLEN" --max-num-seqs 8 --max-num-batched-tokens "$CHUNK" \
+    --max-model-len "$MAXLEN" --max-num-seqs "${MAXSEQS:-8}" --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "$SPEC_CFG" \
     $ASYNC_FLAG $EXTRA \
