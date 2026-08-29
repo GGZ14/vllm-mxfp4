@@ -694,6 +694,13 @@ def _make_kernel_class():
 
         def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                           bias: torch.Tensor | None = None) -> torch.Tensor:
+            if bias is None and getattr(layer, "_rad_ar_overlap", False):
+                # RowParallel layer whose all-reduce is pipelined against the GEMM inside the op
+                # (radiance_aroverlap.py). The layer's reduce_results was set False at install;
+                # the op owns the reduction on BOTH the sliced and the decode path. The M branch
+                # lives INSIDE the op -- in traced code here it would split the graph per linear.
+                return torch.ops.radiance.mxfp4_linear_ar(
+                    x, layer.weight, layer.weight_scale, layer.radiance_wref)
             if HOIST_QUANT:
                 # Quantize in the TRACED region so the rms+quant fusion can see it. Only valid at
                 # MIN_M <= 0: the aiter fallback quantizes activations to mxfp4, not fp8, so it

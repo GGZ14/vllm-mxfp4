@@ -121,7 +121,9 @@ R4D_ATTN=${R4D_ATTN:-1}
 # graph that still calls the two ORIGINAL projections -- whose weights the merge freed --
 # and the engine dies at startup on an N=0 GEMM.
 GDN_MERGE=${RADIANCE_GDN_MERGE_INPROJ:-1}
-CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$([ "$GDN_MERGE" = 1 ] && echo -gdnm)}
+# AR/GEMM overlap (radiance_aroverlap.py) changes the traced graph too -- same cache rule.
+AR_OVERLAP=${RADIANCE_AR_OVERLAP:-0}
+CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$([ "$GDN_MERGE" = 1 ] && echo -gdnm)$([ "$AR_OVERLAP" = 1 ] && echo -arov)}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
@@ -373,6 +375,10 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
+  -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
+  ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
+  -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
+  -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \
   -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" \
   -e RADIANCE_MXFP4_R4D_DECODE_MAX_M="${RADIANCE_MXFP4_R4D_DECODE_MAX_M:-0}" \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS="${RADIANCE_TOPK_TRITON_MIN_ROWS:-1}" \
@@ -423,7 +429,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
-       radiance_verifyhead.py radiance_gdnmerge.py "$SP"/
+       radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --

@@ -117,7 +117,15 @@ def _merge_one(mod) -> bool:
 
 
 def merge_model(model) -> None:
-    """Merge every GDN layer's two input projections. Best-effort: never blocks the serve."""
+    """Merge every GDN layer's two input projections. Best-effort: never blocks the serve.
+
+    Also the shared post-load hook: radiance_aroverlap piggybacks here (its own env gate inside)
+    so there is exactly one injected call site in the model runner."""
+    try:
+        import radiance_aroverlap
+        radiance_aroverlap.install(model)
+    except Exception as e:                          # noqa: BLE001
+        _log(f"aroverlap install failed, serving without it: {e!r}")
     if not ENABLED:
         return
     # Fragment order (RADIANCE_MXFP4_WPERM=1) is fine to merge: permute_w is tile-local along N
