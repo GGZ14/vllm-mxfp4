@@ -111,7 +111,17 @@ NAME=${NAME:-vllmmxfp4074}
 PORT=${PORT:-8080}
 CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-1}
-CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093}
+# GDN in_proj merge (radiance_gdnmerge.py): in_proj_qkvz + in_proj_ba as ONE GEMM, removing 96
+# GEMM launches and 48 activation quants per forward. Measured 2026-08-29: single-stream decode
+# 26.25 -> 25.50 ms/step (-2.9%), prefill unchanged, all 48 layers merge; stacks with WPERM=1
+# for 24.55 ms/step (-6.5%) at a 3% prefill cost. Output drift is split-K reassociation only
+# (merged N crosses a dks boundary), same class as the decode kernel's own M-dependent split;
+# gated with GSM8K 500q paired.  Resolved EARLY because the CACHE default is keyed on it:
+# the merge changes the traced graph, and reusing a cache dir compiled without it replays a
+# graph that still calls the two ORIGINAL projections -- whose weights the merge freed --
+# and the engine dies at startup on an N=0 GEMM.
+GDN_MERGE=${RADIANCE_GDN_MERGE_INPROJ:-1}
+CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$([ "$GDN_MERGE" = 1 ] && echo -gdnm)}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
@@ -247,6 +257,12 @@ MIN_M=${MIN_M:-0}
 # mxfp4 quantization squashes NaN to a finite code. RADIANCE_MXFP4_SANITIZE (default 1) fixes it.
 # Extra vllm serve args, for bisecting (e.g. EXTRA="--enforce-eager").
 EXTRA=${EXTRA:-}
+# PROFILE_DIR=1 arms the torch profiler (vLLM 0.27 moved it from VLLM_TORCH_PROFILER_DIR to CLI
+# flags); traces land in $CACHE/prof, driven by POST /start_profile and /stop_profile.
+if [ -n "${PROFILE_DIR:-}" ]; then
+  mkdir -p "$CACHE/prof"
+  EXTRA="$EXTRA --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false"
+fi
 
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
 # -f follows symlinks, so a checkpoint assembled as a symlink farm into the HF cache fails
@@ -342,6 +358,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
+  -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" \
   -e RADIANCE_MXFP4_R4D_DECODE_MAX_M="${RADIANCE_MXFP4_R4D_DECODE_MAX_M:-0}" \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS="${RADIANCE_TOPK_TRITON_MIN_ROWS:-1}" \
@@ -384,6 +401,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_rmsquant_fusion.py
     python3 patch_verify_head.py
     python3 patch_kv_group_size.py
+    python3 patch_gdn_merge_inproj.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
@@ -391,7 +409,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
-       radiance_verifyhead.py "$SP"/
+       radiance_verifyhead.py radiance_gdnmerge.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
