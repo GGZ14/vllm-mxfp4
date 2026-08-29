@@ -143,7 +143,9 @@ GPU_UTIL=${GPU_UTIL:-0.98}
 # what this eats: with KV pinned, GPU_UTIL=0.75 would no longer buy the headroom it exists to buy.
 # KV_MEM=0 forces profiling back on. See the --kv-cache-memory note in the header for re-deriving.
 KV_MEM=${KV_MEM:-}
-if [ -z "$KV_MEM" ] && [ "$GPU_UTIL" = "0.98" ]; then KV_MEM=18563072000; fi
+# The KV pin was derived at max_num_seqs=8's capture sizes and activation peak; any other
+# MAXSEQS re-profiles instead (re-derive a pin per the header procedure if 16 becomes standing).
+if [ -z "$KV_MEM" ] && [ "$GPU_UTIL" = "0.98" ] && [ "${MAXSEQS:-8}" = "8" ]; then KV_MEM=18563072000; fi
 if [ "$KV_MEM" = "0" ]; then KV_MEM=""; fi
 # Which drafter to speculate with.
 #   mtp    -- the multi-token-prediction head inside the target checkpoint. One draft forward per
@@ -240,7 +242,7 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx2"; fi
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx3"; fi
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -279,6 +281,12 @@ fi
 #
 # Set it absurdly high to route everything to aiter -- only useful for bisecting.
 MIN_M=${MIN_M:-0}
+# The decode-kernel band must cover MAXSEQS x (SPEC+1) rows or the biggest verify batches fall
+# onto the prefill tile: 64 covers the 8-stream default exactly (dflash SPEC=7 -> 8x8), 128
+# covers 16 streams. Defaulted from MAXSEQS so the 8-and-under band routes IDENTICALLY to today.
+if [ "${MAXSEQS:-8}" -gt 8 ]; then
+  RADIANCE_MXFP4_DECODE_MAX_M=${RADIANCE_MXFP4_DECODE_MAX_M:-128}
+fi
 
 # All 304 linear layers run on the W4A8 kernel. RADIANCE_MXFP4_KERNEL_NK / _PERBLOCK_NK remain as
 # shape-level bisect tools (N:K pairs) but are unset by default.
@@ -413,6 +421,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_DYNW_MARGIN="${RADIANCE_DYNW_MARGIN:-2}" \
   -e RADIANCE_DYNW_MIN="${RADIANCE_DYNW_MIN:-2}" \
   -e RADIANCE_DYNW_MIN_BATCH="${RADIANCE_DYNW_MIN_BATCH:-3}" \
+  -e RADIANCE_AR_QNB="${RADIANCE_AR_QNB:-96}" \
+  -e RADIANCE_AR_QNT="${RADIANCE_AR_QNT:-1024}" \
   ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
   -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
   -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \
@@ -460,6 +470,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_kv_group_size.py
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
+    python3 patch_ar_geometry.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
