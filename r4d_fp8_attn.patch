@@ -42,10 +42,10 @@ index cd4e294..3694dab 100644
      return 0;
  }
 diff --git a/r4d_attn_prefill_h256_gqa6.hip b/r4d_attn_prefill_h256_gqa6.hip
-index 513d97f..56d037b 100644
+index 513d97f..d3a19fa 100644
 --- a/r4d_attn_prefill_h256_gqa6.hip
 +++ b/r4d_attn_prefill_h256_gqa6.hip
-@@ -38,6 +38,20 @@
+@@ -38,6 +38,25 @@
  
  #define O_F16     1
  #define O_MSKIP   2
@@ -63,10 +63,15 @@ index 513d97f..56d037b 100644
 +//        indistinguishable at these error levels.
 +#define O_QK8    32
 +#define O_PV8    64
++// A K prefetch across the m-tile loop (the GPREV pattern applied to K) was re-measured under the
++// 8-bit legs on 2026-08-29, on the theory that the register headroom they free (qf8 is 32 VGPRs
++// against qf's 64) removes the spill that killed upstream's three attempts. It still LOSES:
++// -5% at an 8k chunk, -1% at 40k, bit-identical output -- the live range across the loop is the
++// cost, not the spill. Do not build it a fifth time.
  #define O_FOLDQ   8
  #define O_CONTIG  512
  #define O_PF2    1024
-@@ -72,6 +86,13 @@
+@@ -72,6 +91,13 @@
  // ever orders LDS.
  #define O_LDSB  2097152
  
@@ -80,7 +85,7 @@ index 513d97f..56d037b 100644
  // bf16 dword -> 16-bit dword in the target format, optionally scaled. Used once per kernel on Q.
  template<class D, int FOLDQ, int F16>
  __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
-@@ -90,11 +111,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -90,11 +116,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
      constexpr int CTG   = (OPT & O_CONTIG) ? 1 : 0;
      constexpr int PF    = 1 << ((OPT >> 10) & 3);
      constexpr int SGB   = (OPT & O_SGB) ? 1 : 0;
@@ -97,7 +102,7 @@ index 513d97f..56d037b 100644
      typedef DT16<F16> D;
      typedef typename D::frag frag16;
  
-@@ -113,11 +138,18 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -113,11 +143,18 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
      constexpr int NTR     = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
      constexpr int VREGS   = (NTR + NWARPS - 1) / NWARPS;        // uint4 of raw V per thread
      constexpr float PSHIFT = D::SHIFT;
@@ -117,7 +122,7 @@ index 513d97f..56d037b 100644
  
      const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
      const int c = lane & 15, h = lane >> 4;
-@@ -140,6 +172,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -140,6 +177,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
      const float mul   = a.scale * kdesc * 1.44269504089f;
  
      frag16 qf[NKS];
@@ -125,7 +130,7 @@ index 513d97f..56d037b 100644
      {
          const uint16_t* qp = (const uint16_t*)a.q
                             + ((size_t)(seq * a.q_len + qrow) * a.q_heads + qhead) * HEAD_DIM;
-@@ -148,10 +181,21 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -148,10 +186,21 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
              // CONTIG reads the same 8 d as ONE run; the legacy map splits them 4+4.
              const uint2 l0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h : 4 * h));
              const uint2 h0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h + 4 : 8 + 4 * h));
@@ -151,7 +156,7 @@ index 513d97f..56d037b 100644
          }
      }
  
-@@ -229,6 +273,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -229,6 +278,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                  const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
                  const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
                  if (KWIDE && key >= TILE) continue;
@@ -163,7 +168,7 @@ index 513d97f..56d037b 100644
                  uint16_t* kd = &sK[key * KSTR + ch * KEL];
                  #pragma unroll
                  for (int q = 0; q < KEL / 8; ++q) {
-@@ -266,6 +315,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -266,6 +320,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                      // ADJACENT d; v_perm_b32 splits them back into two d rows.
                      const uint32_t lo0 = byte_gather(v.x, v.y, 0), lo1 = byte_gather(v.z, v.w, 0);
                      const uint32_t hi0 = byte_gather(v.x, v.y, 1), hi1 = byte_gather(v.z, v.w, 1);
@@ -175,7 +180,7 @@ index 513d97f..56d037b 100644
                      uint32_t wl[4], wh[4];
                      fp8x8_to_16x4w<D>(make_uint2(lo0, lo1), wl);
                      fp8x8_to_16x4w<D>(make_uint2(hi0, hi1), wh);
-@@ -310,7 +364,21 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -310,7 +369,21 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
          #pragma unroll 1
          for (int mt = 0; mt < MT; ++mt) {
              v8f s = (v8f){0,0,0,0,0,0,0,0};
@@ -198,7 +203,7 @@ index 513d97f..56d037b 100644
                  const uint16_t* krow = &sK[(mt * 16 + c) * KSTR] + (CTG ? 8 * h : 0);
                  // PF fragments are LOADED before the matching PF WMMAs are ISSUED, so the wait in
                  // front of each WMMA becomes `s_wait_dscnt PF-1` instead of a full drain.
-@@ -368,7 +436,22 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
+@@ -368,7 +441,22 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
              }
              if (!DOT2) l_i += lsum;
  
