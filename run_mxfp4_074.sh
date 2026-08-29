@@ -211,20 +211,28 @@ R4D_SO=${R4D_SO:-}
 # setting R4D_SO by hand still wins, so an existing checkout is never rebuilt behind your back.
 R4D_PIN=${R4D_PIN:-b9e42ab}
 R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
+# r4d_fp8_attn.patch adds the opt-in 8-bit prefill attention legs (R4D_ATTN_FP8 below) on top of
+# the pinned libr4d; the build cache key carries the suffix so patched and stock builds coexist.
+R4D_PATCH="$SCRIPT_DIR/r4d_fp8_attn.patch"
+R4D_KEY="$R4D_PIN"
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-fp8attn"; fi
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
-  if [ ! -f "$R4D_CACHE/$R4D_PIN/r4d.so" ]; then
-    echo "[radiance] building libr4d $R4D_PIN in $IMAGE -- one time, a few minutes"
+  if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
+    echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
     rm -rf "$R4D_CACHE/.build"
     mkdir -p "$R4D_CACHE/.build"
     git clone -q https://codeberg.org/StillDeadcode/libr4d.git "$R4D_CACHE/.build"
     git -C "$R4D_CACHE/.build" checkout -q "$R4D_PIN"
+    if [ "$R4D_KEY" != "$R4D_PIN" ]; then
+      git -C "$R4D_CACHE/.build" apply "$R4D_PATCH"
+    fi
     podman run --rm --entrypoint bash -v "$R4D_CACHE/.build":/work:z -w /work \
       "$IMAGE" -c ./build.sh
     # publish only after a successful build, so an interrupted one is not cached as good
-    mv "$R4D_CACHE/.build" "$R4D_CACHE/$R4D_PIN"
+    mv "$R4D_CACHE/.build" "$R4D_CACHE/$R4D_KEY"
   fi
-  R4D_SO="$R4D_CACHE/$R4D_PIN"
-  echo "[radiance] libr4d $R4D_PIN -> $R4D_SO"
+  R4D_SO="$R4D_CACHE/$R4D_KEY"
+  echo "[radiance] libr4d $R4D_KEY -> $R4D_SO"
 fi
 # Where the hand-written W4A8 kernel takes over from aiter's W4A4 Triton path.
 # DEFAULT 0 = never fall back; our kernel serves every M. The comparison is `x.shape[0] > MIN_M`,
@@ -359,6 +367,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
+  -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" \
   -e RADIANCE_MXFP4_R4D_DECODE_MAX_M="${RADIANCE_MXFP4_R4D_DECODE_MAX_M:-0}" \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS="${RADIANCE_TOPK_TRITON_MIN_ROWS:-1}" \
