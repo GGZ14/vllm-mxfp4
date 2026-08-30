@@ -569,7 +569,9 @@ The remaining 13-23% prefill gap to MXFP4 is the FORMAT, mathematically:
   * the two-level split s = 2^e x m folds only the exponent -- the mantissa m in [1,2) still
     costs the same per-group FMA, because it varies along K and must apply before cross-group
     summation;
-  * the per-group temp accumulators the rescale forces are the IMAJOR register pressure that
-    caps occupancy below the MXFP4 folded kernel's.
+  * the rescale's temp accumulators forced the IMAJOR restructure, which reaches register
+    PARITY with the MXFP4 folded kernel (123 vs 116 VGPR, both occupancy 10) but pays for it by
+    re-reading the sW fragments once per M-fragment -- the ~9% residue the original ablation
+    measured, structural to needing any temp accumulator at all.
 MXFP4's zero-rescale inner loop requires power-of-two scales; this format does not have them.
 The kernel is at its format's ceiling on this hardware.
