@@ -291,9 +291,10 @@ the WORST on down and out, where 40 n-blocks cannot fill the GPU alone.
 - **Register prefetch of the next k-slab across the WMMA run**: no gain once staging is
   branchless, and +18 VGPR. The point of a prefetch is to overlap the load latency, and one
   batched round trip at occupancy 10 already is overlapped.
-- **Prefill tile sweep (AR_WN x TN in {2,4}^2)**: INCONCLUSIVE, not rejected. A server came up
-  mid-sweep and the fixed MXFP4 reference drifted 35% between builds. `tilebench.hip` templates
-  WN so all four tiles land in one binary and interleave; it needs a rerun on an idle GPU.
+- **Prefill tile sweep (AR_WN x TN in {2,4}^2)**: CONCLUDED 2026-08-30 (interleaved, NCOPY=6,
+  stable MXFP4 reference). The SHIPPED tiles win every cell: ship-TN4 at M>=2048 beats opt-tn4 by
+  2-4% and WN=4 by 23-72% (WN=4 runs 256 VGPRs at occupancy 5-6 -- the register wall the 08-26
+  TM/WM sweep predicted). The TN2->TN4 crossover at 2048 re-confirms. The tile space is CLOSED.
 
 ### Hardware facts established while looking (`gfx1201`, ROCm 7.14 / clang 23)
 
@@ -549,3 +550,28 @@ look like. A whole loader change and a second decode kernel avoided by one ablat
 Note the asymmetry with prefill, where the answer is different for a structural reason rather than
 a measured one: there `sW` is shared by WM=4 waves and `sA` by WN=2, so register-resident would
 take per-slab staging from 20 KB to 48 KB. LDS is load-bearing at prefill and free at decode.
+
+
+---
+
+# State-of-the-art audit (2026-08-30)
+
+Requested and answered: is this prefill kernel the best it can be on gfx1201/R9700?
+
+Every named technique is measured: branchless staging (originated here), 8 B weight staging
+(16 B identical), SADDR hoists, sched_barrier, W-fragment hoist, IMAJOR (183 -> 123 VGPR),
+epilogue fast path, BK/TM/WM/TN/WN tile space fully swept (this file), register-resident W (0),
+double-buffering (-1%), s_setprio (+11% loss), fp8 WMMA throughout. Decode: 95.5% of achievable
+stream, beats MXFP4 at 13/15 cells (cmp.hip, 2026-08-30).
+
+The remaining 13-23% prefill gap to MXFP4 is the FORMAT, mathematically:
+  * the fp16 group scale cannot fold into e4m3 weights (+41.5% weight error, measured);
+  * the two-level split s = 2^e x m folds only the exponent -- the mantissa m in [1,2) still
+    costs the same per-group FMA, because it varies along K and must apply before cross-group
+    summation;
+  * the rescale's temp accumulators forced the IMAJOR restructure, which reaches register
+    PARITY with the MXFP4 folded kernel (123 vs 116 VGPR, both occupancy 10) but pays for it by
+    re-reading the sW fragments once per M-fragment -- the ~9% residue the original ablation
+    measured, structural to needing any temp accumulator at all.
+MXFP4's zero-rescale inner loop requires power-of-two scales; this format does not have them.
+The kernel is at its format's ceiling on this hardware.
