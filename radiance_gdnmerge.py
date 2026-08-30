@@ -55,8 +55,11 @@ def _merged_forward_hip(self, hidden_states):
     import torch
 
     num_tokens = hidden_states.size(0)
-    merged = torch.ops.radiance.mxfp4_linear(
-        hidden_states, self._rad_w, self._rad_ws, self._rad_wref)
+    if self._rad_quant:
+        merged = torch.ops.radiance.mxfp4_linear(
+            hidden_states, self._rad_w, self._rad_ws, self._rad_wref)
+    else:
+        merged = torch.nn.functional.linear(hidden_states, self._rad_w)
     projected_states_qkvz = merged[:, : self._rad_n1].view(num_tokens, -1)
     projected_states_ba = merged[:, self._rad_n1 :].view(num_tokens, -1)
 
@@ -81,10 +84,22 @@ def _merge_one(mod) -> bool:
     qkvz, ba = getattr(mod, "in_proj_qkvz", None), getattr(mod, "in_proj_ba", None)
     if qkvz is None or ba is None:
         return False
-    # Only merge when BOTH sides are actually served by the radiance kernel. A layer that fell back
-    # to aiter reads a different weight layout, and merging would hand aiter a tensor it cannot
-    # interpret -- the same trap layer_is_supported's docstring describes.
-    if not (getattr(qkvz, "radiance_w4a8_ok", False) and getattr(ba, "radiance_w4a8_ok", False)):
+    # Two servable cases. Quantized: BOTH sides on the radiance MXFP4 kernel (a layer that fell
+    # back to aiter reads a different weight layout, the trap layer_is_supported describes).
+    # Unquantized: BOTH sides plain bf16 (the AutoRound checkpoint keeps every gdn in_proj at
+    # bf16), merged by weight concat with an F.linear forward -- same launch saving, no quant
+    # tensors to carry. KNOWN BLOCKED under RADIANCE_PRESHUFFLE=1 (the AutoRound serve default):
+    # the skinny-gemm preshuffle consumes .weight before this hook runs, the AttributeError is
+    # caught below and the layer is left unmerged -- measured 2026-08-30, all 48 skipped cleanly.
+    # Enabling it would mean forgoing the preshuffled skinny path for these GEMMs, which is worth
+    # more than the launch saving; the branch stays for a serve that runs PRESHUFFLE=0.
+    rad = getattr(qkvz, "radiance_w4a8_ok", False) and getattr(ba, "radiance_w4a8_ok", False)
+    unq = (not rad
+           and getattr(qkvz, "radiance_wref", None) is None
+           and getattr(ba, "radiance_wref", None) is None
+           and qkvz.weight.dtype == torch.bfloat16 and ba.weight.dtype == torch.bfloat16
+           and qkvz.weight.dim() == 2 and ba.weight.dim() == 2)
+    if not (rad or unq):
         return False
     if qkvz.weight.shape[1] != ba.weight.shape[1]:          # same K
         return False
@@ -94,10 +109,12 @@ def _merge_one(mod) -> bool:
 
     mod._rad_w = torch.nn.Parameter(
         torch.cat([qkvz.weight.data, ba.weight.data], dim=0), requires_grad=False)
-    mod._rad_ws = torch.nn.Parameter(
-        torch.cat([qkvz.weight_scale.data, ba.weight_scale.data], dim=1), requires_grad=False)
-    mod._rad_wref = torch.nn.Parameter(
-        torch.cat([qkvz.radiance_wref.data, ba.radiance_wref.data], dim=0), requires_grad=False)
+    if rad:
+        mod._rad_ws = torch.nn.Parameter(
+            torch.cat([qkvz.weight_scale.data, ba.weight_scale.data], dim=1), requires_grad=False)
+        mod._rad_wref = torch.nn.Parameter(
+            torch.cat([qkvz.radiance_wref.data, ba.radiance_wref.data], dim=0), requires_grad=False)
+    mod._rad_quant = rad
     mod._rad_n1 = n1
     # The stock forward re-encodes the layer name on every step; it is constant, so resolve once.
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as _m
@@ -108,7 +125,8 @@ def _merge_one(mod) -> bool:
     empty = torch.empty(0, dtype=qkvz.weight.dtype, device=qkvz.weight.device)
     for lin in (qkvz, ba):
         lin.weight = torch.nn.Parameter(empty, requires_grad=False)
-        lin.weight_scale = torch.nn.Parameter(empty.clone(), requires_grad=False)
+        if rad:
+            lin.weight_scale = torch.nn.Parameter(empty.clone(), requires_grad=False)
 
     import types
     mod.forward_hip = types.MethodType(_merged_forward_hip, mod)

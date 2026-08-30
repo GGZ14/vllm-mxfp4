@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
   // ---------------- correctness ----------------
   // Sweep the real speculative M values plus the dispatch boundaries, N not a multiple of BND,
   // and K not a multiple of DKS*DBK.
-  const int Ms[] = {1, 2, 3, 5, 8, 9, 13, 16, 17, 32, 40, 64};
+  const int Ms[] = {1, 2, 3, 5, 8, 9, 13, 16, 17, 32, 40, 64, 72, 96, 127, 128};
   const Shape cshapes[] = {{128, 512, "small"}, {48, 640, "narrow-N"},
                            {5120, 8704, "down"}, {17408, 5120, "gate_up"},
                            {200, 384, "ragged"}};
@@ -198,7 +198,9 @@ int main(int argc, char **argv) {
                          dW, dS, dAs, dP, dCnt, dC, M, N, K)
 #define AR_BY_TM(KS_)                                                                      \
       do { if (tm == 1) AR_LAUNCH(KS_, 1); else if (tm == 2) AR_LAUNCH(KS_, 2);             \
-           else if (tm == 3) AR_LAUNCH(KS_, 3); else AR_LAUNCH(KS_, 4); } while (0)
+           else if (tm == 3) AR_LAUNCH(KS_, 3); else if (tm == 4) AR_LAUNCH(KS_, 4);        \
+           else if (tm == 5) AR_LAUNCH(KS_, 5); else if (tm == 6) AR_LAUNCH(KS_, 6);        \
+           else if (tm == 7) AR_LAUNCH(KS_, 7); else AR_LAUNCH(KS_, 8); } while (0)
       if (KS == 1) AR_BY_TM(1); else if (KS == 2) AR_BY_TM(2); else AR_BY_TM(4);
       HIP_CHECK(hipDeviceSynchronize());
 

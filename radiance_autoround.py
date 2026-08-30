@@ -57,7 +57,13 @@ _scratch_ready = [False]
 def _ensure_scratch(device):
     if _scratch_ready[0]:
         return
-    _scratch[0] = torch.empty(_DEC_KS * _DEC_MAX_M * _DEC_MAX_N, dtype=torch.float32,
+    # Rows must cover the decode band; sized from the env (mirrors radiance_mxfp4.py) so the
+    # default 64 allocates exactly what it always has and only a 16-concurrent serve
+    # (RADIANCE_AR_DECODE_MAX_M=128) pays the extra 32 MiB.
+    _scratch[0] = torch.empty(
+        _DEC_KS * max(_DEC_MAX_M,
+                      int(os.environ.get("RADIANCE_AR_DECODE_MAX_M", "0"))) * _DEC_MAX_N,
+        dtype=torch.float32,
                               device=device)
     _scratch[1] = torch.zeros(_DEC_MAX_N // 128 + 8, dtype=torch.int32, device=device)
     _ext.set_decode_scratch(_scratch[0].data_ptr(), _scratch[0].numel() * 4,
