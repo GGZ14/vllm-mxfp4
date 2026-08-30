@@ -10,7 +10,12 @@
 
 #define AR_DEC_MAX_N 32768
 #define AR_DEC_KS 4                     // scratch is still SIZED for the widest split
-#define AR_DEC_MAX_TM 4                 // covers M <= 64
+#define AR_DEC_MAX_TM 8                 // covers M <= 128: dflash SPEC=7 x max_num_seqs=16
+                                        // reaches batch x 8 = 128. Extended 2026-08-29 in
+                                        // lockstep with the MXFP4 kernel; RADIANCE_AR_DECODE_MAX_M
+                                        // still gates WHICH M take this kernel (64 by default,
+                                        // so the 8-and-under band routes exactly as before), and
+                                        // radiance_autoround.py sizes the scratch from that env.
 #define AR_DEC_DWN 8
 
 // Split-K partial slab, owned by torch and handed over at weight-load time.
@@ -43,8 +48,18 @@ static void set_decode_scratch(uintptr_t ptr, size_t bytes, uintptr_t cnt) {
 // Measured on an idle GPU: gate_up (N=17408, 136 n-blocks) wants DKS=1 at every M, down and out
 // (N=5120, 40 n-blocks) want 4 up to M=40 and 2 at M=64. This rule picks the best measured cell
 // in all fifteen shape/M combinations.
-static int split_k_for(int nblk, int M) {
+static int split_k_for(int nblk, int M, int K) {
   if (const char *e = getenv("RADIANCE_AR_DECODE_KS")) return atoi(e);
+  if (M > 64) {
+    // The 16-concurrent band, swept cell-by-cell 2026-08-29 (arsweep.hip, idle GPU, DRAM-fed)
+    // in lockstep with the MXFP4 kernel's extension; M <= 64 below is untouched and its rule
+    // re-verified optimal by the same sweep. Wide shapes never split; the nblk=40 shapes split
+    // by 2 until the partial traffic catches up, and at M=128 they diverge by K depth exactly
+    // as the MXFP4 band does (down 141.6 us at ks4 vs 158.2 at ks2; out 95.0 at ks1 vs 106.1).
+    if (nblk >= 48) return 1;
+    if (M <= 112) return 2;
+    return (K >= 6144) ? AR_DEC_KS : 1;
+  }
   int ks = (nblk >= 128) ? 1 : (nblk >= 64) ? 2 : AR_DEC_KS;
   if (M > 48 && ks > 1) ks >>= 1;
   return ks;
@@ -96,7 +111,7 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t s, uintptr_t as, uintptr_
 
   constexpr int BND = AR_DEC_DWN * 16;
   const int nblk = (N + BND - 1) / BND;
-  const int ks = split_k_for(nblk, M);
+  const int ks = split_k_for(nblk, M, K);
   // DKS==1 writes C directly and needs no scratch at all; anything wider does.
   const bool have_scratch =
       g_partial && g_cnt && (size_t)ks * M * N * sizeof(float) <= g_partial_bytes;
@@ -109,7 +124,9 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t s, uintptr_t as, uintptr_
                        st, A, W, S, As, g_partial, g_cnt, C, M, N, K)
 #define AR_DEC_TM(KS_)                                                                          \
     do { if (tm == 1) AR_DEC(KS_, 1); else if (tm == 2) AR_DEC(KS_, 2);                          \
-         else if (tm == 3) AR_DEC(KS_, 3); else AR_DEC(KS_, 4); } while (0)
+         else if (tm == 3) AR_DEC(KS_, 3); else if (tm == 4) AR_DEC(KS_, 4);                     \
+         else if (tm == 5) AR_DEC(KS_, 5); else if (tm == 6) AR_DEC(KS_, 6);                     \
+         else if (tm == 7) AR_DEC(KS_, 7); else AR_DEC(KS_, 8); } while (0)
     if (ks == 1) AR_DEC_TM(1);
     else if (ks == 2) AR_DEC_TM(2);
     else AR_DEC_TM(4);
@@ -122,7 +139,10 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t s, uintptr_t as, uintptr_
 
   const dim3 bl(AR_NTHREADS);
   const int by = (M + AR_BMF - 1) / AR_BMF;
-  if (M >= tn4_min_m()) {
+  // TN=4 only when the shape can use the 128-wide tile -- the MXFP4 launcher's N guard, carried
+  // over even though no quantized AutoRound layer is currently that narrow (the N=48 gdn
+  // in_proj_ba stays bf16 in this checkpoint): a future shape should degrade, not fall over.
+  if (M >= tn4_min_m() && N >= AR_WN * 4 * 16) {
     constexpr int BNF_T = AR_WN * 4 * 16;
     hipLaunchKernelGGL((ar_int4_fp8_gemm_prefill<4, true>), dim3((N + BNF_T - 1) / BNF_T, by), bl,
                        0, st, A, W, S, As, C, M, N, K);
