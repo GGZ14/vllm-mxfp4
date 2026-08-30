@@ -34,27 +34,35 @@ int main() {
     HIP_CHECK(hipMalloc(&C, (size_t)MMAX * N * 2));
     hipEvent_t e0, e1;
     HIP_CHECK(hipEventCreate(&e0)); HIP_CHECK(hipEventCreate(&e1));
-    printf("sweep %-8s N=%d K=%d nblk=%d ncopy=%d\n%-6s %10s %10s %10s\n",
-           sh.name, N, K, nblk, NCOPY, "M", "ks1", "ks2", "ks4");
+    printf("sweep %-8s N=%d K=%d nblk=%d ncopy=%d\n"
+           "%-6s %10s %10s %10s %10s %10s %10s\n",
+           sh.name, N, K, nblk, NCOPY, "M",
+           "w8k1", "w8k2", "w8k4", "w4k1", "w4k2", "w4k4");
     for (int M : {5, 8, 16, 40, 64, 72, 80, 96, 112, 128}) {
       const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;
       printf("%-6d", M);
+      for (int dwnsel : {8, 4})
       for (int ks : {1, 2, 4}) {
         const dim3 grid(nblk, 1, ks), blk(DWN * 32);
-#define L(KS_, TM_) hipLaunchKernelGGL((ar_int4_fp8_gemm_decode<DWN, KS_, TM_>), grid, blk, 0, 0, \
-                        A, W[it % NCOPY], S[it % NCOPY], As, P, cnt, C, M, N, K)
+        (void)grid; (void)blk;
+#define L(KS_, TM_) hipLaunchKernelGGL((ar_int4_fp8_gemm_decode<DWNSEL, KS_, TM_>), \
+                        dim3((N + DWNSEL * 16 - 1) / (DWNSEL * 16), 1, KS_), dim3(DWNSEL * 32), \
+                        0, 0, A, W[it % NCOPY], S[it % NCOPY], As, P, cnt, C, M, N, K)
 #define LT(KS_) do { if (tm==1) L(KS_,1); else if (tm==2) L(KS_,2); else if (tm==3) L(KS_,3); \
                      else if (tm==4) L(KS_,4); else if (tm==5) L(KS_,5); else if (tm==6) L(KS_,6); \
                      else if (tm==7) L(KS_,7); else L(KS_,8); } while (0)
         float best = 1e30f, ms;
+#define LD(KS_) do { if (dwnsel == 8) { constexpr int DWNSEL = 8; LT(KS_); } \
+                     else             { constexpr int DWNSEL = 4; LT(KS_); } } while (0)
         for (int rep = 0; rep < 3; ++rep) {
-          for (int it = 0; it < 3; ++it) { if (ks==1) LT(1); else if (ks==2) LT(2); else LT(4); }
+          for (int it = 0; it < 3; ++it) { if (ks==1) LD(1); else if (ks==2) LD(2); else LD(4); }
           HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipEventRecord(e0));
-          for (int it = 0; it < 15; ++it) { if (ks==1) LT(1); else if (ks==2) LT(2); else LT(4); }
+          for (int it = 0; it < 15; ++it) { if (ks==1) LD(1); else if (ks==2) LD(2); else LD(4); }
           HIP_CHECK(hipEventRecord(e1)); HIP_CHECK(hipEventSynchronize(e1));
           HIP_CHECK(hipEventElapsedTime(&ms, e0, e1));
           best = std::min(best, ms / 15.f);
         }
+#undef LD
         printf(" %10.1f", best * 1000.f);
 #undef LT
 #undef L
