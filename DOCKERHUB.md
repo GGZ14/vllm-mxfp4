@@ -305,3 +305,15 @@ Tool-calling and reasoning:
 ```
 
 Pass a template with `--chat-template file.jinja` if the model needs one. The image ships the `from_json` filter those templates often rely on.
+
+## ParoQuant (0.10.0)
+
+`paroquant/` carries a W4A8 serving stack for ParoQuant checkpoints (int4 group-128 asymmetric +
+learned pairwise Givens rotations + channel scaling; `quant_method: "paroquant"`), e.g.
+z-lab/Qwen3.8-27B-PARO. Not baked into the image: `paroquant/run_paroquant.sh` builds the kernel
+module into site-packages at container start and registers the quant method via the stdlib
+sitecustomize (the site-packages one is shadowed on Ubuntu). Kernels are gfx1201 hand-written HIP:
+fused rotation+quantization prologue, zero-point-as-row-sum-correction GEMM with partition select
+for merged layers, per-token activation scales on the prefill band (`RADIANCE_PQ_PTOK=0` reverts
+to per-group). Gated by `paroquant/run.sh` (harness) and `paroquant/test_module.sh` (integration
+vs the real checkpoint); numbers and design notes in `paroquant/RESULTS.md`.
