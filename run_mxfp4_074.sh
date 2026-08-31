@@ -123,12 +123,33 @@ R4D_ATTN=${R4D_ATTN:-1}
 GDN_MERGE=${RADIANCE_GDN_MERGE_INPROJ:-1}
 # AR/GEMM overlap (radiance_aroverlap.py) changes the traced graph too -- same cache rule.
 AR_OVERLAP=${RADIANCE_AR_OVERLAP:-0}
+# Norm+quant fusion (2026-08-30). Three pieces that only work TOGETHER: hoist the per-linear fp8
+# activation quant into the traced graph (RADIANCE_MXFP4_HOIST_QUANT), swap the aiter pattern's
+# replacement op for one that works on RDNA4 (RADIANCE_RMS_QUANT_FUSION + patch_rmsquant_fusion),
+# and enable the vLLM passes themselves (pass_config.fuse_norm_quant/fuse_act_quant -- the piece
+# the Aug-28 experiment missed: its serve config shows 'fuse_norm_quant': False, so that
+# "neutral" result was a null test). Changes the traced graph => own cache suffix.
+NQF=${RADIANCE_NORMQUANT_FUSION:-0}
+# FP8 residual stream (radiance_arnq): fuse each RowParallel linear's post-AR epilogue
+# (residual add + Gemma rmsnorm + per-token fp8 quant) into one HIP kernel and hand the next
+# linear a pre-quantized (q, scale). Kernel is bit-identical to the traced path; the contract
+# change is why it gets its own cache key and its own gate run. Requires NQF=1 and GDN_MERGE=1.
+# TRAP: if the arnq installer SKIPS at startup (guard failure), the stock graph lands in the
+# -fp8s cache dir, and because that trace never touched radiance_arnq.py the cache key cannot
+# tell the difference afterwards -- a later fixed launch silently replays the stock graph
+# (measured 2026-08-30: epilogue kernels 0/step, bench byte-identical). After fixing whatever
+# made the installer skip, rm the -fp8s cache dir.
+FP8S=${RADIANCE_FP8_STREAM:-0}
 # Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
 # test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
 # single line of output. It bit exactly when a flag was 0.
 CACHE_SUF=""
 if [ "$GDN_MERGE" = 1 ]; then CACHE_SUF="$CACHE_SUF-gdnm"; fi
 if [ "$AR_OVERLAP" = 1 ]; then CACHE_SUF="$CACHE_SUF-arov"; fi
+# -nqft, not -nqf: -nqf was the pass-only null experiment. TRACED_QUANT flips the traced graph
+# via env alone (no hashed file changes), so it MUST key the cache dir.
+if [ "$NQF" = 1 ]; then CACHE_SUF="$CACHE_SUF-nqft"; fi
+if [ "$FP8S" = 1 ]; then CACHE_SUF="$CACHE_SUF-fp8s"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
@@ -242,7 +263,7 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx3"; fi
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx4"; fi
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -308,14 +329,26 @@ EXTRA=${EXTRA:-}
 # the same session: single-stream 184.9 (even), conc-8 405-427 vs 444-461 (LOSES -- cold-start
 # batches run full width into the M=72>64 kernel cliff before the EMAs settle). 7 stays.
 CAPTURE_SIZES=${CAPTURE_SIZES:-none}
+# Compilation-config entries accumulate into ONE flag: two --compilation-config instances would
+# not merge (argparse keeps the last).
+CC_ITEMS=""
 if [ -n "$CAPTURE_SIZES" ] && [ "$CAPTURE_SIZES" != none ]; then
-  EXTRA="$EXTRA --compilation-config {\"cudagraph_capture_sizes\":$CAPTURE_SIZES}"
+  CC_ITEMS="\"cudagraph_capture_sizes\":$CAPTURE_SIZES"
+fi
+if [ "$NQF" = 1 ]; then
+  CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}"
+fi
+if [ -n "$CC_ITEMS" ]; then
+  EXTRA="$EXTRA --compilation-config {$CC_ITEMS}"
 fi
 # PROFILE_DIR=1 arms the torch profiler (vLLM 0.27 moved it from VLLM_TORCH_PROFILER_DIR to CLI
 # flags); traces land in $CACHE/prof, driven by POST /start_profile and /stop_profile.
 if [ -n "${PROFILE_DIR:-}" ]; then
   mkdir -p "$CACHE/prof"
-  EXTRA="$EXTRA --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false"
+  # PROFILE_STACK=1 adds python stacks to the trace (bigger, slower flush; use for ATTRIBUTION
+  # runs, not timing runs -- with_stack inflates the very gaps being measured).
+  if [ "${PROFILE_STACK:-0}" = 1 ]; then WITH_STACK=true; else WITH_STACK=false; fi
+  EXTRA="$EXTRA --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=$WITH_STACK"
 fi
 
 SNAP="$(realpath -m "${SNAP:-$MODELS/Qwen3.8-27B-MXFP4-mtpfp8}")"
@@ -432,8 +465,10 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_SKINNY_GEMM="${RADIANCE_SKINNY_GEMM:-1}" \
   -e RADIANCE_DFLASH_CALIB="${RADIANCE_DFLASH_CALIB:-}" \
   -e RADIANCE_DFLASH_CALIB_TOKENS="${RADIANCE_DFLASH_CALIB_TOKENS:-200000}" \
-  -e RADIANCE_MXFP4_HOIST_QUANT="${RADIANCE_MXFP4_HOIST_QUANT:-0}" \
-  -e RADIANCE_RMS_QUANT_FUSION="${RADIANCE_RMS_QUANT_FUSION:-0}" \
+  -e RADIANCE_MXFP4_HOIST_QUANT="${RADIANCE_MXFP4_HOIST_QUANT:-$NQF}" \
+  -e RADIANCE_MXFP4_TRACED_QUANT="${RADIANCE_MXFP4_TRACED_QUANT:-$NQF}" \
+  -e RADIANCE_FP8_STREAM="$FP8S" \
+  -e RADIANCE_RMS_QUANT_FUSION="${RADIANCE_RMS_QUANT_FUSION:-$NQF}" \
   -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
   -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-0}" \
   -e RADIANCE_GDN_PATHS="${RADIANCE_GDN_PATHS:-both}" \
@@ -468,6 +503,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_rmsquant_fusion.py
     python3 patch_verify_head.py
     python3 patch_kv_group_size.py
+    python3 patch_topk_composite.py
+    python3 patch_gdn_shared_build.py
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
@@ -478,7 +515,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
-       radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py "$SP"/
+       radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py \
+       radiance_arnq.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
