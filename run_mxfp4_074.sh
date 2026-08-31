@@ -406,7 +406,13 @@ if [ "$SPEC_METHOD" = dflash ]; then
   esac
   # disable_padded_drafter_batch is the single-stream lever (~+50% on the 27B hybrids) and the
   # image bakes the vLLM unpad patch it relies on; it applies to dflash as well as mtp.
-  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$CDRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$DRAFT_ATTN\",\"disable_padded_drafter_batch\":$UNPAD}"
+  # DRAFT_SAMPLE=probabilistic drafts stochastically with vLLM's shared-Gumbel coupling
+  # instead of argmax. The serve samples at temperature 0.7, and greedy one-hot drafts accept
+  # with only p_target(argmax); matched sampling accepts with sum(min(p,q)). Costs the full
+  # draft-logits head (bypasses the int2 argmax fast path) until the sparse draft_logits_spec
+  # integration exists -- measure acceptance vs that cost before defaulting.
+  DRAFT_SAMPLE=${DRAFT_SAMPLE:-greedy}
+  SPEC_CFG="{\"method\":\"dflash\",\"model\":\"$CDRAFTER\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$DRAFT_ATTN\",\"disable_padded_drafter_batch\":$UNPAD,\"draft_sample_method\":\"$DRAFT_SAMPLE\"}"
 else
   SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$ATTN\",\"disable_padded_drafter_batch\":$UNPAD}"
 fi
@@ -435,6 +441,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_MXFP4_W4A8_MIN_M="$MIN_M" \
   -e RADIANCE_FAST_DRAFT="$FAST_DRAFT" -e RADIANCE_DRAFT_TAU="${RADIANCE_DRAFT_TAU:-0.20}" \
   -e RADIANCE_DRAFT_RERANK="${RADIANCE_DRAFT_RERANK:-32}" \
+  -e RADIANCE_DFLASH_SELECTOR_TOPK="${RADIANCE_DFLASH_SELECTOR_TOPK:-}" \
   -e RADIANCE_VERIFY_HEAD="${RADIANCE_VERIFY_HEAD:-0}" \
   -e RADIANCE_VERIFY_HEAD_MAX_M="${RADIANCE_VERIFY_HEAD_MAX_M:-32}" \
   -e RADIANCE_MXFP4_DEBUG="${RADIANCE_MXFP4_DEBUG:-0}" \
@@ -505,6 +512,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_kv_group_size.py
     python3 patch_topk_composite.py
     python3 patch_gdn_shared_build.py
+    python3 patch_dflash_selector_topk.py
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
