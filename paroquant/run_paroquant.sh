@@ -25,6 +25,10 @@ set -euo pipefail
 MODE=${MODE:-eval}
 PORT=${PORT:-8080}
 NAME=${NAME:-vllmparo}
+# Space-separated served ids. Eval default answers ONLY to Qwen3.8-PARO so nothing pinned to the
+# prod ids routes here by accident; the qwen_vllm_paro systemd unit (vllm-switch paro) overrides
+# with the prod ids so clients like the Pi (model id Qwen3.6) work unchanged.
+SERVED_NAMES=${SERVED_NAMES:-Qwen3.8-PARO}
 SPEC=${SPEC:-5}      # dflash re-sweep 2026-08: 5 beats 7 by 8-13% aggregate on this stack
 GPU_UTIL=${GPU_UTIL:-0.92}
 
@@ -135,7 +139,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     exec /opt/radiance_entrypoint.sh "$@"' \
   _ \
   "$MODEL" \
-  --served-model-name Qwen3.8-PARO \
+  --served-model-name $SERVED_NAMES \
   --host 0.0.0.0 --port "$PORT" \
   --kv-cache-dtype fp8 \
   --tensor-parallel-size 2 \
