@@ -11,8 +11,9 @@ don't have to build the stack yourself.
 > **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8),
 > **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), and
 > **Qwen3.8-27B-Quark-AWQ-MXFP4** (4-bit OCP micro-scaling), all with fp8 (or bf16/`auto`) KV cache on two
-> R9700 GPUs (tensor parallel). Other models, other weight formats, single or 3+ GPUs, and non-R9700
-> hardware are untested. Expect rough edges and breaking changes. Not production hardened. Use at your own
+> R9700 GPUs (tensor parallel). The MXFP4 launcher now detects the card count and configures
+> tensor-parallel size and KV cache for it, but other models, other weight formats, single or 3+ GPU
+> counts, and non-R9700 hardware remain **untested**. Expect rough edges and breaking changes. Not production hardened. Use at your own
 > risk.
 
 This repository carries the MXFP4 work on top of
@@ -41,7 +42,9 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 That serves **Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter: on two R9700, 9.4 GiB
-of weights per GPU, ~940k tokens of KV cache, 260K context. Tensor-parallel size and KV cache size are
+of weights per GPU, ~940k tokens of KV cache, 260K context, **22.7 ms/step** decode and **573 t/s**
+aggregate at 8 concurrent, at WikiText-2 perplexity 8.3708 and GSM8K 97.8% -- see
+[Measured](#measured). Tensor-parallel size and KV cache size are
 worked out from the GPUs you actually have -- there is nothing to edit for a different card count.
 `./serve-mxfp4.sh --help` lists every knob, and any argument it does not recognise is passed straight
 through to `vllm serve`.
@@ -328,11 +331,116 @@ of 25% -- the smaller win that actually holds.
 
 ### Measured
 
-These are the two gating measurements for the MXFP4 stack. Both were taken under `SPEC_METHOD=mtp`
-at `SPEC=4`, which was the default at the time; the shipped default is now the `dflash` drafter, and
-the numbers that moved with it are in [MXFP4-NOTES.md](MXFP4-NOTES.md).
+Two things to know before reading any number here. **Report step time, not tokens/s, for anything
+decode-related**: tokens/s swings ~14% on draft-acceptance luck alone at a fixed config, and
+`ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that out. And **speculative decoding packs
+several tokens into one stream update**, so there is no per-token latency to quote -- `update p50` is
+the wall-clock gap between updates and `tok/update` is how many tokens land in each.
 
-Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness:
+#### Current build, shipped defaults
+
+BetterBench 0.4.0, corpus v1.0, `2026-08-30`, on the reference box (2x R9700, TP2, `dflash` `SPEC=7`,
+`GPU_UTIL=0.98`, KV pinned, temp 0.7 / top_p 0.95 / top_k 20, cold prefix cache per request).
+Raw: `~/betterbench/results/epifix-1pass.json`.
+
+**Sampling depth differs by phase, and it matters.** The concurrency sweep ran 48 requests per level
+and the prefill sweep 8 runs per depth, so those are well sampled. The single-stream table is
+**one pass per category** -- treat each cell as a single observation, not a distribution. The
+`update p50` column is the exception worth trusting even so: it is the median of hundreds of update
+gaps inside one run, and it lands within 0.2-0.5 ms of the `22.66 ms/step` figure the decode work
+was gated on.
+
+| category | TTFT p50 (ms) | PP t/s | update p50 (ms) | tok/update | decode t/s |
+|---|--:|--:|--:|--:|--:|
+| code | 54.5 | 1229 | 22.9 | 5.77 | 253.8 |
+| json | 54.7 | 1335 | 22.8 | 5.90 | 266.7 |
+| math | 53.8 | 1319 | 22.9 | 5.81 | 256.0 |
+| summarization | 59.0 | 1899 | 22.8 | 5.45 | 244.6 |
+| file_edit | 59.1 | 1794 | 22.9 | 5.38 | 236.1 |
+| reasoning | 56.4 | 1648 | 23.1 | 5.00 | 218.5 |
+| chat | 59.1 | 1912 | 22.8 | 2.78 | 122.9 |
+| prose | 36.5 | 1534 | 23.2 | 2.54 | 109.4 |
+
+**Combined** (weighted code 0.3, reasoning 0.2, prose 0.15, json 0.15, file_edit 0.1,
+summarization 0.1): decode **224.3 t/s**, update p99 **23.4 ms**, TTFT p50 **53 ms**.
+
+The decode t/s spread across categories is almost entirely `tok/update`, not step time: every
+category holds 22.8-23.2 ms per update, and `code` reaches 253.8 t/s against `prose`'s 109.4 purely
+because code drafts accept 5.77 tokens per update where prose accepts 2.54. This is why the depth
+default is content-dependent -- see `SPEC` in [Serving shape](#serving-shape).
+
+**Concurrency** (48 requests per level, `MAXSEQS=8`):
+
+| concurrent | aggregate t/s | TTFT p50 (ms) | per-request decode t/s |
+|--:|--:|--:|--:|
+| 1 | 175.4 | 55.5 | 223.0 |
+| 2 | 302.6 | 83.8 | 202.8 |
+| 4 | 442.7 | 93.0 | 153.2 |
+| 8 | **572.8** | 115.4 | 104.2 |
+| 16 | 565.5 | 4430.2 | 101.2 |
+
+Aggregate throughput peaks at 8 and does not improve at 16, because `MAXSEQS` is 8 -- the extra
+requests queue, which is what the 4430 ms TTFT is. Serving 16 concurrent usefully means
+`MAXSEQS=16`, which also widens the decode band to `RADIANCE_MXFP4_DECODE_MAX_M=128`; measured
+there, conc-16 reaches 549-622 t/s at 75-79 ms steps. That path re-profiles KV rather than using
+the pin, so run `./calibrate-kv.sh` if you standardise on it.
+
+**Prefill** (8 runs per depth, cold prefix cache, prompt tokens / TTFT):
+
+| target depth | prompt tokens | TTFT p50 (ms) | PP t/s |
+|--:|--:|--:|--:|
+| 2k | 1,514 | 314.7 | 4810 |
+| 8k | 5,918 | 1,239.5 | 4773 |
+| 16k | 11,794 | 2,483.1 | 4749 |
+| 32k | 23,543 | 5,134.7 | 4585 |
+| 64k | 47,056 | 10,866.2 | 4330 |
+
+This sweep stops at 64k. For deeper context the reference points are the fp8-attention gate below
+(3831 t/s at 106k) and the 0.5.8 -> 0.7.4 table further down, which runs to 260k on a different
+harness -- the two are not directly comparable, and prefill throughput keeps falling with depth in
+both.
+
+**Quality.** WikiText-2 perplexity **8.3708** over 208,539 tokens, top-1 54.13%. GSM8K 500q greedy
+**97.8%**, holding 97.0-98.0 across the whole optimization stack. Weights 9.4 GiB/GPU, KV cache
+943,581 tokens, 3.60x concurrency at 262,144 tokens per request.
+
+#### Where the speed came from
+
+Each row is a separate landed change with its own gate, measured against the build immediately
+before it -- not a decomposition of one A/B. They are not additive: several move the same wall time.
+
+| change | measured | gate |
+|---|---|---|
+| decode launch-gap stack -- traced quant, fp8 residual stream, fused AR epilogue (`db9dba6`) | **25.4 -> 22.66 ms/step**; decode launches 1477 -> ~1080/step; weighted single-stream +14%, conc-8 aggregate +24% | GSM8K 500q 97.8, paired sign test p=0.219; epilogue kernels bit-identical to the traced reference |
+| dynamic verify width (`f68d215`) | conc-8 steps 52-57 -> **46-47 ms**, aggregate 391-413 -> 444-461 t/s (**+11-13%**); single-stream a wash | lossless by construction -- speculative verification preserves the output distribution at any proposal length |
+| fp8 QK + PV legs in prefill attention (`afa21b5`) | prefill 4442 -> 4648 t/s @ 40k, 3448 -> **3831 t/s @ 106k** (+10.8%); kernel-level 96.2 -> 150.5 TF at a hot 8k chunk | ppl 8.3708 -> 8.3707, top-1 54.09 -> 54.13%; GSM8K paired p=1.000. Upstream deleted these legs on *kernel* accuracy; the end-task gates say the error is free |
+| KV cache group size by capacity, not smallest bucket (`1bf3914`) | **739,544 -> 892,799 KV tokens** (+20.7%); concurrency 2.82x -> 3.41x | allocator-derived group size, unchanged for the n:1 layouts upstream targeted |
+| explicit KV pin over profiling (see [auto-detection](#hardware-auto-detection)) | 892,799 -> **943,581 KV tokens** (+5.7%); 3.60x | survives a full 260k-prefill sweep with no OOM |
+| int2 target verify head (`f882ea2`) | combined decode 170.0 -> **174.9 t/s** (+2.9%), all 8 categories +2.7-3.4%; conc 1/2/4 +2.8/+2.5/+1.6% | equivalence, not a score: 24/24 seeded sampled completions byte-identical against a sequential self-consistency control |
+| epilogue store width T=512 at prefill M (`5950b38`) | 726 -> **685 us** at M>=2048 (405 -> 429 GB/s); TTFT @ 32k 7443-7878 -> 7196/7260 ms | GSM8K 97.60, in band (the 512-way striding changes per-row summation order); decode untouched and byte-identical |
+| GDN `in_proj` single-GEMM merge (`588d5e6`) | single-stream 26.25 -> **25.50 ms/step** (-2.9%), -6.5% stacked with `WPERM=1`; removes 96 GEMM launches and 48 activation quants per forward | GSM8K 500q paired; drift is split-K reassociation only |
+| GDN decode conv+recurrent fused into one launch (`9a84208`) | 25.01 -> **24.91 ms/step** (-0.4%) | **bit-identical** -- 4/4 byte-equal greedy completions |
+| decode band extended to M<=128 (`44d48f0`, opt-in at `MAXSEQS>8`) | conc-16 **549-622 t/s** at 75-79 ms steps, +30% over the pre-extension attempt | dks1 bit-identical to the folded tile at every shape and M in {72, 96, 127, 128} |
+
+Two results worth carrying forward because they cost time to learn:
+
+- **`SPEC` depth is content-dependent, and tuning it on one content class picks the wrong default.**
+  A sweep on non-repetitive prose flipped the dflash default to 5; on BetterBench's weighted mix,
+  back to back on the same build, `SPEC=7` scores 184.3 t/s combined against `SPEC=5`'s 159.4
+  (+15.6%), because code/json/file_edit run 4.7-6.0 tok/update at depth 7 and a cap at 5 truncates
+  exactly the high-acceptance tail the mix rewards. `SPEC=5` keeps the edge on prose-heavy and on
+  batch throughput (conc-8 562 vs 544). Dynamic verify width mostly dissolves the trade. (`5692fed`)
+- **Fill the GPU before judging a tiling.** The epilogue prefetch above was justified by an M=2048
+  microbench on an idle, VRAM-squeezed GPU and shipped as a regression: at the real prefill shape
+  (M=8192) it measures 828 us against the original 726 -- **14% worse** -- because its +40
+  VGPRs/thread costs occupancy exactly when 8192 workgroups compete. (`eafcac9`, reverted in
+  `5950b38`)
+
+#### Provenance: the 0.5.8 -> 0.7.4 baseline
+
+The cross-image A/B that established the stack, kept because it is the one clean comparison this box
+can make and the numbers above are all measured downstream of it. Both arms under `SPEC_METHOD=mtp`
+at `SPEC=4`, which was the default at the time; the shipped default is now the `dflash` drafter.
 
 | | 0.5.8 | 0.7.4 | |
 |---|---|---|---|
@@ -344,15 +452,12 @@ Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness:
 | decode short / medium | 63.0 / 67.4 | **67.1 / 67.5** | +6.5% / +0.1% |
 | WikiText-2 PPL | 8.3335 | 8.3719 | +0.46% |
 
-KV cache 857,399 tokens at `GPU_UTIL=0.98` under vLLM's own memory profiling; the explicit `KV_MEM`
-pin the launcher now defaults to raises that to 943,581. All 304 linear layers run the W4A8 fp8-WMMA kernel;
-`aiter` is not used at all now that `RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain
-scales with context because it is mostly R4D's paged attention, whose share of prefill grows with
-sequence length.
+All 304 linear layers run the W4A8 fp8-WMMA kernel; `aiter` is not used at all now that
+`RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain scales with context because it is mostly
+R4D's paged attention, whose share of prefill grows with sequence length.
 
 **The decode GEMM (`RADIANCE_MXFP4_DECODE_MAX_M`, default 64), measured against the same 0.7.4 with
-it off.** Report step time, not tokens/s: tokens/s swings ~14% on draft-acceptance luck alone at
-fixed config, and `ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that out.
+it off.**
 
 | | off | on | |
 |---|---|---|---|
@@ -360,7 +465,7 @@ fixed config, and `ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that o
 | ms/step at 32k context | 36.53 | **33.47** | -8.4% |
 | aggregate tok/s, 4 concurrent | 170.1 | **218.5** | +28.5% |
 | aggregate tok/s, 8 concurrent | 295.0 | **353.1** | +19.7% |
-| prefill, all five lengths | — | — | unchanged (-0.3 to -1.2%) |
+| prefill, all five lengths | -- | -- | unchanged (-0.3 to -1.2%) |
 | GSM8K 500q, greedy | 97.80% | 97.80% | 3/3 discordant, sign test p=1.00 |
 
 Batched gains most because at M=20-40 aiter's tuned band uses `NUM_KSPLIT=1`, which leaves the grid
