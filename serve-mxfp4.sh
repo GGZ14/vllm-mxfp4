@@ -1,6 +1,8 @@
 #!/bin/bash
-# Serve Qwen3.8-27B in native MXFP4 (4-bit) on 2x AMD Radeon AI PRO R9700 (gfx1201), with an FP8
-# speculative drafter, on the vllm-radiance image.
+# Serve Qwen3.8-27B in native MXFP4 (4-bit) on AMD RDNA4 (gfx1201), with an FP8 speculative
+# drafter, on the vllm-radiance image. Developed on 2x Radeon AI PRO R9700, but the card count
+# is detected rather than assumed: gpu-detect.sh picks the tensor-parallel size and, where one
+# has been measured for the hardware, the KV cache pin. See kv-profiles.tsv.
 #
 #   ./setup-mxfp4.sh     one-time: checks the host, pulls the image, builds the checkpoints
 #   ./serve-mxfp4.sh     start the server on http://localhost:8080/v1
@@ -27,7 +29,7 @@
 #   the stock "current platform does not support native MXFP4/MXFP6" notice still prints and is a
 #   false alarm; it comes from a separate supports_mx() call.
 #
-# Port 8080 is production's and this needs both GPUs, so stop production first:
+# Port 8080 is production's and this needs every GPU it serves on, so stop production first:
 #   systemctl --user stop qwen_vllm_38          restore with: vllm-switch 38
 #
 # The measurements behind the defaults, the numerics reference, the 0.5.8 baseline and the history
@@ -38,7 +40,10 @@ set -euo pipefail
 # ---------------------------------------------------------------- usage / arguments
 usage() {
   cat <<'USAGE'
-serve-mxfp4.sh -- native MXFP4 Qwen3.8-27B on 2x R9700 (gfx1201)
+serve-mxfp4.sh -- native MXFP4 Qwen3.8-27B on AMD RDNA4 (gfx1201)
+
+GPU count, tensor-parallel size and KV cache size are all detected; nothing below has to be
+edited to run on a host with a different number of cards.
 
   ./setup-mxfp4.sh          one-time setup (host check, image, checkpoints)
   ./serve-mxfp4.sh          serve on http://localhost:8080/v1
@@ -60,7 +65,15 @@ Everything is an environment variable; these are the ones worth knowing.
   MAXLEN=262144             max context length
   CHUNK=8192                prefill chunk (--max-num-batched-tokens)
   GPU_UTIL=0.98             VRAM fraction; use 0.75 for perplexity work (prompt_logprobs)
-  KV_MEM=<bytes>            explicit KV cache size; 0 re-enables vLLM's own profiling
+
+  TP=<auto>                 tensor-parallel size; defaults to the largest of 8/4/2/1 that the
+                            detected cards can fill (head counts rule out 3, 6 and 12)
+  GPUS=0,1                  HIP indices to serve on; defaults to every card with enough VRAM
+  MIN_GPU_MIB=8192          VRAM floor for "usable"; excludes iGPUs from the count
+  KV_MEM=auto               KV cache size: auto uses a pin measured for your hardware if
+                            kv-profiles.tsv has one and lets vLLM profile if not; <bytes> pins
+                            explicitly; 0 forces profiling. ./calibrate-kv.sh measures a pin
+  ./gpu-detect.sh           print what was detected and which of these it would pick
 
   R4D_ATTN=1                R4D paged attention backend (0 = AITER unified attention)
   FAST_DRAFT=1              int2 draft head with an exact rerank
@@ -84,6 +97,14 @@ while [ "$#" -gt 0 ]; do
 done
 
 die() { echo "[serve-mxfp4] ERROR: $1" >&2; shift; for l in "$@"; do echo "  $l" >&2; done; exit 1; }
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# Hardware detection: how many usable AMD GPUs there are, which HIP indices they are, what TP
+# fits them and the model's head counts, and whether a KV pin has been measured for them. Sets
+# RAD_GPU_* / RAD_TP and defines rad_kv_lookup. See gpu-detect.sh for why a VRAM floor and not
+# a count of render nodes. Sourced rather than run so a single scan serves every default below.
+# shellcheck source=gpu-detect.sh
+. "$SCRIPT_DIR/gpu-detect.sh"
 
 # ---------------------------------------------------------------- container runtime
 # podman and docker differ in three places this script touches: `--replace` is podman-only,
@@ -119,13 +140,15 @@ preflight() {
       "check: ls -l /dev/kfd /dev/dri  and  dmesg | grep amdgpu"
   [ -d /dev/dri ] || die "/dev/dri is missing -- no GPU render nodes on this host"
 
-  local amd=0 d
-  for d in /sys/class/drm/renderD*; do
-    if [ "$(cat "$d/device/vendor" 2>/dev/null)" = "0x1002" ]; then amd=$((amd+1)); fi
-  done
-  if [ "$amd" -lt 2 ]; then
-    echo "[serve-mxfp4] WARNING: found $amd AMD GPU(s); this configuration serves with" >&2
-    echo "  --tensor-parallel-size 2 and will fail at startup with fewer than two." >&2
+  # gpu-detect.sh has already scanned. It counts only cards big enough to hold a shard, so a
+  # host whose only amdgpu node is an iGPU lands here with zero rather than serving onto 2 GiB
+  # of shared system memory and dying somewhere inside weight loading.
+  [ "$RAD_GPU_COUNT" -gt 0 ] || die "no AMD GPU with at least ${RAD_MIN_GPU_MIB} MiB of VRAM" \
+      "found:$([ -n "$RAD_GPU_SKIPPED" ] && echo "$RAD_GPU_SKIPPED" || echo " nothing on the amdgpu driver")" \
+      "lower the floor with MIN_GPU_MIB=<mib>, or name the cards with GPUS=0,1"
+  if [ "$RAD_GPU_COUNT" -gt "$TP" ]; then
+    echo "[serve-mxfp4] note: $RAD_GPU_COUNT usable GPUs, serving on $TP (indices $GPU_IDS)." >&2
+    echo "  TP must divide the model's head counts -- $RAD_TP_ALLOWED are the supported sizes." >&2
   fi
 
   [ -d "$MODELS" ] || die "MODELS=$MODELS does not exist" \
@@ -144,10 +167,20 @@ preflight() {
   # a bare `exec 3>&- 2>/dev/null` would apply that redirection to the shell itself and silence
   # every error message after it.
   if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+    # Name the container holding it. "stop the container you find in `podman ps`" was not
+    # enough on 2026-09-01: the server on the port had been started by running its script
+    # directly, so `systemctl --user stop` was a no-op against it, the port stayed held, and
+    # this check aborted a switch that looked like it should have worked. A container started
+    # outside systemd is stopped with the runtime, not the unit -- so print the runtime command.
+    local holder=""
+    holder=$("$RUNTIME" ps --format '{{.Names}}' 2>/dev/null | head -20 | tr '\n' ' ')
     die "port $PORT is already in use" \
-        "another server is running -- this one needs both GPUs to itself:" \
-        "  $RUNTIME ps                            # stop the container you find here" \
-        "  systemctl --user stop qwen_vllm_38     # or its unit, on the dev box (vllm-switch 38 restores it)" \
+        "another server is running -- this one needs every GPU it serves on:" \
+        "  running containers: ${holder:-<none: the port is held by a host process>}" \
+        "  $RUNTIME stop <name>                   # works however the container was started" \
+        "  systemctl --user stop qwen_vllm_paro   # ONLY if that unit started it -- check" \
+        "                                         # \`systemctl --user is-active\` first, a" \
+        "                                         # hand-started container is not systemd's" \
         "or serve on a different port: PORT=8081 ./serve-mxfp4.sh"
   fi
 
@@ -212,15 +245,8 @@ CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # 31.54 GiB and fails at startup. 0.98 gives 857,399 KV tokens against 840,019 at 0.97 and
 # survives a full 260k-prefill sweep with no OOM.
 GPU_UTIL=${GPU_UTIL:-0.98}
-# Explicit KV cache size, which OVERRIDES GPU_UTIL and skips vLLM's memory profiling. Defaulted
-# only for the throughput GPU_UTIL, because the ppl.py prompt_logprobs transient above is exactly
-# what this eats: with KV pinned, GPU_UTIL=0.75 would no longer buy the headroom it exists to buy.
-# KV_MEM=0 forces profiling back on. See the --kv-cache-memory note in the header for re-deriving.
-KV_MEM=${KV_MEM:-}
-# The KV pin was derived at max_num_seqs=8's capture sizes and activation peak; any other
-# MAXSEQS re-profiles instead (re-derive a pin per the header procedure if 16 becomes standing).
-if [ -z "$KV_MEM" ] && [ "$GPU_UTIL" = "0.98" ] && [ "${MAXSEQS:-8}" = "8" ]; then KV_MEM=18563072000; fi
-if [ "$KV_MEM" = "0" ]; then KV_MEM=""; fi
+# KV cache size. Resolved further down, once the batch shape it depends on is known.
+KV_MEM=${KV_MEM:-auto}
 # Which drafter to speculate with.
 #   mtp    -- the multi-token-prediction head inside the target checkpoint. One draft forward per
 #             speculative position, so RADIANCE_DYNAMIC_DRAFT can stop the loop early.
@@ -233,6 +259,11 @@ if [ "$KV_MEM" = "0" ]; then KV_MEM=""; fi
 # check further down prints the command if it is missing). SPEC_METHOD=mtp needs no drafter at all
 # and is the fallback if you do not want the second checkpoint.
 SPEC_METHOD=${SPEC_METHOD:-dflash}
+# Tensor parallelism, defaulted from the cards actually present. This was hardcoded to 2, which
+# is right for the reference box and wrong for every host that is not it: a single-card user got
+# a startup failure from inside a TP worker, and a four-card user got two idle cards.
+TP=${TP:-$RAD_TP}
+GPU_IDS=${GPU_IDS:-$RAD_GPU_INDICES}
 # MODELS is bind-mounted at /models below, so SNAP and DRAFTER must live somewhere under it.
 # Resolved HERE rather than next to SNAP further down: DRAFTER's default dereferences it, and under
 # `set -u` that made an un-exported MODELS an "unbound variable" abort rather than a default.
@@ -301,7 +332,6 @@ if [ "$SPEC_METHOD" = dflash ]; then RADIANCE_VERIFY_HEAD=${RADIANCE_VERIFY_HEAD
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
 MAXLEN=${MAXLEN:-262144}
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 # Chat template. It is mounted into the container by path, so it must exist ON THE HOST: this was
 # hardcoded to a file under ~/.cache/huggingface that only ever existed on the box it was written
 # on, which made a fresh clone fail at startup with a missing-file error from vllm rather than
@@ -506,11 +536,45 @@ fi
 # than hardcoding it, so changing CHUNK cannot silently drop prefill back onto RCCL.
 AR_MAX_KB=$(( (CHUNK * 5120 * 2) / 1024 + 4096 ))
 
+# ---------------------------------------------------------------- KV cache size
+# An explicit --kv-cache-memory OVERRIDES GPU_UTIL and skips vLLM's memory profiling entirely.
+# It is worth having because that profiling is deliberately conservative: it subtracts the
+# profile run's TRANSIENT activation peak plus the cudagraph estimate, both of which sit above
+# what steady-state serving needs. On the reference box the difference is 0.93 GiB per rank,
+# which is 5.7% of the cache -- but its size depends on the card, on the activation peak at
+# CHUNK and on the cudagraph capture set, so it is measured, not computed. See kv-profiles.tsv.
+#
+#   KV_MEM=auto     (default) use a pin measured for this hardware and batch shape if one
+#                   exists, otherwise let vLLM profile -- which is always safe
+#   KV_MEM=<bytes>  pin explicitly, consulting neither the table nor the profiler
+#   KV_MEM=0        force profiling on even where a measured pin exists
+#
+# The lookup is keyed on the batch shape as well as the hardware because MAXSEQS moves the
+# cudagraph capture sizes and CHUNK moves the prefill transient; a pin measured at one shape is
+# not valid at another. It is consulted only at the throughput GPU_UTIL, because the ppl.py
+# prompt_logprobs transient is exactly what a pinned KV eats: with KV pinned, GPU_UTIL=0.75
+# would no longer buy the headroom it exists to buy.
+KV_SRC=explicit
+if [ "$KV_MEM" = auto ]; then
+  KV_MEM=""; KV_SRC=profiled
+  if [ "$GPU_UTIL" = "0.98" ]; then
+    KV_MEM=$(rad_kv_lookup "$RAD_GPU_SIG" "${MAXSEQS:-8}" "$CHUNK" "$MAXLEN" "$SPEC_METHOD")
+    if [ -n "$KV_MEM" ]; then KV_SRC=measured; fi
+  fi
+fi
+if [ "$KV_MEM" = "0" ]; then KV_MEM=""; KV_SRC=profiled; fi
+
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
 echo "[run] $RUNTIME $IMAGE | port $PORT | $SPEC_METHOD spec=$SPEC | model $CSNAP"
-echo "[run] attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-profiled}"
+echo "[run] gpus=$RAD_GPU_COUNT x $RAD_GPU_NAME ($RAD_GPU_MIB MiB) tp=$TP hip=$GPU_IDS sig=$RAD_GPU_SIG"
+echo "[run] attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-none}($KV_SRC)"
+if [ "$KV_SRC" = profiled ] && [ "$GPU_UTIL" = "0.98" ]; then
+  echo "[run] no KV pin measured for $RAD_GPU_SIG at seqs=${MAXSEQS:-8} chunk=$CHUNK -- vLLM will"
+  echo "[run]   profile for itself (safe). ./calibrate-kv.sh measures one and typically reclaims"
+  echo "[run]   another ~5% of KV cache on hardware it has not seen before."
+fi
 echo "[run] cache=$CACHE"
 echo "[run] chat-template=$CHAT_TEMPLATE"
 echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME stop $NAME"
@@ -523,7 +587,8 @@ if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || tr
 exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
-  -e ROCR_VISIBLE_DEVICES=0,1 -e HIP_VISIBLE_DEVICES=0,1 -e HF_HUB_OFFLINE=1 \
+  -e ROCR_VISIBLE_DEVICES="$GPU_IDS" -e HIP_VISIBLE_DEVICES="$GPU_IDS" -e HF_HUB_OFFLINE=1 \
+  -e VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}" \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \
@@ -637,7 +702,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     cd /
     exec /opt/radiance_entrypoint.sh "$@"' _ \
     "$CSNAP" --served-model-name Qwen3.8 Qwen3.6 Qwen3.8-MXFP4 --host 0.0.0.0 --port "$PORT" \
-    --kv-cache-dtype fp8 --tensor-parallel-size 2 \
+    --kv-cache-dtype fp8 --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$GPU_UTIL" \
     ${KV_MEM:+--kv-cache-memory "$KV_MEM"} \
     --max-model-len "$MAXLEN" --max-num-seqs "${MAXSEQS:-8}" --max-num-batched-tokens "$CHUNK" \

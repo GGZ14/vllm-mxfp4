@@ -1,0 +1,22 @@
+# Measured --kv-cache-memory pins, one row per (hardware, batch shape).
+#
+# serve-mxfp4.sh consults this table automatically. A signature that is not listed falls back
+# to vLLM's own memory profiling, which is always safe -- it just leaves the margin below on
+# the table. ./calibrate-kv.sh measures a row for your host and writes it to
+# ~/.cache/radiance-mxfp4/kv-profiles.local.tsv, which is read after this file and wins.
+#
+# WHY THESE ARE NOT COMPUTED
+# vLLM sizes KV as requested_memory - non_kv_cache_memory - cudagraph_estimate, and
+# non_kv_cache_memory is the profile run's TRANSIENT peak, not the steady-state need. The
+# difference is real headroom, but its size depends on the activation peak at CHUNK, on the
+# cudagraph capture set, and on the allocator's fragmentation on that specific card. It is
+# found by pushing the pin up until startup fails and backing off, which is what
+# calibrate-kv.sh automates. Do not hand-edit these toward bigger numbers: the failure mode is
+# an OOM several minutes into startup, during cudagraph capture, with a traceback that blames
+# whatever allocation happened to be next.
+#
+# A row is only valid for the batch shape it was measured at. MAXSEQS changes the cudagraph
+# capture sizes and the activation peak; CHUNK changes the prefill transient directly.
+#
+# sig                 maxseqs chunk   maxlen  spec    bytes           note
+2x7551-32624	8	8192	262144	dflash	18563072000	2x R9700 32 GiB, gfx1201; 943,581 KV tokens vs 892,799 profiled (+5.7%); survives a full 260k prefill sweep

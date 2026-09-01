@@ -40,15 +40,29 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"Qwen3.8","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-That serves **Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter: 9.4 GiB of weights per
-GPU, ~940k tokens of KV cache, 260K context. `./serve-mxfp4.sh --help` lists every knob, and any
-argument it does not recognise is passed straight through to `vllm serve`.
+That serves **Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter: on two R9700, 9.4 GiB
+of weights per GPU, ~940k tokens of KV cache, 260K context. Tensor-parallel size and KV cache size are
+worked out from the GPUs you actually have -- there is nothing to edit for a different card count.
+`./serve-mxfp4.sh --help` lists every knob, and any argument it does not recognise is passed straight
+through to `vllm serve`.
+
+```bash
+./gpu-detect.sh       # what it found, and what it will do with it
+```
+```
+AMD GPUs usable:  2 x Radeon AI PRO R9700 (0x7551, 32624 MiB each)
+HIP indices:      0,1
+skipped (<8192 MiB): 2:0x13c0:2048MiB
+tensor parallel:  2   (supported: 8 4 2 1)
+hardware sig:     2x7551-32624
+KV cache pin:     18563072000 bytes (17.29 GiB/GPU, measured)
+```
 
 **What setup does, and why each step exists.** Nothing here is an optimization you can skip:
 
 | | |
 |---|---|
-| 1. host | `/dev/kfd` + `/dev/dri`, two AMD GPUs, a container runtime (podman or docker, auto-detected), disk |
+| 1. host | `/dev/kfd` + `/dev/dri`, at least one AMD GPU with 8 GiB+ of VRAM, a container runtime (podman or docker, auto-detected), disk |
 | 2. image | pulls `stilldeadcode/vllm-radiance:0.9.3` |
 | 3. download | `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` (~19 GiB), fetched with the image's own `huggingface_hub`, so the host needs no Python |
 | 4. checkpoint | rewrites it with an **fp8 MTP head** (`fp8_mtp.py`, ~15 min). AMD's release does not load as-is: its `mtp.*` layers are bf16 but named in neither `exclude` nor `layer_quant_config`, so vLLM applies the mxfp4 scheme to them and dies with `Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))` |
@@ -61,8 +75,10 @@ before the engine comes up. It looks idle; it is compiling. That result is cache
 
 ### Requirements
 
-- **AMD Radeon AI PRO R9700 (gfx1201), two of them.** The image is compiled for gfx1201 only and this
-  configuration serves tensor-parallel across two cards. It will not start with one.
+- **An AMD RDNA4 (gfx1201) GPU.** The image is compiled for gfx1201 only. Developed on two Radeon AI
+  PRO R9700, but the card count is **detected, not assumed**: `./serve-mxfp4.sh` picks the
+  tensor-parallel size from the cards it finds and sizes the KV cache for them. One card works; four
+  work. See [Hardware auto-detection](#hardware-auto-detection).
 - **Linux host with the amdgpu kernel driver**, exposing `/dev/kfd` and `/dev/dri`. ROCm userspace lives
   inside the image; nothing but the driver is needed on the host.
 - **podman or docker.** podman is what this is developed against and is preferred (`--replace`,
@@ -123,6 +139,66 @@ table rather than assuming.
 
 ---
 
+## Hardware auto-detection
+
+`serve-mxfp4.sh` works out three things for itself at startup. All three are overridable; none has to
+be edited to move between hosts.
+
+**Which GPUs.** `gpu-detect.sh` reads `mem_info_vram_total` out of sysfs for every `amdgpu` render
+node -- no `rocm-smi` on the host, no container start just to count cards. Anything below
+`MIN_GPU_MIB` (8192) is excluded, which is what keeps an integrated GPU out of the count. That matters
+more than it sounds: the development box reports **three** AMD render nodes -- two R9700 and a 2 GiB
+Granite Ridge iGPU -- and a naive count picks `--tensor-parallel-size 3`.
+
+**Tensor-parallel size.** The largest of `8 4 2 1` the usable cards can fill. `3`, `6` and `12` are
+excluded even though they divide `num_attention_heads=24`, because TP must also divide the GDN layers'
+`linear_num_key_heads=16` and `linear_num_value_heads=48`. (Fixing that is what
+[TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) is for.) A three-card host therefore serves on two and
+leaves one idle, and says so.
+
+**KV cache size.** An explicit `--kv-cache-memory` beats letting vLLM profile, because profiling is
+deliberately conservative: it subtracts the profile run's *transient* activation peak plus the
+cudagraph estimate, neither of which the steady state needs alongside a full cache. On the R9700 pair
+that conservatism is 0.93 GiB per rank -- **5.7% of the cache**, 892,799 KV tokens against 943,581.
+
+The size of that margin is not in any log. It depends on the activation peak at `CHUNK`, on the
+cudagraph capture set `MAXSEQS` produces, and on how the allocator fragments on that particular card,
+so it is *measured*, not computed. Measured rows live in [`kv-profiles.tsv`](kv-profiles.tsv), keyed on
+hardware **and** batch shape:
+
+```
+# sig            maxseqs chunk  maxlen  spec    bytes
+2x7551-32624     8       8192   262144  dflash  18563072000
+```
+
+A signature that is not in the table falls back to vLLM's own profiling. **That is always safe** -- it
+just leaves the margin unclaimed, and the launcher prints a one-line note saying so.
+
+To claim it on your own hardware:
+
+```bash
+./calibrate-kv.sh              # ~15 min, needs the GPUs to itself
+./calibrate-kv.sh --dry-run    # show the plan, run nothing
+./calibrate-kv.sh --quick      # pass 1 only: pin what vLLM profiles, no search
+```
+
+Pass 1 profiles. Pass 2 raises the pin in 2% steps until the server stops coming up, then backs off one
+step. A step only counts as passing if the server answers `/health` **and** completes a `CHUNK`-sized
+prefill plus a decode -- reaching `GPU KV cache size` is not enough, because the cache is allocated
+before cudagraph capture and capture is where an over-committed pin actually dies. The result is
+written to `~/.cache/radiance-mxfp4/kv-profiles.local.tsv`, which is read after the shipped table and
+wins over it. Re-run it after changing `MAXSEQS` or `CHUNK`; a pin is only valid at the shape it was
+measured at.
+
+| | | |
+|---|---|---|
+| `TP` | auto | tensor-parallel size |
+| `GPUS` | auto | HIP indices to serve on, e.g. `GPUS=0,1`. Overrides the VRAM floor |
+| `MIN_GPU_MIB` | `8192` | VRAM floor for "usable". Lower it to admit a small card, raise it to skip one |
+| `KV_MEM` | `auto` | `auto` = measured pin if one exists, else profile. `<bytes>` = pin explicitly. `0` = force profiling |
+
+---
+
 ## Knobs
 
 Every default below is the measured production configuration. They are all `${VAR:-default}`, so override
@@ -152,11 +228,12 @@ running it.
 |---|---|---|
 | `SPEC_METHOD` | `dflash` | `dflash` (block-diffusion drafter, one graphed pass, needs the second checkpoint) or `mtp` (the head inside the target, no extra download) |
 | `SPEC` | `7` dflash / `4` mtp | speculative depth. Under dflash it is **content-dependent**: 7 wins on a weighted mix (code/JSON run 4.7-6.0 tok/update), 5 wins on prose-heavy or batch-throughput serving. `RADIANCE_DYNAMIC_WIDTH` mostly dissolves the trade |
-| `MAXSEQS` | `8` | max concurrent sequences. Above 8 the decode band widens to `RADIANCE_MXFP4_DECODE_MAX_M=128` automatically, and the `KV_MEM` pin no longer applies |
+| `MAXSEQS` | `8` | max concurrent sequences. Above 8 the decode band widens to `RADIANCE_MXFP4_DECODE_MAX_M=128` automatically, and the `KV_MEM` lookup misses -- a pin is keyed on the batch shape, so re-run `./calibrate-kv.sh` if you standardise on another one |
 | `MAXLEN` | `262144` | context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this, not the chunk size |
 | `CHUNK` | `8192` | prefill chunk. `RADIANCE_AR_MAX_KB` is derived from it, so raising it cannot silently drop prefill onto RCCL |
 | `GPU_UTIL` | `0.98` | the ceiling on this box. Use `0.75` for perplexity work: `prompt_logprobs` allocates a 1-1.7 GiB transient vLLM does not reserve for |
-| `KV_MEM` | `18563072000` | explicit KV cache size, which overrides `GPU_UTIL` and skips profiling. Worth 892,799 -> 943,581 tokens. Applied only at `GPU_UTIL=0.98` and `MAXSEQS=8`; `KV_MEM=0` re-enables profiling. Re-derive it after anything that moves weights, cudagraph sizes or `CHUNK` |
+| `KV_MEM` | `auto` | KV cache size. `auto` looks up a pin measured for your hardware and batch shape and falls back to vLLM's profiling if there is none; `<bytes>` pins explicitly; `0` forces profiling. Consulted only at `GPU_UTIL=0.98`, since a pinned KV is exactly what the `prompt_logprobs` transient eats. Worth 892,799 -> 943,581 tokens on the R9700 pair. See [Hardware auto-detection](#hardware-auto-detection) |
+| `TP` / `GPUS` | auto | tensor-parallel size and the HIP indices to serve on. Detected from the cards present |
 | `ASYNC` | `0` | async scheduling. vLLM refuses it together with `disable_padded_drafter_batch`, so the two are one switch; the unpad lever is ~+50% single-stream under mtp |
 | `EXTRA` | empty | extra `vllm serve` flags (or just pass them as arguments) |
 
@@ -471,6 +548,9 @@ The MXFP4 entry points at the repo root:
 |---|---|
 | `setup-mxfp4.sh` | one-time setup: host check, image, checkpoints, kernels. Idempotent |
 | `serve-mxfp4.sh` | the launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds |
+| `gpu-detect.sh` | GPU/TP/KV detection, sourced by the launcher. Run it directly to see what it finds |
+| `calibrate-kv.sh` | measures a `--kv-cache-memory` pin for your hardware and saves it |
+| `kv-profiles.tsv` | pins measured so far, keyed on hardware and batch shape |
 | `fp8_mtp.py` | builds the loadable checkpoint from AMD's release (setup drives it) |
 | `MXFP4-NOTES.md` | the measurements, traps and history behind the defaults |
 | `run_mxfp4_074.sh` | compatibility shim -- the launcher's old name, forwards to `serve-mxfp4.sh` |
