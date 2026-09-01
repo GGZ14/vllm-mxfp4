@@ -64,15 +64,19 @@ ok "container runtime: $RUNTIME"
     "ROCm userspace ships inside the image, but the kernel driver must be on the host"
 [ -d /dev/dri ] || die "/dev/dri is missing -- no GPU render nodes on this host"
 
-gpus=0
-for d in /sys/class/drm/renderD*; do
-  if [ "$(cat "$d/device/vendor" 2>/dev/null)" = "0x1002" ]; then gpus=$((gpus+1)); fi
-done
-if [ "$gpus" -lt 2 ]; then
-  echo "  WARNING: found $gpus AMD GPU(s). The serve runs tensor-parallel across two R9700s and"
-  echo "  will not start with fewer. Setup can still prepare everything else."
+# Same scan the launcher uses, so setup and serve cannot disagree about what hardware is here.
+# It counts only cards big enough to hold a shard: a bare count of amdgpu render nodes includes
+# integrated graphics, which is three rather than two on the development box.
+# shellcheck source=gpu-detect.sh
+. "$(cd "$(dirname "$0")" && pwd)/gpu-detect.sh"
+if [ "$RAD_GPU_COUNT" -lt 1 ]; then
+  echo "  WARNING: no AMD GPU with at least ${RAD_MIN_GPU_MIB} MiB of VRAM."
+  echo "  Found:${RAD_GPU_SKIPPED:- nothing on the amdgpu driver}. Setup can still prepare everything else."
 else
-  ok "$gpus AMD GPUs visible"
+  ok "$RAD_GPU_COUNT AMD GPU(s) usable: $RAD_GPU_NAME, $RAD_GPU_MIB MiB each -> tensor-parallel $RAD_TP"
+  if [ -n "$RAD_GPU_SKIPPED" ]; then
+    echo "  (skipped as too small:$RAD_GPU_SKIPPED)"
+  fi
 fi
 
 command -v git >/dev/null 2>&1 || die "git is required (the libr4d build clones it)"
