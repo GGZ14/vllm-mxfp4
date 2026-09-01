@@ -10,9 +10,13 @@
 #
 # It needs two checkpoints under $MODELS, both produced by setup-mxfp4.sh:
 #   Qwen3.8-27B-MXFP4-mtpfp8   AMD's amd/Qwen3.8-27B-Quark-AWQ-MXFP4 with the MTP head requantized
-#                              to fp8 by ./fp8_mtp.py. NOT optional: AMD's release leaves mtp.* out
-#                              of both `exclude` and `layer_quant_config`, so vLLM applies the mxfp4
-#                              scheme to a bf16 head and asserts on a half-width parameter at load.
+#                              to fp8 by ./fp8_mtp.py. NOT optional for THAT checkpoint: its exclude
+#                              list does name the mtp.* layers, but as tensor names (mtp.fc.weight,
+#                              all 15 .weight-suffixed) among 112 module names, and quark matches
+#                              modules -- so the exclusion never fires, vLLM applies the mxfp4
+#                              scheme to a bf16 head, and it asserts on a half-width parameter.
+#                              A checkpoint that declares mtp.* in layer_quant_config (or excludes
+#                              it by module name) loads as-is: point SNAP at it and skip fp8_mtp.py.
 #                              The drafter is fp8 and not mxfp4 on purpose -- 4-bit costs more
 #                              acceptance than it saves in bandwidth, and AWQ does not rescue it.
 #   Qwen3.8-27B-DFlash2-FP8    the block-diffusion drafter used by SPEC_METHOD=dflash (the default).
@@ -472,10 +476,14 @@ if [ ! -f "$SNAP/config.json" ] && [ ! -L "$SNAP/config.json" ]; then
   echo >&2
   echo "  ./setup-mxfp4.sh" >&2
   echo >&2
-  echo "It is not an optimization you can skip. AMD's release does not load as-is: its bf16 mtp.*" >&2
-  echo "layers are named in neither \`exclude\` nor \`layer_quant_config\`, so vLLM applies the mxfp4" >&2
-  echo "scheme to them and asserts on a half-width parameter. ./fp8_mtp.py requantizes that head to" >&2
-  echo "fp8 and writes the matching layer_quant_config; setup-mxfp4.sh just drives it for you." >&2
+  echo "It is not an optimization you can skip. AMD's release does not load as-is: its exclude list" >&2
+  echo "names the bf16 mtp.* layers as TENSOR names (mtp.fc.weight) among module names, so quark's" >&2
+  echo "module match never fires, vLLM applies the mxfp4 scheme to them, and it asserts on a" >&2
+  echo "half-width parameter. ./fp8_mtp.py requantizes that head to fp8 and writes the matching" >&2
+  echo "layer_quant_config; setup-mxfp4.sh just drives it for you." >&2
+  echo >&2
+  echo "A checkpoint that already declares mtp.* in layer_quant_config needs none of this --" >&2
+  echo "point SNAP straight at it, e.g. the uncensored MXFP4 build linked in the README." >&2
   exit 1
 fi
 # HF_HUB_OFFLINE=1 inside the container and the cache mounts at /root/.cache/huggingface, so vllm

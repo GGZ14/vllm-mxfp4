@@ -67,9 +67,9 @@ KV cache pin:     18563072000 bytes (17.29 GiB/GPU, measured)
 |---|---|
 | 1. host | `/dev/kfd` + `/dev/dri`, at least one AMD GPU with 8 GiB+ of VRAM, a container runtime (podman or docker, auto-detected), disk |
 | 2. image | pulls `stilldeadcode/vllm-radiance:0.9.3` |
-| 3. download | `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` (~19 GiB), fetched with the image's own `huggingface_hub`, so the host needs no Python |
-| 4. checkpoint | rewrites it with an **fp8 MTP head** (`fp8_mtp.py`, ~15 min). AMD's release does not load as-is: its `mtp.*` layers are bf16 but named in neither `exclude` nor `layer_quant_config`, so vLLM applies the mxfp4 scheme to them and dies with `Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))` |
-| 5. drafter | `tcclaviger/Qwen3.8-27B-DFlash2-FP8` (2 GiB), the block-diffusion drafter. `--no-drafter` skips it; then serve with `SPEC_METHOD=mtp` |
+| 3. download | [`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) (~19 GiB), fetched with the image's own `huggingface_hub`, so the host needs no Python |
+| 4. checkpoint | rewrites it with an **fp8 MTP head** (`fp8_mtp.py`, ~15 min). AMD's release does not load as-is: its `mtp.*` layers are bf16, and its `exclude` list names them as *tensor* names among *module* names, so the exclusion never matches, vLLM applies the mxfp4 scheme to them, and the load dies with `Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))`. See [Checkpoints](#checkpoints) -- a checkpoint that already ships an fp8 MTP head skips this step |
+| 5. drafter | [`tcclaviger/Qwen3.8-27B-DFlash2-FP8`](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) (2 GiB), the block-diffusion drafter. `--no-drafter` skips it; then serve with `SPEC_METHOD=mtp` |
 | 6. kernels | builds the pinned **libr4d** inside the image (a few minutes, cached in `~/.cache/radiance-libr4d`). The kernel *shipped in the image* predates the gated-delta-net overflow fix and NaNs this model's output -- WikiText-2 perplexity 653586 against 8.3706 -- so this build is load-bearing. See [the GDN NaN](#the-gated-delta-net-nan-fixed-upstream) |
 
 The first `serve-mxfp4.sh` after setup spends several extra minutes compiling Triton and inductor kernels
@@ -89,6 +89,44 @@ before the engine comes up. It looks idle; it is compiling. That result is cache
 - **~60 GiB free disk** for a full setup: 19 source + 19 built checkpoint + 2 drafter + ~10 image. The
   source download can be deleted once the checkpoint is built; setup prints the command.
 - No Python, no ROCm, no HF CLI on the host. Setup runs everything that needs them inside the image.
+
+### Checkpoints
+
+Everything the MXFP4 path uses, and what setup does with each. `setup-mxfp4.sh` downloads the
+defaults on its own; the repo ids are `${VAR:-default}` overrides, so pointing at a different one
+needs no edit.
+
+| | | |
+|---|---|---|
+| **[`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4)** | the default target, ~19 GiB | AMD's Quark OCP micro-scaling release, Apache-2.0. **Needs the MTP-head rewrite** below; setup does it for you. `SRC_REPO=` |
+| **[`just1moremodel/Qwen3.8-27B-Uncensored-MXFP4-awq`](https://huggingface.co/just1moremodel/Qwen3.8-27B-Uncensored-MXFP4-awq)** | an abliterated / uncensored MXFP4 build of the same architecture | **Ships the MTP head already at `fp8_e4m3`**, so it needs no rewrite -- point `SNAP` straight at it. Opt-in: it has had its refusal behaviour removed, so it will answer things the base model declines |
+| **[`tcclaviger/Qwen3.8-27B-DFlash2-FP8`](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8)** | the drafter, 2 GiB | block-diffusion drafter for `SPEC_METHOD=dflash`, the default. `--no-drafter` skips it; then serve `SPEC_METHOD=mtp`. `DRAFT_REPO=` |
+
+To serve the uncensored variant, download it under `$MODELS` and point the launcher at it -- there is
+no rewrite step and nothing else changes:
+
+```bash
+SNAP=$HOME/models/Qwen3.8-27B-Uncensored-MXFP4-awq ./serve-mxfp4.sh
+```
+
+*Verified from its `config.json`, which declares all 8 `mtp.*` modules `fp8_e4m3` per-channel in
+`layer_quant_config` -- exactly what `fp8_mtp.py` produces. Not load-tested here; the numbers
+throughout this README are the AMD checkpoint.*
+
+**Why the AMD release needs a rewrite, and how to tell whether another one does.** Its `mtp.*`
+layers are bf16, and its `exclude` list does name them -- but as **tensor** names
+(`mtp.fc.weight`, all 15 of them `.weight`-suffixed) among 112 **module** names
+(`model.visual.blocks.0.attn.qkv`). Quark matches modules, so `mtp.fc.weight` never matches the
+module `mtp.fc`, the exclusion silently does nothing, vLLM applies the mxfp4 scheme to a bf16 head,
+and the load dies with:
+
+```
+Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))
+```
+
+So the check for any other MXFP4 checkpoint is not "is `mtp` mentioned" but **"is it mentioned the
+same way as everything else"** -- module names in `exclude`, or an entry in `layer_quant_config`.
+`fp8_mtp.py` fixes the AMD one by requantizing the head to fp8 and declaring it properly.
 
 ### Serving something other than MXFP4
 
