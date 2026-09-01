@@ -24,7 +24,9 @@ reproduce the baseline these numbers are measured against:
 
 Checkpoint built by this repo's ./fp8_mtp.py from amd/Qwen3.8-27B-Quark-AWQ-MXFP4; run it once
 before this script (it prints the command if the checkpoint is missing). AMD's release will not
-load as-is: its mtp.* layers are bf16 but named in neither `exclude` nor `layer_quant_config`,
+load as-is: its mtp.* layers are bf16 and its `exclude` list names them as TENSOR names
+(`mtp.fc.weight`, all 15 `.weight`-suffixed) among 112 module names, so quark's module-name match
+never fires,
 so vLLM applies the global mxfp4 scheme to them and asserts on a half-width parameter.
 
 The drafter is FP8, not MXFP4, and that is a settled result: MXFP4 RTN cost acceptance
