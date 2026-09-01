@@ -144,9 +144,11 @@ if [ -f "$SNAP/config.json" ]; then
   ok "already built"
 else
   echo "  requantizing the MTP head to fp8 (~15 minutes, one file rewritten)."
-  echo "  This is not optional: AMD's release leaves mtp.* out of both 'exclude' and"
-  echo "  'layer_quant_config', so vLLM applies the mxfp4 scheme to a bf16 head and asserts"
-  echo "  on a half-width parameter at load."
+  echo "  This is not optional for AMD's release: its exclude list names the bf16 mtp.* layers"
+  echo "  as tensor names (mtp.fc.weight) among module names, so quark's module match never"
+  echo "  fires, the mxfp4 scheme lands on a bf16 head, and vLLM asserts on a half-width"
+  echo "  parameter at load. A checkpoint that declares mtp.* in layer_quant_config skips this:"
+  echo "  set SNAP=<that checkpoint> and serve it directly."
   case "$SNAP" in
     "$MODELS"/*) CSNAP="/models/${SNAP#"$MODELS"/}" ;;
     *) die "SNAP ($SNAP) must live under MODELS ($MODELS)" ;;
