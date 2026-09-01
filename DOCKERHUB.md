@@ -6,7 +6,7 @@ vLLM inference server for the AMD Radeon AI PRO R9700 (gfx1201 / RDNA4). Bundles
 
 | | |
 |---|---|
-| Models | **Qwen3.8-27B-FP8** / **Qwen3.6-27B-FP8** (gated-delta-net hybrids, architecturally identical), **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts top-8), **Gemma-4-31B-it-FP8** (dense, sliding + global attention, vision) |
+| Models | **Qwen3.8-27B-FP8** / **Qwen3.6-27B-FP8** (gated-delta-net hybrids, architecturally identical), **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts top-8), **Gemma-4-31B-it-FP8** (dense, sliding + global attention, vision), **Qwen3.8-27B-Quark-AWQ-MXFP4** (4-bit, see [MXFP4](#mxfp4-4-bit-checkpoints)) |
 | KV cache | fp8, bf16 or `auto` |
 | GPUs | 2x R9700, tensor parallel (TP=2) |
 
@@ -115,7 +115,7 @@ what it covers. The build clones a pinned tag and compiles it with its own `hipc
 | `RADIANCE_MXFP4_W4A8` | `0` | routes large-M (prefill) MXFP4 linears to a hand-written fp8-WMMA HIP kernel. Triton will not emit gfx1201's fp8 matrix instruction -- measured register-resident, fp8 WMMA runs **325 TFLOP/s vs f16's 160**, while Triton's own fp8 `tl.dot` manages only 43 because it upconverts to 16-bit and pays conversion on top. Against the tuned aiter path it replaces this measures **1.47-2.26x faster and 4.2x more accurate** (relative error 0.0265 vs 0.1119 against exact arithmetic), because fp8 activations beat the mxfp4 ones aiter quantizes to. Off by default because it makes the layer W4A8 rather than the checkpoint's declared W4A4: more precise, but no longer bit-identical to emulation. Requires `RADIANCE_MXFP4=1`. |
 | `RADIANCE_MXFP4_W4A8_MIN_M` | `0` | batch size above which `RADIANCE_MXFP4_W4A8` takes over from aiter. **0 means never fall back**, which is both a correctness and a speed choice. Correctness: aiter's W4A4 path returns a wrong result for N=5120 K=3072 (`o_proj`) -- replayed against an fp32 reference it lands at rel=1.066 with ~1/35th of the correct magnitude, against 0.0017 for ours -- because that shape has no tuned table in `mxfp4-configs/` and falls into aiter's generic bands. At the old default of 16 this was invisible in prefill (M=17, our kernel) and silently poisoned decode (M=9, aiter). Speed: 0 used to cost ~55% of decode because the only kernel below M=16 was the prefill-tiled one; `RADIANCE_MXFP4_DECODE_MAX_M` fixes that. Note the comparison is `M > MIN_M`, so 1 would still route M=1 to aiter -- use 0. |
 | `RADIANCE_MXFP4_TN4_MIN_M` | `2048` | batch size above which the W4A8 kernel switches from its TN=2 tile to the wider TN=4 one (BNF 64 -> 128). A-tile staging is 24% of the kernel and the wider tile amortises it, but only once there is enough work to fill it: measured **+10.0% at M=8192, +8.5% at 4096, +1.3% at 2048, -8.8% at 512**. Identical numerics either way. |
-| `RADIANCE_MXFP4_DECODE_MAX_M` | `48` | **decode-shaped MXFP4 GEMM for small M.** The W4A8 kernel above is tiled BM=256 for prefill; at decode M is `batch x (num_speculative_tokens+1)`, so at batch 1 with SPEC=4 it is 5 -- where that tile issues 4352 WMMA per wave against 5 real rows, **51x more matrix MACs than useful**. This routes `M <= 48` to a second kernel with TM=`ceil(M/16)` (no wasted M-fragments), split-K to fill the CUs, and BK=128 -- which reverses the prefill tuning, where BK=128 measured -34%, because that loss was purely an LDS occupancy cliff a 16-row A tile never reaches. Needs `RADIANCE_MXFP4_W4A8_MIN_M=0` to be reachable at all; at 16 the M=5 call never enters our launcher. Measured on 2x R9700 against the same build with it off: single-stream step time **35.06 -> 32.16 ms (-8.3%)**, aggregate throughput **+28.5% at 4 concurrent** and **+19.7% at 8**, prefill unchanged within 1.2%. Lossless in practice: GSM8K 500q greedy scored 97.80% both ways, 3/3 discordant, exact sign test p=1.00, at 14% less wall clock. Set `0` to send every M to the prefill tile. |
+| `RADIANCE_MXFP4_DECODE_MAX_M` | `0` (off; the source repo's `serve-mxfp4.sh` sets **64**, or 128 above 8 concurrent sequences) | **decode-shaped MXFP4 GEMM for small M.** The W4A8 kernel above is tiled BM=256 for prefill; at decode M is `batch x (num_speculative_tokens+1)`, so at batch 1 with SPEC=4 it is 5 -- where that tile issues 4352 WMMA per wave against 5 real rows, **51x more matrix MACs than useful**. This routes `M` up to that bound to a second kernel with TM=`ceil(M/16)` (no wasted M-fragments), split-K to fill the CUs, and BK=128 -- which reverses the prefill tuning, where BK=128 measured -34%, because that loss was purely an LDS occupancy cliff a 16-row A tile never reaches. Needs `RADIANCE_MXFP4_W4A8_MIN_M=0` to be reachable at all; at 16 the M=5 call never enters our launcher. Measured on 2x R9700 against the same build with it off: single-stream step time **35.06 -> 32.16 ms (-8.3%)**, aggregate throughput **+28.5% at 4 concurrent** and **+19.7% at 8**, prefill unchanged within 1.2%. Lossless in practice: GSM8K 500q greedy scored 97.80% both ways, 3/3 discordant, exact sign test p=1.00, at 14% less wall clock. The bound must cover `max_num_seqs x (num_speculative_tokens + 1)` or the widest verify batches fall back onto the prefill tile. Set `0` to send every M to the prefill tile. |
 | `RADIANCE_MXFP4_MAX_M` | *(retired)* | read by builds up to 0.5.8, ignored since. It handed batches past M~256 back to vLLM's emulated path, where a single amortised bf16 dequant beat the fp4 kernel. That crossover only ever mattered against the aiter W4A4 path -- with `RADIANCE_MXFP4_W4A8=1` large M belongs to the fp8-WMMA kernel, which beats both -- and the fallback could not run here regardless: it reached quark's TileLang backend, which dies with `HIP runtime library (libamdhip64.so) not found` inside the vLLM worker, and the branch was specialised into the torch.compile graph during the M=8192 profile run, killing startup rather than one request. Setting it now has no effect. |
 | `RADIANCE_TOPK_TRITON_MIN_ROWS` | `1` | Row count at or above which `apply_top_k_top_p` uses the Triton kernel instead of a vocabulary-wide `logits.sort()`. Upstream vLLM hardcodes 8, on the assumption that sorting a few rows is cheap; on gfx1201 at vocab 248320 the sort is slower at *every* row count -- flat ~210 us for Triton to 20 rows against 235-1904 us for the sort, and the sort is not even monotonic in rows because torch switches algorithm around 8 (which is why batch 8 profiles faster than batch 4 upstream). Speculative decode sits under the gate: the rejection sampler calls it once per step on `batch x (SPEC+1)` rows -- 5 single-stream at SPEC=4 -- and the bonus-token sampler again on 1. Measured on 2x R9700 toggling only this: **32.38 -> 31.47 ms/step (-2.8%)**, decode 78.6 -> 80.8 tok/s, acceptance identical at 1.544. The two paths are **bit-identical** (same `-inf` mask, 0.0 max difference on kept entries), so this is scheduling only. Set `8` for upstream behaviour. |
 | `RADIANCE_FUSE_RMS_QUANT` | `1` | folds group-FP8 quant into the RMSNorm epilogue |
@@ -154,7 +154,7 @@ single-node hosts; needs `--cap-add SYS_NICE` under Docker's default seccomp.
 
 - AMD Radeon AI PRO R9700 (gfx1201). Compiled for gfx1201 only, won't run on other GPUs. Two GPUs (TP=2) is the only configuration tested so far.
 - Linux host with the amdgpu kernel driver and `/dev/kfd` + `/dev/dri`. ROCm userspace is inside the image.
-- Docker with device passthrough.
+- podman or docker, with device passthrough. podman is what this is developed against; the source repo's launcher auto-detects either.
 
 ## Run
 
@@ -305,6 +305,32 @@ Tool-calling and reasoning:
 ```
 
 Pass a template with `--chat-template file.jinja` if the model needs one. The image ships the `from_json` filter those templates often rely on.
+
+## MXFP4 (4-bit) checkpoints
+
+Quark OCP micro-scaling checkpoints (`quantization_config.quant_method: quark`, mxfp4 weights *and*
+activations, group 32, e8m0 scales) run **natively** on gfx1201 with `RADIANCE_MXFP4=1` -- e.g.
+`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`. Drop `--quantization`; the runtime reads the method from
+`config.json`. The native path is bit-identical to vLLM's emulation and multiples faster (6.1x at
+M=16 on gate_up 17408x5120), and with `RADIANCE_MXFP4_W4A8=1` the linears go to a hand-written
+fp8-WMMA HIP kernel instead. On the 27B that is 9.4 GiB of weights per GPU against ~12.6 for FP8,
+and the headroom goes straight into KV.
+
+This does **not** work by pointing `docker run` at AMD's checkpoint, for two reasons that both bite
+at load: AMD's release leaves its bf16 `mtp.*` layers out of both `exclude` and `layer_quant_config`
+so vLLM asserts on a half-width parameter, and the libr4d pinned in this image predates the
+gated-delta-net overflow fix, which NaNs this model's output. Both are handled by two scripts in the
+source repo:
+
+```bash
+git clone https://codeberg.org/ggz14/radiance-vllm-mxfp4 && cd radiance-vllm-mxfp4
+./setup-mxfp4.sh      # host check, image pull, checkpoints, kernels
+./serve-mxfp4.sh      # serve on http://localhost:8080/v1
+```
+
+`setup-mxfp4.sh` is idempotent and needs no Python, ROCm or HF CLI on the host -- it runs everything
+that needs them inside this image. `./serve-mxfp4.sh --help` lists the knobs; the full write-up,
+including the measurements behind each default, is in that repo's README.
 
 ## ParoQuant (0.10.0)
 
