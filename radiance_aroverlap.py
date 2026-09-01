@@ -45,7 +45,7 @@ is the part of this experiment worth keeping.
 
 CACHES. Enabling this changes the traced graph (the vllm::all_reduce node disappears into our
 op), so it needs its own torch.compile cache dir -- a warm cache from a non-overlap serve replays
-the OLD graph and silently ignores the feature. run_mxfp4_074.sh keys the cache on the flag.
+the OLD graph and silently ignores the feature. serve-mxfp4.sh keys the cache on the flag.
 """
 import os
 import sys

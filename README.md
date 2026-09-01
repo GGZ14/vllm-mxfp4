@@ -5,23 +5,340 @@ ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom k
 this card, plus RDNA4-tuned GEMM / attention / all-reduce paths and a dynamic MTP draft controller, so you
 don't have to build the stack yourself.
 
-> **Status: super early dev (v0.7.4). Experimental.** Everything here was built and measured on a few exact
-> setups: **Qwen3.8-27B-FP8** and **Qwen3.6-27B-FP8** (gated-delta-net hybrids, architecturally identical),
+> **Status: early dev, experimental.** Repo version `0.10.0`; the pinned image is
+> `stilldeadcode/vllm-radiance:0.9.3`. Everything here was built and measured on a few exact setups:
+> **Qwen3.8-27B-FP8** and **Qwen3.6-27B-FP8** (gated-delta-net hybrids, architecturally identical),
 > **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8),
 > **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), and
-> **Qwen3.8-27B-Quark-AWQ-MXFP4** (4-bit OCP micro-scaling, see [MXFP4](#mxfp4-4-bit-checkpoints)), all with
-> fp8 (or bf16/`auto`) KV cache on two R9700 GPUs (tensor parallel). Other models, other weight formats,
-> single or 3+ GPUs, and non-R9700 hardware are untested. Expect rough edges and breaking changes. Not
-> production hardened. Use at your own risk.
+> **Qwen3.8-27B-Quark-AWQ-MXFP4** (4-bit OCP micro-scaling), all with fp8 (or bf16/`auto`) KV cache on two
+> R9700 GPUs (tensor parallel). Other models, other weight formats, single or 3+ GPUs, and non-R9700
+> hardware are untested. Expect rough edges and breaking changes. Not production hardened. Use at your own
+> risk.
 
-This repository is the **source** for the image published as `stilldeadcode/vllm-radiance` on Docker Hub.
-See **[DOCKERHUB.md](DOCKERHUB.md)** for the full description, the complete environment-variable / knob
-reference, tested configuration, and stack versions.
+This repository carries the MXFP4 work on top of
+[vllm-radiance](https://codeberg.org/StillDeadcode/vllm-radiance), which is the source for the image
+published as `stilldeadcode/vllm-radiance` on Docker Hub. The launcher pulls that published image and
+applies this repo's patches and kernels at container start, so **running the MXFP4 stack never requires
+building an image**. See **[DOCKERHUB.md](DOCKERHUB.md)** for the image description, the complete
+environment-variable / knob reference, and stack versions.
 
-## Build
+---
+
+## Quickstart
+
+Two commands. `setup-mxfp4.sh` is idempotent -- re-run it any time; it skips whatever is already done.
+
+```bash
+git clone https://codeberg.org/ggz14/radiance-vllm-mxfp4 && cd radiance-vllm-mxfp4
+./setup-mxfp4.sh      # host check, image pull, checkpoints, kernels (~40 GiB, mostly download)
+./serve-mxfp4.sh      # serve on http://localhost:8080/v1
+```
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+That serves **Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter: 9.4 GiB of weights per
+GPU, ~940k tokens of KV cache, 260K context. `./serve-mxfp4.sh --help` lists every knob, and any
+argument it does not recognise is passed straight through to `vllm serve`.
+
+**What setup does, and why each step exists.** Nothing here is an optimization you can skip:
+
+| | |
+|---|---|
+| 1. host | `/dev/kfd` + `/dev/dri`, two AMD GPUs, a container runtime (podman or docker, auto-detected), disk |
+| 2. image | pulls `stilldeadcode/vllm-radiance:0.9.3` |
+| 3. download | `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` (~19 GiB), fetched with the image's own `huggingface_hub`, so the host needs no Python |
+| 4. checkpoint | rewrites it with an **fp8 MTP head** (`fp8_mtp.py`, ~15 min). AMD's release does not load as-is: its `mtp.*` layers are bf16 but named in neither `exclude` nor `layer_quant_config`, so vLLM applies the mxfp4 scheme to them and dies with `Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))` |
+| 5. drafter | `tcclaviger/Qwen3.8-27B-DFlash2-FP8` (2 GiB), the block-diffusion drafter. `--no-drafter` skips it; then serve with `SPEC_METHOD=mtp` |
+| 6. kernels | builds the pinned **libr4d** inside the image (a few minutes, cached in `~/.cache/radiance-libr4d`). The kernel *shipped in the image* predates the gated-delta-net overflow fix and NaNs this model's output -- WikiText-2 perplexity 653586 against 8.3706 -- so this build is load-bearing. See [the GDN NaN](#the-gated-delta-net-nan-fixed-upstream) |
+
+The first `serve-mxfp4.sh` after setup spends several extra minutes compiling Triton and inductor kernels
+before the engine comes up. It looks idle; it is compiling. That result is cached in
+`~/.radiance-cache-w4a8-093-gdnm` and later starts skip it.
+
+### Requirements
+
+- **AMD Radeon AI PRO R9700 (gfx1201), two of them.** The image is compiled for gfx1201 only and this
+  configuration serves tensor-parallel across two cards. It will not start with one.
+- **Linux host with the amdgpu kernel driver**, exposing `/dev/kfd` and `/dev/dri`. ROCm userspace lives
+  inside the image; nothing but the driver is needed on the host.
+- **podman or docker.** podman is what this is developed against and is preferred (`--replace`,
+  `keep-groups`); docker is handled by the launcher but is less exercised.
+- **~60 GiB free disk** for a full setup: 19 source + 19 built checkpoint + 2 drafter + ~10 image. The
+  source download can be deleted once the checkpoint is built; setup prints the command.
+- No Python, no ROCm, no HF CLI on the host. Setup runs everything that needs them inside the image.
+
+### Serving something other than MXFP4
+
+`docker-compose.yml` serves **Qwen3.8-27B-FP8** and is the path for the FP8 and Gemma checkpoints; it is a
+plain `vllm serve` with no patch prelude, so it is compose-shaped rather than script-shaped.
+
+```bash
+# put your model at ./models/Qwen/Qwen3.8-27B-FP8  (or set MODELS=/your/model/dir)
+docker compose up -d          # start; follow with: docker compose logs -f
+docker compose down           # stop
+```
+
+All of its tunables are `${VAR:-default}`, so override them from the shell or a `.env` file without editing
+it. With podman, `podman compose` takes the same file. The per-model notes (35B-A3B's
+`--max-num-batched-tokens >= 2240`, Gemma-4-31B's template and drafter) are in
+**[DOCKERHUB.md](DOCKERHUB.md#tested-so-far)**.
+
+---
+
+## Troubleshooting
+
+The launcher preflights the host and fails with the command that fixes it, so most of these surface as a
+one-line error rather than a traceback. The rest are what the log looks like when something is wrong.
+
+| Symptom | Cause and fix |
+|---|---|
+| `port 8080 is already in use` | Another server holds the port and, more importantly, the GPUs. Stop the container `podman ps` shows, or its systemd unit if it has one (`systemctl --user stop qwen_vllm_38` on the dev box). Or `PORT=8081 ./serve-mxfp4.sh` |
+| `no checkpoint at .../Qwen3.8-27B-MXFP4-mtpfp8` | Run `./setup-mxfp4.sh`. AMD's release cannot be served directly -- see step 4 above |
+| `no dflash drafter at ...` | `./setup-mxfp4.sh` fetches it, or serve without it: `SPEC_METHOD=mtp ./serve-mxfp4.sh` |
+| `chat template not readable` | `CHAT_TEMPLATE=<path>`; unset uses this repo's `qwen3.8-enhanced.jinja`. It is mounted by path, so it must exist **on the host** |
+| `/dev/kfd is missing` | The amdgpu kernel driver is not loaded. The image ships ROCm userspace, not the driver |
+| `AssertionError: Attempted to load weight (torch.Size([5120, 10240]))` | You pointed it at AMD's raw checkpoint instead of the one `fp8_mtp.py` builds |
+| Fluent but wrong output; perplexity in the hundreds of thousands | The stock libr4d NaNs the gated-delta-net. Confirm the launcher printed `[radiance] libr4d <pin> -> ...`; if you ran with `AUTO_R4D=0`, set `RADIANCE_MXFP4_SANITIZE=1` as a stopgap |
+| `IndexError` in `rocm_unquantized_gemm_impl` at load | The int2 draft head against a libr4d that ships `r4d_gemm_w4a16_nt_m64`. `FAST_DRAFT=0` |
+| Engine dies at startup on an `N=0` GEMM | A cache directory reused across a config that changes the traced graph. `rm -rf ~/.radiance-cache-w4a8-093*` and start again -- `CACHE` and `IMAGE` must always move together |
+| `running the draft eagerly` in the log | The drafter lost its CUDA graph, which is the whole point of `dflash`. Check `DRAFT_ATTN` supports full graphs (`TRITON_ATTN` does) |
+| `current platform does not support native MXFP4/MXFP6` | **False alarm.** It comes from a separate `supports_mx()` call. The line that matters is `[radiance] native MXFP4 enabled on gfx12x` |
+| Startup is slow and looks hung | First run compiles Triton/inductor kernels. Later runs reuse `$CACHE` |
+| OOM at startup after changing `MAXSEQS`, `CHUNK` or a graph-changing knob | The KV pin (`KV_MEM`) was derived at `MAXSEQS=8`. `KV_MEM=0` re-enables vLLM's own profiling |
+
+Three lines in the log say the fast paths actually bound:
+
+```
+Using RadianceMxfp4W4A8LinearKernel for MXFP4 GEMM     the W4A8 kernel won the selection
+[radiance] native MXFP4 enabled on gfx12x              the aiter fp4 gate was relaxed
+R4D selections table (RADIANCE_R4D_REPORT=1, on)       which kernels bound, and why not
+```
+
+A kernel that fails to bind **falls back silently** and costs performance rather than raising, so read that
+table rather than assuming.
+
+---
+
+## Knobs
+
+Every default below is the measured production configuration. They are all `${VAR:-default}`, so override
+from the environment; nothing needs editing. `./serve-mxfp4.sh --help` is the short version of this table,
+and `DRY_RUN=1 ./serve-mxfp4.sh` prints the container command a given set of overrides produces without
+running it.
+
+### Where and what
+
+| | default | |
+|---|---|---|
+| `MODELS` | `~/models` | checkpoint directory, bind-mounted at `/models`. Both checkpoints must live under it -- it is the only mount |
+| `SNAP` | `$MODELS/Qwen3.8-27B-MXFP4-mtpfp8` | the target checkpoint |
+| `DRAFTER` | `$MODELS/Qwen3.8-27B-DFlash2-FP8` | the `dflash` drafter |
+| `PORT` | `8080` | listen port |
+| `NAME` | `vllmmxfp4074` | container name (historical; `podman logs -f <name>` uses it) |
+| `IMAGE` | `stilldeadcode/vllm-radiance:0.9.3` | **moves with `CACHE`** |
+| `CACHE` | `~/.radiance-cache-w4a8-093` + suffixes | compile cache. Keyed on model + torch/Triton version **and** on every knob that changes the traced graph; never share one across configurations |
+| `RUNTIME` | auto | `podman` (preferred) or `docker` |
+| `CHAT_TEMPLATE` | `./qwen3.8-enhanced.jinja` | must exist on the host; mounted by path |
+| `HF_CACHE` | `~/.cache/huggingface` | mounted for tokenizer files |
+| `DRY_RUN` / `PREPARE_ONLY` | off | print the command instead of running / do the one-time work and stop |
+
+### Serving shape
+
+| | default | |
+|---|---|---|
+| `SPEC_METHOD` | `dflash` | `dflash` (block-diffusion drafter, one graphed pass, needs the second checkpoint) or `mtp` (the head inside the target, no extra download) |
+| `SPEC` | `7` dflash / `4` mtp | speculative depth. Under dflash it is **content-dependent**: 7 wins on a weighted mix (code/JSON run 4.7-6.0 tok/update), 5 wins on prose-heavy or batch-throughput serving. `RADIANCE_DYNAMIC_WIDTH` mostly dissolves the trade |
+| `MAXSEQS` | `8` | max concurrent sequences. Above 8 the decode band widens to `RADIANCE_MXFP4_DECODE_MAX_M=128` automatically, and the `KV_MEM` pin no longer applies |
+| `MAXLEN` | `262144` | context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this, not the chunk size |
+| `CHUNK` | `8192` | prefill chunk. `RADIANCE_AR_MAX_KB` is derived from it, so raising it cannot silently drop prefill onto RCCL |
+| `GPU_UTIL` | `0.98` | the ceiling on this box. Use `0.75` for perplexity work: `prompt_logprobs` allocates a 1-1.7 GiB transient vLLM does not reserve for |
+| `KV_MEM` | `18563072000` | explicit KV cache size, which overrides `GPU_UTIL` and skips profiling. Worth 892,799 -> 943,581 tokens. Applied only at `GPU_UTIL=0.98` and `MAXSEQS=8`; `KV_MEM=0` re-enables profiling. Re-derive it after anything that moves weights, cudagraph sizes or `CHUNK` |
+| `ASYNC` | `0` | async scheduling. vLLM refuses it together with `disable_padded_drafter_batch`, so the two are one switch; the unpad lever is ~+50% single-stream under mtp |
+| `EXTRA` | empty | extra `vllm serve` flags (or just pass them as arguments) |
+
+### Kernels
+
+| | default | |
+|---|---|---|
+| `R4D_ATTN` | `1` | the R4D paged attention backend. +37.8% prefill at 260k against AITER unified attention; `0` falls back to it |
+| `AUTO_R4D` | `1` | build the pinned libr4d on first run. `0` uses the image's, which **NaNs this model** |
+| `R4D_SO` | unset | use your own libr4d checkout directory instead; nothing is rebuilt behind your back |
+| `R4D_PIN` | `b9e42ab` | which libr4d commit to build. Each is cached separately, and the cache is keyed by the string, so `R4D_PIN=main` is fetched once and reused (`rm -rf ~/.cache/radiance-libr4d/main` to refresh) |
+| `MIN_M` | `0` | M above which the hand-written W4A8 kernel takes over from aiter. `0` means always -- the comparison is `>`, so `1` would still send M=1 to aiter |
+| `RADIANCE_MXFP4_DECODE_MAX_M` | `64` (`128` if `MAXSEQS>8`) | the small-M decode GEMM band. Must cover `MAXSEQS x (SPEC+1)` rows or the biggest verify batches fall onto the prefill tile |
+| `FAST_DRAFT` | `1` | the int2 draft head with an exact rerank: +6.5% decode under mtp, +5.1% under dflash |
+| `RADIANCE_DRAFT_RERANK` | `80` dflash / `32` mtp | the candidate pool a top-k caller can draw from, not just a rescoring budget. Under dflash, 32 costs 5.3% of acceptance; 80 covers 4x the drafter's `selector_top_k` **and** 4x the sampler's `top_k` |
+| `RADIANCE_VERIFY_HEAD` | `1` dflash / `0` mtp | the int2 head applied to the target's verify `lm_head` (one 2.02 ms GEMM per step, 5.9% of wall). +2.9% combined decode, output-equivalent |
+| `RADIANCE_DYNAMIC_WIDTH` | `1` | scheduler-side per-request verify width from an acceptance EMA. Recovers static `SPEC=5`'s batch efficiency at `SPEC=7` without losing code depth. Lossless by construction |
+| `RADIANCE_GDN_MERGE_INPROJ` | `1` | GDN `in_proj_qkvz` + `in_proj_ba` as one GEMM (-2.9% decode). **Changes the traced graph**, so it keys the cache directory |
+| `RADIANCE_SKINNY_GEMM` | `1` | R4D split-K for skinny bf16 projections. `all` adds shapes that differ from rocBLAS at a bf16 ULP |
+| `RADIANCE_MXFP4_SANITIZE` | `0` | zero non-finite activations. Only useful with `AUTO_R4D=0`, where it gets perplexity to 8.4004 instead of 653586 |
+
+Diagnostics and bisect tools (`RADIANCE_MXFP4_CHECKALL`, `_SHADOW`, `_KERNEL_NK`, `_PERBLOCK_NK`,
+`_MHIST`, `RADIANCE_GDN_NANTRACE`, `PROFILE_DIR`) are unset by default and documented where they are read
+in `serve-mxfp4.sh`. The full image-level knob reference is in [DOCKERHUB.md](DOCKERHUB.md).
+
+---
+
+## How the MXFP4 path works
+
+Quark OCP micro-scaling checkpoints (`quantization_config.quant_method: quark`, mxfp4 weights *and*
+activations, group 32, e8m0 scales) run **natively** with `RADIANCE_MXFP4=1` -- e.g.
+`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`. Drop `--quantization`: the runtime reads the method from `config.json`
+and routes it itself. [`serve-mxfp4.sh`](serve-mxfp4.sh) is the worked launch, and every
+default in it carries the measurement that chose it; [MXFP4-NOTES.md](MXFP4-NOTES.md) collects the
+longer form of that reasoning.
+
+Without this, vLLM falls back to emulated MXFP4, which materialises every weight tensor in bf16 on each
+forward. Nothing in the way was a compiler limitation -- Triton 3.6 does lower `tl.dot_scaled` on gfx1201 --
+just three soft gates, all handled in `patch_quark_mxfp4.py`: an `is_fp4_avail()` allowlist that omits
+gfx1201, an aiter module path that moved in 0.1.17, and gfx1250 tiles that ask for
+`matrix_instr_nonkdim=32` when this card's WMMA is 16x16x16 only (`mxfp4-configs/` pins 16 across every
+band). The native path is **bit-identical to emulation** -- the activation quantization is the same either
+way -- so it is a speed change with no quality dimension: measured on gate_up 17408x5120, **6.1x at M=16,
+4.7x at M=32, 2.5x at M=64**.
+
+### The W4A8 fp8-WMMA kernel
+
+`RADIANCE_MXFP4_W4A8=1` additionally routes linears to a hand-written fp8-WMMA HIP kernel
+(`radiance_mxfp4_fp8.hip`). Triton lowers `tl.dot_scaled` by upconverting e2m1 to bf16 and using the 16-bit
+WMMA; register-resident on this card, **fp8 WMMA runs 325 TFLOP/s against f16's 160**, while Triton's own
+fp8 `tl.dot` manages 43 because it upconverts and pays conversion on top. Against the tuned aiter path it
+measures **1.47-2.26x faster and 4.2x more accurate** (0.0265 vs 0.1119 relative error), since fp8
+activations beat the mxfp4 ones aiter quantizes to. It is **off in the image because it changes numerics**
+-- the layer becomes W4A8 rather than the checkpoint's declared W4A4, more precise than what the model was
+calibrated against but no longer bit-identical -- and **on in `serve-mxfp4.sh`**, which is what every number
+below was measured with. The N tile is M-keyed (`RADIANCE_MXFP4_TN4_MIN_M`, default
+2048): the wide tile amortises A-tile staging for +10% at M=8192 but cannot fill below ~2048 rows.
+`RADIANCE_MXFP4_W4A8_MIN_M` is where it takes over from aiter, and it now defaults to **0** -- our
+kernel serves every M.
+
+**There are two tilings, because prefill and decode are different problems.** The tile above
+(BM=256 via TM=4) is sized for prefill. At decode M is 5 (batch 1 x `num_speculative_tokens`+1), where
+it issues 51x more matrix MACs than useful -- 4352 WMMA per wave against 5 real rows. So small M goes
+to a second kernel with TM=`ceil(M/16)`, no wasted M-fragments, and split-K to fill the CUs, gated by
+`RADIANCE_MXFP4_DECODE_MAX_M` (default 64, or 128 at `MAXSEQS>8`; it must cover
+`MAXSEQS x (SPEC+1)` rows or the biggest verify batches fall back onto the prefill tile). The split-K reduction is **fused**: the KS blocks covering
+one output range race on an atomic counter and the last arrival reduces in place, so there is no
+second launch — worth a further -3.9% of step time on top, at bit-identical output. It reverses one of the prefill answers: **BK=128 wins at
+decode** (1.87x on gate_up) where it measured -34% at prefill, because that loss was purely the LDS
+occupancy cliff and a 16-row A tile never reaches it.
+
+**4-bit weights leave far more room for KV**: on 2x R9700 the 27B MXFP4 body occupies 9.24 GiB/GPU against
+roughly 12.6 for the same model in FP8, and that headroom goes straight into context.
+
+**`RADIANCE_MXFP4_MAX_M` is retired** (it was read up to 0.5.8). It handed big batches back to emulation as
+a throughput win on paper; in practice quark's TileLang backend cannot initialise inside a vLLM worker, and
+the branch was specialised into the compile graph during the `max-num-batched-tokens` profile run -- so it
+killed startup rather than one request. That also means **the stock emulated path cannot serve these
+checkpoints here at all**, which makes the native kernel the only way to run them on this card, not merely
+the faster one.
+
+### The drafter is FP8
+
+Checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with the MTP
+drafter requantized to fp8 by [`fp8_mtp.py`](fp8_mtp.py). The drafter must NOT be MXFP4 -- 4-bit
+costs more acceptance than it saves in bandwidth, and AWQ does not rescue it. Data-free RTN
+measured ~11.6% relative error and cost acceptance 2.5 -> 2.21; AWQ calibration improved that by
+0-5% (the alpha search chose 0.1-0.2, and 0.0 for `mtp.fc`, because MXFP4's per-32 E8M0 block
+exponent already does most of what per-channel scaling would). FP8 e4m3 per-channel is ~2-3%
+relative error and holds acceptance at 2.60-2.80, removing ~17% of decode weight traffic instead
+of 25% -- the smaller win that actually holds.
+
+### Measured
+
+These are the two gating measurements for the MXFP4 stack. Both were taken under `SPEC_METHOD=mtp`
+at `SPEC=4`, which was the default at the time; the shipped default is now the `dflash` drafter, and
+the numbers that moved with it are in [MXFP4-NOTES.md](MXFP4-NOTES.md).
+
+Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness:
+
+| | 0.5.8 | 0.7.4 | |
+|---|---|---|---|
+| prefill 7.8k | 3873 | **4387** | +13.3% |
+| prefill 26k | 3445 | **4138** | +20.1% |
+| prefill 104k | 2310 | **3143** | +36.1% |
+| prefill 182k | 1736 | **2511** | +44.6% |
+| prefill 260k | 1393 | **2089** | +49.9% |
+| decode short / medium | 63.0 / 67.4 | **67.1 / 67.5** | +6.5% / +0.1% |
+| WikiText-2 PPL | 8.3335 | 8.3719 | +0.46% |
+
+KV cache 857,399 tokens at `GPU_UTIL=0.98` under vLLM's own memory profiling; the explicit `KV_MEM`
+pin the launcher now defaults to raises that to 943,581. All 304 linear layers run the W4A8 fp8-WMMA kernel;
+`aiter` is not used at all now that `RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain
+scales with context because it is mostly R4D's paged attention, whose share of prefill grows with
+sequence length.
+
+**The decode GEMM (`RADIANCE_MXFP4_DECODE_MAX_M`, default 64), measured against the same 0.7.4 with
+it off.** Report step time, not tokens/s: tokens/s swings ~14% on draft-acceptance luck alone at
+fixed config, and `ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that out.
+
+| | off | on | |
+|---|---|---|---|
+| single stream, ms/step | 35.06 | **32.16** | -8.3% |
+| ms/step at 32k context | 36.53 | **33.47** | -8.4% |
+| aggregate tok/s, 4 concurrent | 170.1 | **218.5** | +28.5% |
+| aggregate tok/s, 8 concurrent | 295.0 | **353.1** | +19.7% |
+| prefill, all five lengths | — | — | unchanged (-0.3 to -1.2%) |
+| GSM8K 500q, greedy | 97.80% | 97.80% | 3/3 discordant, sign test p=1.00 |
+
+Batched gains most because at M=20-40 aiter's tuned band uses `NUM_KSPLIT=1`, which leaves the grid
+underfilled, while this kernel keeps split-K. GSM8K also ran **14% faster wall** (375.5s -> 322.7s)
+on slightly *more* generated tokens.
+
+### The gated-delta-net NaN (fixed upstream)
+
+libr4d v0.4.0 produces NaN in the gated-delta-net output on this model -- WikiText-2 PPL **653586**
+with the W4A8 path and no mitigation. Three exponent overflows, all the same shape: an unguarded
+`__expf` on an inactive lane or a split-form half, giving `0 * INF = NaN`.
+
+1. **`kkt_solve`, padding rows.** `gi` is forced to 0 for `i >= rows` while `gb[j]` keeps its real
+   negative cumsum, so `d = -gb[j]` is large POSITIVE -- the opposite of the "never positive"
+   invariant the code asserts, which holds only for live rows. The NaNs land in padding rows of the
+   64x64 tile and the blocked inverse merges the whole tile with WMMA, so they reach live rows.
+2. **`chunk_scan`, split-form halves.** `e^{g_i-c}.e^{c-g_j}` with `cref` at the chunk midpoint
+   gives each half +/-(gate span)/2; a span past ~176 sends one to +INF and the other to 0.
+3. **`chunk_scan`, `V'` staging.** The dominant one, and only visible across chunks. `V' = V.gv[t]`
+   is staged in **bf16**, so `gv` must leave room for `V` under bf16's 3.4e38 ceiling. Clamping at
+   `e^88` still NaNs; `e^80` leaves margin.
+
+Fixed in **StillDeadcode/libr4d PR #1** (merged 2026-08-24). Not in a tag yet, which is why setup
+builds libr4d at a pinned commit instead of using the one in the image. The build is verified
+reproducible: it produces an `r4d.so` byte-identical (sha256 `3026297b...`) to the one every number
+here was measured with. The pin is deliberate -- nothing version-checks the library it loads, so a
+later commit that renames an entry point or changes a compiled-in geometry constant makes
+`radiance_gdn.py` set `ENABLED = False` and **fall back to the Triton path with one line on
+stderr**, costing performance rather than raising.
+
+Clamp value, measured over 208,539 WikiText-2 tokens with no other mitigation:
+70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586. (Those were measured
+before the fold was widened; on the current build the same configuration reads 8.3719, against
+8.3736 with the original fold table.)
+
+**The clamp bounds the damage; it does not remove the cause** -- and upstream sharpened this point
+when merging. The original note here claimed the clamped product "evaluates to 0, which is the
+correct answer". That is wrong: what leaves range is the distance from `cref`, not `g_i-g_j`, so on
+a span-200 chunk the last token's own diagonal -- and its `e^{gl-g_t} ~ 1` weight into the state,
+which the next chunk reads -- are *attenuated* by `e^{80-(cref-g_t)}` rather than correctly
+vanishing. The real fix is to stop splitting a weight that is provably <= 1 into a huge x tiny
+pair: stage `V'` in fp32, or apply `e^{gl-g_t}` directly on the state path.
+
+Fixing this also removed a second symptom: `RADIANCE_FAST_DRAFT` used to hang a worker at chunk
+8192 because the draft head was being fed NaN like everything else downstream of the GDN core.
+
+## Building the image from source
+
+You do not need any of this to serve: `setup-mxfp4.sh` pulls the published image, and the MXFP4
+patches and kernels are applied at container start. Build from source only to change a pinned
+component or a baked-in patch.
 
 Everything the build needs is in this directory (a flat Docker build context). The version string lives in
-one place, the `VERSION` file, which the tag and the build-arg both read:
+one place, the `VERSION` file, which the tag and the build-arg both read (`podman build` takes the same
+arguments):
 
 ```bash
 docker build -t vllm-radiance:$(cat VERSION) --build-arg RADIANCE_VERSION=$(cat VERSION) .
@@ -62,287 +379,6 @@ re-download torch, not as licence to install a newer one. Builds 0.5.0 through 0
 newer trio and hung a GPU under sustained tensor-parallel load; restoring the pinned versions fixed it with
 no code change. If you override these with `--build-arg`, move them together and soak-test under real load.
 
-## Run
-
-`docker-compose.yml` is the canonical way to serve. Point it at your model directory and your GPU group GIDs,
-then:
-
-```bash
-# put your model at ./models/Qwen/Qwen3.8-27B-FP8  (or set MODELS=/your/model/dir)
-docker compose up -d          # start; follow with: docker compose logs -f
-docker compose down           # stop
-```
-
-The compose defaults target **Qwen3.8-27B-FP8**, the model the image is tuned around: a gated-delta-net
-hybrid of 64 layers (48 linear attention + 16 full attention), hidden 5120, attention `head_dim` 256 with 6
-query heads per KV head, GDN key/value head dim 128 and a width-4 causal conv. **Qwen3.6-27B-FP8 has exactly
-the same shape**, so it takes the same tuned paths and the same flags; only the checkpoint path changes. Both
-carry their MTP head in the checkpoint, so speculative decoding needs no separate drafter, and both are
-vision-language checkpoints served text-only here via `--language-model-only`.
-
-To serve the fine-grained-MoE **Qwen3.6-35B-A3B-FP8**, point it
-at that model and raise the batch-token budget: `--max-num-batched-tokens` must be **≥ 2240** (align mode
-reconciles the GDN state to attention block size 2240). Its tuned
-MoE config and the R4D gate GEMM are baked in and turn on automatically.
-
-To serve **Gemma-4-31B-it-FP8** (block-fp8, e.g. `RedHatAI/gemma-4-31B-it-FP8-block`), just point the compose
-at it: the quantization is auto-detected from `config.json` (compressed-tensors, 128x128 blocks), the tuned
-GEMM configs load by shape, and the long-context prefill attention path is tuned for its head-512 global
-layers. Drop the Qwen-specific `--mamba-cache-mode` and chat template / tool-reasoning parsers (it is not a
-GDN hybrid and uses its own template). Its vision tower works as-is. Note it is a *big-KV* model (60 layers,
-50 sliding + 10 global), so give it a smaller `--max-model-len` than the Qwen models at the same
-`--gpu-memory-utilization`.
-
-Gemma-4-31B also supports **MTP speculative decoding** for a large decode speedup, using Google's official
-drafter `google/gemma-4-31B-it-assistant` (vLLM loads it as an MTP model). It is lossless (the target
-verifies every drafted token) and the dynamic draft controller applies to it. Its one requirement on this
-card: the drafter has a head-512 layer, so pass `"attention_backend":"ROCM_AITER_UNIFIED_ATTN"` in the
-speculative config (the usual `flash_attn` caps at head 256). For example:
-`--speculative-config '{"method":"mtp","model":"/models/google/gemma-4-31B-it-assistant","num_speculative_tokens":8,"attention_backend":"ROCM_AITER_UNIFIED_ATTN","disable_padded_drafter_batch":true}' --no-async-scheduling`.
-
-### MXFP4 (4-bit) checkpoints
-
-Quark OCP micro-scaling checkpoints (`quantization_config.quant_method: quark`, mxfp4 weights *and*
-activations, group 32, e8m0 scales) run **natively** with `RADIANCE_MXFP4=1` -- e.g.
-`amd/Qwen3.8-27B-Quark-AWQ-MXFP4`. Drop `--quantization`: the runtime reads the method from `config.json`
-and routes it itself. `run_mxfp4_minm.sh` at the repo root is a complete worked launch, annotated with every
-deliberate difference from the FP8 setup and why.
-
-Without this, vLLM falls back to emulated MXFP4, which materialises every weight tensor in bf16 on each
-forward. Nothing in the way was a compiler limitation -- Triton 3.6 does lower `tl.dot_scaled` on gfx1201 --
-just three soft gates, all handled in `patch_quark_mxfp4.py`: an `is_fp4_avail()` allowlist that omits
-gfx1201, an aiter module path that moved in 0.1.17, and gfx1250 tiles that ask for
-`matrix_instr_nonkdim=32` when this card's WMMA is 16x16x16 only (`mxfp4-configs/` pins 16 across every
-band). The native path is **bit-identical to emulation** -- the activation quantization is the same either
-way -- so it is a speed change with no quality dimension: measured on gate_up 17408x5120, **6.1x at M=16,
-4.7x at M=32, 2.5x at M=64**.
-
-### Running this build
-
-First build the checkpoint, once. `fp8_mtp.py` needs torch; if the host has none, run it inside the
-image, which does:
-
-```bash
-hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4
-
-docker run --rm \
-  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  -v "$HOME/models:/models" -v "$PWD:/repo" \
-  --entrypoint bash stilldeadcode/vllm-radiance:$(cat VERSION) -lc '
-    python3 /repo/fp8_mtp.py \
-      "$(ls -d /root/.cache/huggingface/hub/models--amd--Qwen3.8-27B-Quark-AWQ-MXFP4/snapshots/*/ | head -1)" \
-      /models/Qwen3.8-27B-MXFP4-mtpfp8'
-```
-
-On a host that already has torch, `./fp8_mtp.py <src-snapshot> $HOME/models/Qwen3.8-27B-MXFP4-mtpfp8`
-does the same thing without the container.
-
-This is **not** an optimization step you can skip -- AMD's release does not load with MTP enabled.
-It ships the MTP head bf16 but names `mtp.*` in neither `exclude` nor `layer_quant_config`, so
-vLLM's quark config falls through to `global_quant_config` (mxfp4), builds a packed uint8 weight of
-half the input width, and dies loading the full-width bf16 tensor into it: `AssertionError:
-Attempted to load weight (torch.Size([5120, 10240])) into parameter (torch.Size([5120, 5120]))`.
-`fp8_mtp.py` requantizes the eight MTP projections to fp8 e4m3 per-channel and writes the matching
-`layer_quant_config`, which is what makes the head loadable. Why fp8 and not mxfp4 is
-[below](#the-drafter-is-fp8). It reads and rewrites one safetensors file, needs only torch, and
-takes about fifteen minutes.
-
-Then:
-
-```bash
-MODELS=$HOME/models ./run_mxfp4_074.sh
-```
-
-That is the whole thing. On the first launch it clones libr4d at a pinned commit and compiles it
-inside the same image it will be loaded from, which takes a few minutes; the result is cached in
-`~/.cache/radiance-libr4d` and every later launch reuses it. This repo's vLLM patches and the W4A8
-kernel are applied in the container prelude, so no image rebuild is involved either.
-
-The build step exists because the fix this build depends on is upstream but unreleased. The GDN
-overflow guards are merged (StillDeadcode/libr4d PR #1), but the only tag is still `v0.4.0` and the
-0.7.4 image pins that tag -- so the `r4d.so` **inside the image predates the fix** and NaNs the
-gated-delta-net output on this model: WikiText-2 perplexity 653586 against 8.3706. Once deadcode
-cuts a tag and ships an image pinning it, the whole step disappears.
-
-Knobs, if you want them:
-
-| | |
-|---|---|
-| `R4D_SO=/path/to/libr4d` | use your own checkout instead; nothing is rebuilt behind your back |
-| `R4D_PIN=<sha>` | build a different libr4d commit (each is cached separately) |
-| `AUTO_R4D=0` | skip the build and run the image stock kernel -- see below |
-
-The pin is deliberate. `main` is a moving branch, and nothing in radiance version-checks the library
-it loads: all six `radiance_*.py` modules just `import r4d` and call it. If a later commit renames an
-entry point or changes a compiled-in geometry constant, the registry and the constants disagree,
-`radiance_gdn.py` sets `ENABLED = False`, and the build **falls back to the Triton path with one line
-on stderr** -- you lose the performance rather than getting an error. `R4D_PIN=main` builds the tip instead, but note the cache
-is keyed by that string, so it is fetched once and then reused -- `rm -rf ~/.cache/radiance-libr4d/main`
-to pick up newer commits. Either way, read the R4D selections table printed at startup
-(`RADIANCE_R4D_REPORT=1`, on by default) and confirm the GDN and attention kernels actually bound.
-
-Verified reproducible: the automatic build produces an `r4d.so` byte-identical (sha256
-`3026297b...`) to the one every number below was measured with.
-
-`AUTO_R4D=0` leaves you on the stock kernel, where the W4A8 path is unusable. If you must run
-stock, set `RADIANCE_MXFP4_SANITIZE=1`, which zeroes non-finite activations and gets you to
-perplexity 8.4004 -- worse than the fix, but serviceable.
-
-#### The drafter is FP8
-
-Checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with the MTP
-drafter requantized to fp8 by [`fp8_mtp.py`](fp8_mtp.py). The drafter must NOT be MXFP4 -- 4-bit
-costs more acceptance than it saves in bandwidth, and AWQ does not rescue it. Data-free RTN
-measured ~11.6% relative error and cost acceptance 2.5 -> 2.21; AWQ calibration improved that by
-0-5% (the alpha search chose 0.1-0.2, and 0.0 for `mtp.fc`, because MXFP4's per-32 E8M0 block
-exponent already does most of what per-channel scaling would). FP8 e4m3 per-channel is ~2-3%
-relative error and holds acceptance at 2.60-2.80, removing ~17% of decode weight traffic instead
-of 25% -- the smaller win that actually holds.
-
-### Measured
-
-Against the 0.5.8 MXFP4 build, same box (2x R9700, TP2), same harness, `SPEC=4`:
-
-| | 0.5.8 | 0.7.4 | |
-|---|---|---|---|
-| prefill 7.8k | 3873 | **4387** | +13.3% |
-| prefill 26k | 3445 | **4138** | +20.1% |
-| prefill 104k | 2310 | **3143** | +36.1% |
-| prefill 182k | 1736 | **2511** | +44.6% |
-| prefill 260k | 1393 | **2089** | +49.9% |
-| decode short / medium | 63.0 / 67.4 | **67.1 / 67.5** | +6.5% / +0.1% |
-| WikiText-2 PPL | 8.3335 | 8.3719 | +0.46% |
-
-KV cache 857,399 tokens at `GPU_UTIL=0.98`. All 304 linear layers run the W4A8 fp8-WMMA kernel;
-`aiter` is not used at all now that `RADIANCE_MXFP4_W4A8_MIN_M` defaults to 0. The prefill gain
-scales with context because it is mostly R4D's paged attention, whose share of prefill grows with
-sequence length.
-
-**The decode GEMM (`RADIANCE_MXFP4_DECODE_MAX_M`, default 48), measured against the same 0.7.4 with
-it off.** Report step time, not tokens/s: tokens/s swings ~14% on draft-acceptance luck alone at
-fixed config, and `ms/step = 1000 x (accepted/draft + 1) / tok_s` divides that out.
-
-| | off | on | |
-|---|---|---|---|
-| single stream, ms/step | 35.06 | **32.16** | -8.3% |
-| ms/step at 32k context | 36.53 | **33.47** | -8.4% |
-| aggregate tok/s, 4 concurrent | 170.1 | **218.5** | +28.5% |
-| aggregate tok/s, 8 concurrent | 295.0 | **353.1** | +19.7% |
-| prefill, all five lengths | — | — | unchanged (-0.3 to -1.2%) |
-| GSM8K 500q, greedy | 97.80% | 97.80% | 3/3 discordant, sign test p=1.00 |
-
-Batched gains most because at M=20-40 aiter's tuned band uses `NUM_KSPLIT=1`, which leaves the grid
-underfilled, while this kernel keeps split-K. GSM8K also ran **14% faster wall** (375.5s -> 322.7s)
-on slightly *more* generated tokens.
-
-`run_mxfp4_074.sh --help`-style knobs worth knowing: `R4D_ATTN` (default 1), `MIN_M` (0),
-`RADIANCE_MXFP4_DECODE_MAX_M` (64), `CHUNK` (8192), `GPU_UTIL` (0.98), and three whose default is
-keyed to `SPEC_METHOD`:
-
-* `FAST_DRAFT` -- **1 under both** (the int2 draft head): +6.5% decode under mtp, +5.1% under
-  dflash. It was 0 under dflash until 2026-08-27, when it crashed the drafter at load with an
-  `IndexError` in `rocm_unquantized_gemm_impl` -- radiance_w4 frees `layer.weight` to
-  `torch.empty(0)` and DFlash2's fused context-KV precompute then slices it. That path is dormant
-  only because the pinned libr4d ships no `w4a16 gemm_nt` kernel, so radiance_w4 disables itself;
-  rebuilding libr4d with `r4d_gemm_w4a16_nt_m64` brings the crash back.
-* `RADIANCE_DRAFT_RERANK` -- **32 under mtp, 64 under dflash**. It is the size of the candidate
-  pool a top-k caller can draw from, not just a rescoring budget: `_radiance_topk_only` blanks
-  every entry the rerank did not touch. mtp wants an argmax and 32 is ample; DFlash2 asks for
-  `selector_top_k`=16 and 32 costs 5.3% of acceptance (acc/draft 1.904 -> 1.804). 64 restores it
-  exactly, for +0.23 ms/step; 128 and 256 measure identical. Raise it with `selector_top_k`.
-* `SPEC` -- **4 under mtp** (measurably better than 6 and 8 here), **7 under dflash** (the peak;
-  5/6/8 measure 91.2/95.5/88.9 tok/s against 101.3).
-* `RADIANCE_VERIFY_HEAD` -- **1 under dflash**, 0 under mtp. The int2 head applied to the TARGET's
-  verify `lm_head`, which the decode profile shows as one 2.02 ms bf16 GEMM per step, 5.9% of wall.
-  It reuses the drafter's int2 packing, so it costs no extra VRAM. BetterBench single pass: combined
-  decode 170.0 -> 174.9 t/s (+2.9%), all eight categories +2.7 to +3.4%, conc 1/2/4 +2.8/+2.5/+1.6%,
-  conc 8 neutral (48-request, 3-rep re-measurement: 499.6 -> 505.3, overlapping), prefill unchanged.
-  Output-equivalent on everything measured: GSM8K 500q greedy identical (486/500 both), 8/8 greedy
-  completions byte-identical, 24/24 seeded SAMPLED completions byte-identical at the serve's own
-  temperature 0.7 / top_p 0.95 / top_k 20. Per step it falls back to the exact bf16 head unless every
-  request is greedy or has `top_k <= RERANK/4` with `min_p` 0, and none asks for logprobs or grammar.
-
-`IMAGE` and `CACHE` default to `0.9.3` / `.radiance-cache-w4a8-093` and must move together --
-cache dirs validate on model + torch/Triton version and must not be shared across configurations.
-`SPEC_METHOD` still defaults to `mtp`, so production is
-`MODELS=$HOME/models SPEC_METHOD=dflash ./run_mxfp4_074.sh`.
-
-### The gated-delta-net NaN (fixed upstream)
-
-libr4d v0.4.0 produces NaN in the gated-delta-net output on this model -- WikiText-2 PPL **653586**
-with the W4A8 path and no mitigation. Three exponent overflows, all the same shape: an unguarded
-`__expf` on an inactive lane or a split-form half, giving `0 * INF = NaN`.
-
-1. **`kkt_solve`, padding rows.** `gi` is forced to 0 for `i >= rows` while `gb[j]` keeps its real
-   negative cumsum, so `d = -gb[j]` is large POSITIVE -- the opposite of the "never positive"
-   invariant the code asserts, which holds only for live rows. The NaNs land in padding rows of the
-   64x64 tile and the blocked inverse merges the whole tile with WMMA, so they reach live rows.
-2. **`chunk_scan`, split-form halves.** `e^{g_i-c}.e^{c-g_j}` with `cref` at the chunk midpoint
-   gives each half +/-(gate span)/2; a span past ~176 sends one to +INF and the other to 0.
-3. **`chunk_scan`, `V'` staging.** The dominant one, and only visible across chunks. `V' = V.gv[t]`
-   is staged in **bf16**, so `gv` must leave room for `V` under bf16's 3.4e38 ceiling. Clamping at
-   `e^88` still NaNs; `e^80` leaves margin.
-
-Fixed in **StillDeadcode/libr4d PR #1** (merged 2026-08-24). Not in a tag yet, hence the build-from-
-main step above.
-
-Clamp value, measured over 208,539 WikiText-2 tokens with no other mitigation:
-70 -> 8.3841, **80 -> 8.3706**, 83 -> 8.3728, reference 8.3335, stock 653586. (Those were measured
-before the fold was widened; on the current build the same configuration reads 8.3719, against
-8.3736 with the original fold table.)
-
-**The clamp bounds the damage; it does not remove the cause** -- and upstream sharpened this point
-when merging. The original note here claimed the clamped product "evaluates to 0, which is the
-correct answer". That is wrong: what leaves range is the distance from `cref`, not `g_i-g_j`, so on
-a span-200 chunk the last token's own diagonal -- and its `e^{gl-g_t} ~ 1` weight into the state,
-which the next chunk reads -- are *attenuated* by `e^{80-(cref-g_t)}` rather than correctly
-vanishing. The real fix is to stop splitting a weight that is provably <= 1 into a huge x tiny
-pair: stage `V'` in fp32, or apply `e^{gl-g_t}` directly on the state path.
-
-Fixing this also removed a second symptom: `RADIANCE_FAST_DRAFT` used to hang a worker at chunk
-8192 because the draft head was being fed NaN like everything else downstream of the GDN core.
-
-**`RADIANCE_MXFP4_MAX_M` is retired** (it was read up to 0.5.8). It handed big batches back to emulation as
-a throughput win on paper; in practice quark's TileLang backend cannot initialise inside a vLLM worker, and
-the branch was specialised into the compile graph during the `max-num-batched-tokens` profile run -- so it
-killed startup rather than one request. That also means the stock emulated path cannot serve these
-checkpoints here at all, which makes the native kernel the only way to run them on this card, not merely the
-faster one. With `RADIANCE_MXFP4_W4A8=1` the crossover is moot anyway: large M goes to the fp8-WMMA kernel,
-which beats both the aiter path and emulation.
-
-`RADIANCE_MXFP4_W4A8=1` additionally routes linears to a hand-written fp8-WMMA HIP kernel
-(`radiance_mxfp4_fp8.hip`). Triton lowers `tl.dot_scaled` by upconverting e2m1 to bf16 and using the 16-bit
-WMMA; register-resident on this card, **fp8 WMMA runs 325 TFLOP/s against f16's 160**, while Triton's own
-fp8 `tl.dot` manages 43 because it upconverts and pays conversion on top. Against the tuned aiter path it
-measures **1.47-2.26x faster and 4.2x more accurate** (0.0265 vs 0.1119 relative error), since fp8
-activations beat the mxfp4 ones aiter quantizes to. It is **off by default because it changes numerics**:
-the layer becomes W4A8 rather than the checkpoint's declared W4A4 -- more precise than what the model was
-calibrated against, but no longer bit-identical. The N tile is M-keyed (`RADIANCE_MXFP4_TN4_MIN_M`, default
-2048): the wide tile amortises A-tile staging for +10% at M=8192 but cannot fill below ~2048 rows.
-`RADIANCE_MXFP4_W4A8_MIN_M` is where it takes over from aiter, and it now defaults to **0** -- our
-kernel serves every M.
-
-**There are two tilings, because prefill and decode are different problems.** The tile above
-(BM=256 via TM=4) is sized for prefill. At decode M is 5 (batch 1 x `num_speculative_tokens`+1), where
-it issues 51x more matrix MACs than useful -- 4352 WMMA per wave against 5 real rows. So M<=48 goes
-to a second kernel with TM=`ceil(M/16)`, no wasted M-fragments, and split-K to fill the CUs, gated by
-`RADIANCE_MXFP4_DECODE_MAX_M` (default 48). The split-K reduction is **fused**: the KS blocks covering
-one output range race on an atomic counter and the last arrival reduces in place, so there is no
-second launch — worth a further -3.9% of step time on top, at bit-identical output. It reverses one of the prefill answers: **BK=128 wins at
-decode** (1.87x on gate_up) where it measured -34% at prefill, because that loss was purely the LDS
-occupancy cliff and a 16-row A tile never reaches it.
-
-Two practical notes. **4-bit weights leave far more room for KV**: on 2x R9700 the 27B MXFP4 body occupies
-9.24 GiB/GPU against roughly 12.6 for the same model in FP8, and that headroom goes straight into context.
-And **do not quantize the MTP drafter to MXFP4**: at n=8 the drafter is 34% of decode weight traffic so it
-looks like an obvious target, but data-free RTN (~11.6% relative error) drops mean acceptance from 2.5 to
-2.21 and AWQ calibration does not rescue it -- for a drafter, accuracy *is* throughput. An fp8 e4m3
-per-channel drafter (~2-3% error) holds acceptance at 2.60-2.80 and is what the worked script serves.
-
-All tunables are `${VAR:-default}` in the compose file; override via the shell or a `.env` file without
-editing it. The full knob list (kernel toggles, draft controller, AITER routing, …) is in
-[DOCKERHUB.md](DOCKERHUB.md).
-
 ## What's inside
 
 Everything below is baked into the image; the tuned paths are env-gated and on by default. See
@@ -381,7 +417,7 @@ Everything below is baked into the image; the tuned paths are env-gated and on b
 - **Native MXFP4** for Quark OCP micro-scaling checkpoints (`RADIANCE_MXFP4`), bit-identical to vLLM's
   emulation and multiples faster, plus an optional hand-written fp8-WMMA W4A8 prefill GEMM
   (`RADIANCE_MXFP4_W4A8`) that reaches the fp8 matrix instruction Triton will not emit. See
-  [MXFP4](#mxfp4-4-bit-checkpoints).
+  [How the MXFP4 path works](#how-the-mxfp4-path-works).
 - **Lossless dynamic MTP drafting**: a per-request confidence gate plus verbatim n-gram tail that varies
   draft depth without changing what the model verifies. `mtp` only -- it works by stopping a serial loop of
   draft forwards early, and a `dflash` drafter has no such loop (it emits every position in one graphed pass).
@@ -427,6 +463,15 @@ running, so which kernels an engine binds is visible in the startup log and in `
 
 One HIP kernel does stay here: `radiance_mxfp4_fp8.hip`, the MXFP4 W4A8 fp8-WMMA GEMM. It is specific to
 this fork rather than general to gfx1201, so it is compiled by the image build directly and `make
-radiance_mxfp4_fp8.so` rebuilds it against the image toolchain during development. `run_mxfp4_minm.sh` is a
-worked MXFP4 launch kept alongside it (a podman invocation from the box it was measured on, not part of the
-build).
+radiance_mxfp4_fp8.so` rebuilds it against the image toolchain during development.
+
+The MXFP4 entry points at the repo root:
+
+| | |
+|---|---|
+| `setup-mxfp4.sh` | one-time setup: host check, image, checkpoints, kernels. Idempotent |
+| `serve-mxfp4.sh` | the launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds |
+| `fp8_mtp.py` | builds the loadable checkpoint from AMD's release (setup drives it) |
+| `MXFP4-NOTES.md` | the measurements, traps and history behind the defaults |
+| `run_mxfp4_074.sh` | compatibility shim -- the launcher's old name, forwards to `serve-mxfp4.sh` |
+| `run_mxfp4_minm.sh` | the 0.5.8 launch, frozen: it is the only way to reproduce the baseline the numbers above are measured against |

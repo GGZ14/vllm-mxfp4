@@ -1,7 +1,7 @@
 #!/bin/bash
 # HISTORICAL REFERENCE -- the 0.5.8 launch, kept only because it is what the baseline numbers in
 # README.md were measured with. It has absolute paths from the box it ran on and points at an
-# image that predates this fork's MXFP4 work. For the current build use run_mxfp4_074.sh.
+# image that predates this fork's MXFP4 work. For the current build use ./serve-mxfp4.sh.
 # EVALUATION (not production): native MXFP4 body on gfx1201, with the MTP drafter in FP8.
 #
 # Checkpoint built by this repo's ./fp8_mtp.py from amd/Qwen3.8-27B-Quark-AWQ-MXFP4, served on
@@ -137,3 +137,6 @@ exec podman run --replace --name vllmminm --privileged --ipc=host --network=host
     --no-async-scheduling \
     --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
     --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja
+# NOTE: this script is FROZEN at the 0.5.8 baseline, template included -- the numbers it reproduces
+# were measured with that exact file, so it is not switched to the repo template the way
+# serve-mxfp4.sh is. It is host-local: supply your own at that path, or serve with ./serve-mxfp4.sh.

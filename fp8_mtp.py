@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """MXFP4 body + FP8 drafter, in one checkpoint.
 
-Run this once against amd/Qwen3.8-27B-Quark-AWQ-MXFP4 to produce the checkpoint run_mxfp4_074.sh
-serves. It is not optional: AMD ships the MTP head bf16 but names it in neither `exclude` nor
+Run this once against amd/Qwen3.8-27B-Quark-AWQ-MXFP4 to produce the checkpoint serve-mxfp4.sh
+serves (./setup-mxfp4.sh drives it for you). It is not optional: AMD ships the MTP head bf16 but names it in neither `exclude` nor
 `layer_quant_config`, so vLLM's quark config falls through to `global_quant_config` (mxfp4) for
 `mtp.*`, builds a packed uint8 weight of half the input width, and dies loading the full-width
 bf16 tensor into it --

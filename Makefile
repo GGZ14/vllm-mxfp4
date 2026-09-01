@@ -22,9 +22,11 @@ R4D_REPO    ?= $(shell sed -n 's/^ARG R4D_REPO=//p' Dockerfile)
 R4D_VERSION ?= $(shell sed -n 's/^ARG R4D_VERSION=//p' Dockerfile)
 R4D_DIR     ?= libr4d
 
-RUN     = docker run --rm --entrypoint bash -v "$(CURDIR)/$(R4D_DIR):/work" -w /work $(IMAGE) -c
+# podman where it exists, docker otherwise -- same as the launcher's auto-detection.
+RUNTIME ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
+RUN     = $(RUNTIME) run --rm --entrypoint bash -v "$(CURDIR)/$(R4D_DIR):/work" -w /work $(IMAGE) -c
 # The MXFP4 kernel is a single .hip at the repo root, so it mounts the root rather than $(R4D_DIR).
-RUN_ROOT = docker run --rm --entrypoint bash -v "$(CURDIR):/work" -w /work $(IMAGE) -c
+RUN_ROOT = $(RUNTIME) run --rm --entrypoint bash -v "$(CURDIR):/work" -w /work $(IMAGE) -c
 HIPCC_FLAGS = -O3 -std=c++17 -fPIC -shared --offload-arch=$(GFX_ARCH) -Wno-unused-result
 
 .DEFAULT_GOAL := r4d
