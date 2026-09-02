@@ -259,6 +259,20 @@ if [ "$AR_OVERLAP" = 1 ]; then CACHE_SUF="$CACHE_SUF-arov"; fi
 # via env alone (no hashed file changes), so it MUST key the cache dir.
 if [ "$NQF" = 1 ]; then CACHE_SUF="$CACHE_SUF-nqft"; fi
 if [ "$FP8S" = 1 ]; then CACHE_SUF="$CACHE_SUF-fp8s"; fi
+# RADIANCE_GDN_NORM_QUANT=1 (default since 2026-09-02): the GDN RMSNormGated + per-token quant as
+# ONE custom op (radiance::gdn_norm_quant) instead of the two inductor kernels per linear-attention
+# layer. Serve gate: 22.51 -> 22.32 ms/step at ctx 0 (-0.8%), 25.8 -> 25.1 @32k; GSM8K 500q 97.60%;
+# BetterBench single-pass update p50 -0.2 ms in every category, tok/update neutral. Not bit-exact
+# (silu 1 ulp), so a single prompt's acc/draft moves -- judge it on multi-prompt tok/update. The
+# compiled graph changes, so it keys the cache dir.
+GNQ=${RADIANCE_GDN_NORM_QUANT:-1}
+if [ "$GNQ" = 1 ]; then CACHE_SUF="$CACHE_SUF-gnq"; fi
+# RADIANCE_GDN_STRIDED_GATES=1 (default 0, MEASURED NEUTRAL 2026-09-02): skips vLLM's .contiguous()
+# on the GDN (b, a) gate slices. Serve A/B on top of GNQ: 22.34-22.41 vs 22.31-22.33 ms/step, output
+# byte-identical, GSM8K 97.80% -- the copies are not on the critical path (or inductor re-packs
+# the custom-op inputs anyway). Left dark; the graph changes, so it keys the cache dir.
+SGATES=${RADIANCE_GDN_STRIDED_GATES:-0}
+if [ "$SGATES" = 1 ]; then CACHE_SUF="$CACHE_SUF-sg"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
@@ -663,6 +677,8 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
+  -e RADIANCE_GDN_NORM_QUANT="$GNQ" \
+  -e RADIANCE_GDN_STRIDED_GATES="$SGATES" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
   -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \
@@ -727,6 +743,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
+    python3 patch_gdn_glue.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"

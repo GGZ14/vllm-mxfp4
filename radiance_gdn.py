@@ -63,6 +63,9 @@ _FUSED_UPDATE = _bind("gdn_fused_update", conv_width=CONV_WIDTH, head_k=HEAD_K, 
 # boundary per GDN layer per forward. Bit-identical to the pair by construction. Off by default
 # until the serving A/B has run; needs a build whose registry has gdn_fused_update.
 FUSED_UPDATE_ON = os.environ.get("RADIANCE_GDN_FUSED_UPDATE", "0") == "1" and _FUSED_UPDATE is not None
+# patch_gdn_glue.py reads this: skip vLLM's .contiguous() on the (b, a) gate slices; the R4D
+# kernels take the row stride. Default 0 until the serving A/B lands.
+STRIDED_GATES = os.environ.get("RADIANCE_GDN_STRIDED_GATES", "0") == "1"
 # The barrier counter must exist BEFORE any CUDA-graph capture replays the kernel, and must NOT
 # be allocated at import -- that grabs a CUDA context before vLLM sets the device and breaks its
 # memory snapshot (the split-K decode scratch learned the same lesson; it allocates at weight

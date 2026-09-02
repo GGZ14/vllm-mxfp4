@@ -1408,6 +1408,94 @@ static void launch_silu_mul_quant(uintptr_t gu, uintptr_t q, uintptr_t scale, in
                        (float *)scale, N);
 }
 
+// ---- fused per-head gated RMSNorm + per-token fp8 quant (GDN out_proj input) ----------------
+// Replaces RMSNormGated(norm_before_gate=True, group per 128-wide head) + the traced per-token
+// quant in _output_projection, which inductor emits as two kernels per GDN layer (a variance
+// reduction and a normalize+gate+quant). Precision contract mirrors radiance_add_rms_quant and
+// the traced reference: fp32 throughout, ((x * rsqrt(mean(x^2) + eps)) * w) * silu(z) rounded
+// to bf16 once, amax over the rounded values, e4m3 with the vLLM min-scale clamp. The per-head
+// sum of squares is a 16-lane xor-shuffle: 16 consecutive 8-groups make one head and, with ART a
+// multiple of 16 and N a multiple of 128, every 16-lane segment is either fully active or fully
+// idle in each pass. x: [M, N] contiguous bf16; z: [M, N] bf16 with row stride zs (a column
+// slice of the fused qkvz projection, no copy); w: [128] bf16 shared by all heads.
+template <int ART>
+__global__ __launch_bounds__(ART) void radiance_gdn_norm_quant(
+    const __bf16 *__restrict__ x, const __bf16 *__restrict__ z, long zs,
+    const __bf16 *__restrict__ w, unsigned char *__restrict__ q, float *__restrict__ scale,
+    int N, float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  x += (long)row * N; z += (long)row * zs; q += (long)row * N;
+  constexpr int MAXG = 5;                       // N <= ART*8*5 = 10240 (3072 in this model)
+  const int NV = N >> 3;                        // 8-element groups; 16 per head
+  float sv[MAXG][8];
+  int ng = 0;
+  float amax = 0.f;
+  for (int g = tid; g < NV; g += ART, ++ng) {
+    ArnqVec8 vx, vz, vw;
+    vx.u4 = ((const uint4 *)x)[g];
+    float ssq = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float v = (float)vx.h[j];
+      sv[ng][j] = v;
+      ssq += v * v;
+    }
+    for (int o = 8; o; o >>= 1) ssq += __shfl_xor(ssq, o, 16);
+    const float inv = rsqrtf(ssq * (1.f / 128.f) + eps);
+    vz.u4 = ((const uint4 *)z)[g];
+    vw.u4 = ((const uint4 *)w)[g & 15];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float zz = (float)vz.h[j];
+      const float sg = zz / (1.f + expf(-zz));                       // silu, fp32
+      const float nv = (float)(__bf16)(((sv[ng][j] * inv) * (float)vw.h[j]) * sg);
+      sv[ng][j] = nv;
+      amax = fmaxf(amax, fabsf(nv));
+    }
+  }
+  __shared__ float lds[ART / 32];
+  for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_down(amax, o));
+  if ((tid & 31) == 0) lds[tid >> 5] = amax;
+  __syncthreads();
+  if (tid < ART / 32) {
+    float v = lds[tid];
+    for (int o = ART / 64; o; o >>= 1) v = fmaxf(v, __shfl_down(v, o));
+    if (tid == 0) lds[0] = v;
+  }
+  __syncthreads();
+  const float sc = fmaxf(lds[0] * (1.f / 448.f), 1.f / (448.f * 512.f));
+  const float rs = 1.f / sc;
+  if (tid == 0) scale[row] = sc;
+  int mg = 0;
+  for (int g = tid; g < NV; g += ART, ++mg) {
+    uint32_tt lo = 0, hi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j += 2) {
+      float a = fminf(fmaxf(sv[mg][j] * rs, -448.f), 448.f);
+      float b = fminf(fmaxf(sv[mg][j + 1] * rs, -448.f), 448.f);
+      lo |= (__builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false) & 0xffffu) << (j * 8);
+    }
+#pragma unroll
+    for (int j = 4; j < 8; j += 2) {
+      float a = fminf(fmaxf(sv[mg][j] * rs, -448.f), 448.f);
+      float b = fminf(fmaxf(sv[mg][j + 1] * rs, -448.f), 448.f);
+      hi |= (__builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false) & 0xffffu) << ((j - 4) * 8);
+    }
+    ((uint2 *)q)[g] = make_uint2(lo, hi);
+  }
+}
+
+static void launch_gdn_norm_quant(uintptr_t x, uintptr_t z, long zs, uintptr_t w, uintptr_t q,
+                                  uintptr_t scale, int M, int N, double eps, uintptr_t stream) {
+  if (N > 40 * ARNQ_T || (N & 127))
+    throw std::runtime_error("radiance_gdn_norm_quant: N must be a multiple of 128 and <= 10240");
+  if (zs & 7) throw std::runtime_error("radiance_gdn_norm_quant: z row stride must be 8-aligned");
+  hipLaunchKernelGGL((radiance_gdn_norm_quant<ARNQ_T>), dim3(M), dim3(ARNQ_T), 0,
+                     (hipStream_t)stream, (const __bf16 *)x, (const __bf16 *)z, zs,
+                     (const __bf16 *)w, (unsigned char *)q, (float *)scale, N, (float)eps);
+}
+
 static void launch_add_rms_quant(uintptr_t y, uintptr_t res, uintptr_t w, uintptr_t q,
                                  uintptr_t scale, uintptr_t res_out, int M, int K, double eps,
                                  uintptr_t stream, int tiled) {
@@ -1480,6 +1568,8 @@ PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
         "fused silu(gate)*up + per-token e4m3 quant, one WG per row",
         py::arg("gu"), py::arg("q"), py::arg("scale"), py::arg("M"), py::arg("N"),
         py::arg("stream"), py::arg("tiled") = 0);
+  m.def("launch_gdn_norm_quant", &launch_gdn_norm_quant,
+        "per-head gated RMSNorm + per-token fp8 quant (GDN out_proj input)");
   m.def("launch_add_rms_quant", &launch_add_rms_quant,
         "fused residual-add + Gemma rmsnorm + per-token e4m3 quant, one WG per row",
         py::arg("y"), py::arg("res"), py::arg("w"), py::arg("q"), py::arg("scale"),

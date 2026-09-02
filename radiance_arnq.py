@@ -144,6 +144,62 @@ class _SiluMulQuant(torch.nn.Module):
         return torch.ops.radiance.silu_mul_quant(gu)
 
 
+# ---- GDN gated norm + quant (RADIANCE_GDN_NORM_QUANT=1) --------------------------------------
+# RMSNormGated (per-head, norm_before_gate) + the traced per-token quant feeding out_proj, as ONE
+# kernel instead of the two inductor kernels per linear-attention layer (a variance reduction and
+# a normalize+gate+quant; 48 layers = 96 launches/step). Same (q, scale) contract as silu_mul_quant.
+GNQ = os.environ.get("RADIANCE_GDN_NORM_QUANT", "0") == "1"
+
+
+@torch.library.custom_op("radiance::gdn_norm_quant", mutates_args=())
+def gdn_norm_quant(x: torch.Tensor, z: torch.Tensor, w: torch.Tensor,
+                   eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    x = x.contiguous()                                # core_attn_out is allocated contiguous
+    if z.stride(-1) != 1 or z.shape[0] != M or z.shape[1] != N:
+        z = z.contiguous()
+    q = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
+    sc = torch.empty((M,), dtype=torch.float32, device=x.device)
+    _ext().launch_gdn_norm_quant(x.data_ptr(), z.data_ptr(), z.stride(0), w.data_ptr(),
+                                 q.data_ptr(), sc.data_ptr(), M, N, float(eps),
+                                 torch.cuda.current_stream().cuda_stream)
+    return q, sc
+
+
+@gdn_norm_quant.register_fake
+def _(x, z, w, eps):
+    M, N = x.shape
+    return (torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device),
+            torch.empty((M,), dtype=torch.float32, device=x.device))
+
+
+def _gdn_output_projection(self, core_attn_out, z):
+    """Drop-in for QwenGDN linear attention's _output_projection: norm+gate+quant in one launch,
+    (q, scale) straight into out_proj's pq path."""
+    T = core_attn_out.shape[0]
+    q, sc = torch.ops.radiance.gdn_norm_quant(core_attn_out.reshape(T, -1), z.reshape(T, -1),
+                                              self.norm.weight, float(self.norm.eps))
+    output, _ = self.out_proj((q, sc))
+    return output
+
+
+def _gnq_ok(la) -> str | None:
+    n = getattr(la, "norm", None)
+    if n is None or getattr(la, "out_proj", None) is None:
+        return "no norm/out_proj"
+    if getattr(n, "group_size", None) is not None or not getattr(n, "norm_before_gate", False):
+        return f"norm shape group_size={getattr(n, 'group_size', None)} before_gate={getattr(n, 'norm_before_gate', None)}"
+    if getattr(n, "activation", "swish") not in ("swish", "silu"):
+        return f"activation {n.activation}"
+    if n.weight.dtype != torch.bfloat16 or n.weight.numel() != 128:
+        return f"norm weight {n.weight.dtype} x{n.weight.numel()}"
+    if not _linear_is_ours(la.out_proj) or la.out_proj.bias is not None:
+        return "out_proj not ours / has bias"
+    if la.out_proj.input_size_per_partition % 128:
+        return f"N {la.out_proj.input_size_per_partition} not a multiple of 128"
+    return None
+
+
 def _stream_forward(self, hidden_states, residual, positions=None, **kwargs):
     """Patched decoder-layer forward under the fp8-stream contract. Mirrors the stock body
     (qwen3_next.py Qwen3NextDecoderLayer.forward) minus the guarded-away branches (sequence
@@ -271,6 +327,14 @@ def install(model) -> None:
             layer.mlp.act_fn = _SiluMulQuant()
             n_act = getattr(install, "_n_act", 0) + 1
             install._n_act = n_act
+        if GNQ and layer.layer_type == "linear_attention":
+            why = _gnq_ok(layer.linear_attn)
+            if why is None:
+                layer.linear_attn._output_projection = types.MethodType(
+                    _gdn_output_projection, layer.linear_attn)
+                install._n_gnq = getattr(install, "_n_gnq", 0) + 1
+            else:
+                _log(f"layer {i}: gdn norm+quant left stock ({why})")
         layer.forward = types.MethodType(_stream_forward, layer)
         if not hasattr(layer, "_rad_fp8_in"):
             layer._rad_fp8_in = False
@@ -281,4 +345,5 @@ def install(model) -> None:
         if not hasattr(layer, "_rad_fp8_mid"):
             layer._rad_fp8_mid = False
     _log(f"fp8 stream installed: {n_mid} mid epilogues, {n_down} down streams, "
-         f"{getattr(install, '_n_act', 0)} act epilogues over {L} layers")
+         f"{getattr(install, '_n_act', 0)} act epilogues, "
+         f"{getattr(install, '_n_gnq', 0)} gdn norm+quant epilogues over {L} layers")
