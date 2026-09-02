@@ -240,6 +240,15 @@ FP8S=${RADIANCE_FP8_STREAM:-1}
 # kernel: +9.7% @2k, +6..+8% @8k-64k, +0.4% @250k (attention-bound there); GSM8K 500q 98.00%
 # (490/500). Must stay > 512 (the exact_nq decode epilogue writes row-major) and above
 # RADIANCE_MXFP4_DECODE_MAX_M.
+#
+# RADIANCE_MXFP4_WPERM=1 + RADIANCE_MXFP4_DECODE_NT=1 (defaults since 2026-09-02): fragment-order
+# weight layout plus nontemporal weight loads in the decode GEMM. Serve-level gate, same cache dir
+# (weight layout only, the traced graph is untouched): bench_decode_ctx 23.95 -> 22.66 ms/step at
+# ctx 0 and 27.23 -> 25.65 at 32k (-5.4/-5.6%), acceptance byte-identical (2.069); GSM8K 500q
+# 97.40% (487/500); BetterBench prefill within +0.3..+3.3% of the WPERM=0 A-tiled sweep at every
+# depth 2k-64k (the A-tiled prefill kernel is layout-neutral, which is what ended the old
+# "WPERM costs prefill 7-11%" trade). NT is honoured only under WPERM=1 (2-3.6x SLOWER on the
+# checkpoint layout - the kernel ignores it there). Set both to 0 to serve the checkpoint layout.
 # Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
 # test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
 # single line of output. It bit exactly when a flag was 0.
@@ -650,9 +659,9 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
-  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-0}" \
+  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-1}" \
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
-  -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
+  -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
