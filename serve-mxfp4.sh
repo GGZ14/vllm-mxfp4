@@ -454,6 +454,22 @@ CC_ITEMS=""
 if [ -n "$CAPTURE_SIZES" ] && [ "$CAPTURE_SIZES" != none ]; then
   CC_ITEMS="\"cudagraph_capture_sizes\":$CAPTURE_SIZES"
 fi
+# Static-shape inductor specializations for the decode batch sizes, and cooperative reductions.
+# Both were in the serve that measured 22.66 ms/step (serve_final1.log, 2026-08-29) and neither
+# made it into the launch defaults. Re-measured 2026-09-02 on the current stack (bench_decode_ctx
+# ctx 0, gen 400, 2-3 reps each): defaults 23.91-23.98 ms/step at 2.069 acc/draft; COOP_RED=1
+# alone 23.95-23.97 / 2.069 (neutral); COMPILE_SIZES=[1,2,4,8] alone 23.79-23.82 but acc/draft
+# 1.837 (119 vs 128 tok/s, the static specializations change numerics enough to cost the
+# drafter); both 23.81-23.85 / 1.771 (116 tok/s). Neither recovers 22.66; both stay OFF.
+# COMPILE_SIZES="[1,2,4,8]"  COOP_RED=1
+COMPILE_SIZES=${COMPILE_SIZES:-none}
+COOP_RED=${COOP_RED:-0}
+if [ -n "$COMPILE_SIZES" ] && [ "$COMPILE_SIZES" != none ]; then
+  CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"compile_sizes\":$COMPILE_SIZES"
+fi
+if [ "$COOP_RED" = 1 ]; then
+  CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"inductor_compile_config\":{\"triton.cooperative_reductions\":true}"
+fi
 if [ "$NQF" = 1 ]; then
   CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}"
 fi
