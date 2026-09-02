@@ -240,6 +240,15 @@ FP8S=${RADIANCE_FP8_STREAM:-1}
 # kernel: +9.7% @2k, +6..+8% @8k-64k, +0.4% @250k (attention-bound there); GSM8K 500q 98.00%
 # (490/500). Must stay > 512 (the exact_nq decode epilogue writes row-major) and above
 # RADIANCE_MXFP4_DECODE_MAX_M.
+#
+# RADIANCE_MXFP4_WPERM=1 + RADIANCE_MXFP4_DECODE_NT=1 (defaults since 2026-09-02): fragment-order
+# weight layout plus nontemporal weight loads in the decode GEMM. Serve-level gate, same cache dir
+# (weight layout only, the traced graph is untouched): bench_decode_ctx 23.95 -> 22.66 ms/step at
+# ctx 0 and 27.23 -> 25.65 at 32k (-5.4/-5.6%), acceptance byte-identical (2.069); GSM8K 500q
+# 97.40% (487/500); BetterBench prefill within +0.3..+3.3% of the WPERM=0 A-tiled sweep at every
+# depth 2k-64k (the A-tiled prefill kernel is layout-neutral, which is what ended the old
+# "WPERM costs prefill 7-11%" trade). NT is honoured only under WPERM=1 (2-3.6x SLOWER on the
+# checkpoint layout - the kernel ignores it there). Set both to 0 to serve the checkpoint layout.
 # Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
 # test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
 # single line of output. It bit exactly when a flag was 0.
@@ -250,6 +259,28 @@ if [ "$AR_OVERLAP" = 1 ]; then CACHE_SUF="$CACHE_SUF-arov"; fi
 # via env alone (no hashed file changes), so it MUST key the cache dir.
 if [ "$NQF" = 1 ]; then CACHE_SUF="$CACHE_SUF-nqft"; fi
 if [ "$FP8S" = 1 ]; then CACHE_SUF="$CACHE_SUF-fp8s"; fi
+# RADIANCE_GDN_NORM_QUANT=1 (default since 2026-09-02): the GDN RMSNormGated + per-token quant as
+# ONE custom op (radiance::gdn_norm_quant) instead of the two inductor kernels per linear-attention
+# layer. Serve gate: 22.51 -> 22.32 ms/step at ctx 0 (-0.8%), 25.8 -> 25.1 @32k; GSM8K 500q 97.60%;
+# BetterBench single-pass update p50 -0.2 ms in every category, tok/update neutral. Not bit-exact
+# (silu 1 ulp), so a single prompt's acc/draft moves -- judge it on multi-prompt tok/update. The
+# compiled graph changes, so it keys the cache dir.
+GNQ=${RADIANCE_GDN_NORM_QUANT:-1}
+if [ "$GNQ" = 1 ]; then CACHE_SUF="$CACHE_SUF-gnq"; fi
+# RADIANCE_GDN_STRIDED_GATES=1 (default 0, MEASURED NEUTRAL 2026-09-02): skips vLLM's .contiguous()
+# on the GDN (b, a) gate slices. Serve A/B on top of GNQ: 22.34-22.41 vs 22.31-22.33 ms/step, output
+# byte-identical, GSM8K 97.80% -- the copies are not on the critical path (or inductor re-packs
+# the custom-op inputs anyway). Left dark; the graph changes, so it keys the cache dir.
+SGATES=${RADIANCE_GDN_STRIDED_GATES:-0}
+if [ "$SGATES" = 1 ]; then CACHE_SUF="$CACHE_SUF-sg"; fi
+# RADIANCE_GDN_EMPTY_OUT=1 (default 0, MEASURED NEUTRAL 2026-09-02): core_attn_out via torch.empty,
+# the rx5 fused_update zeroing the cudagraph pad rows itself. Serve A/B on top of GNQ: 22.28-22.32
+# vs 22.29-22.33 ms/step, output byte-identical, GSM8K 500q @conc 8 98.00% (pad rows exercised).
+# Correct but worthless: with the strided-gates result this says a ~1 us kernel plus its gap is
+# hidden behind the queue at decode -- only kernel TIME moves the step now. Kept dark; keys the
+# cache dir because the fill kernel leaves the graph.
+EOUT=${RADIANCE_GDN_EMPTY_OUT:-0}
+if [ "$EOUT" = 1 ]; then CACHE_SUF="$CACHE_SUF-eo"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
@@ -388,7 +419,7 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx4"; fi
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx5"; fi   # rx5: fused_update zeroes the pad rows (o_rows arg)
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -650,10 +681,13 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
-  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-0}" \
+  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-1}" \
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
-  -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
+  -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
+  -e RADIANCE_GDN_NORM_QUANT="$GNQ" \
+  -e RADIANCE_GDN_STRIDED_GATES="$SGATES" \
+  -e RADIANCE_GDN_EMPTY_OUT="$EOUT" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
   -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \
@@ -718,6 +752,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
+    python3 patch_gdn_glue.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
