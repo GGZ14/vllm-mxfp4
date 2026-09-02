@@ -63,6 +63,9 @@ _FUSED_UPDATE = _bind("gdn_fused_update", conv_width=CONV_WIDTH, head_k=HEAD_K, 
 # boundary per GDN layer per forward. Bit-identical to the pair by construction. Off by default
 # until the serving A/B has run; needs a build whose registry has gdn_fused_update.
 FUSED_UPDATE_ON = os.environ.get("RADIANCE_GDN_FUSED_UPDATE", "0") == "1" and _FUSED_UPDATE is not None
+# (seq, v-head) items above which the decode step takes the conv+recurrent PAIR instead of the
+# fused kernel; 32 = the fused kernel's FU_MAXWG, i.e. one sequence at H=24. Env-tunable for A/B.
+FUSED_MAX_ITEMS = int(os.environ.get("RADIANCE_GDN_FUSED_MAX_ITEMS", "32"))
 # patch_gdn_glue.py reads this: skip vLLM's .contiguous() on the (b, a) gate slices; the R4D
 # kernels take the row stride. Default 0 until the serving A/B lands.
 STRIDED_GATES = os.environ.get("RADIANCE_GDN_STRIDED_GATES", "0") == "1"
@@ -481,7 +484,16 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         maxq = sidx.size(-1)
         cu = md.spec_query_start_loc[: nseq + 1]
         o = core_attn_out[:T].view(T, H, HEAD_V)
-        if FUSED_UPDATE_ON:
+        # The fused kernel's resident grid is capped at 32 workgroups (deadlock-free barrier), so
+        # past one sequence it work-loops nseq*H (seq, head) items over 32 WGs while the pair's
+        # recurrent kernel launches one WG per item. Microbench 2026-09-02 (gdn_decode_bench.py,
+        # one state slot per candidate): N=1 fused 32.0 / pair 26.6 us at T=8 -- but in the serve
+        # the fused step measured -0.4% (its barrier hides one launch gap); N=2 40.2 / 31.2,
+        # N=4 60.1 / 45.8, N=8 89.8 / 72.9 us. So: fused for a single sequence, the pair beyond.
+        # Serve-level (2026-09-02): conc-4 32.8-33.4 -> 31.7-33.0, conc-8 43.0-45.2 -> 43.3-47.3
+        # ms/step, single-stream unchanged -- neutral, because at conc-8 the step is paced by the
+        # serial CPU/IPC chain, not the GPU. Kept: less GPU time for the same step.
+        if FUSED_UPDATE_ON and nseq * H <= FUSED_MAX_ITEMS:
             fused_update(mixed_qkv, conv_w, self.conv1d.bias, conv_state,
                          (4 - 1) + (maxq - 1), sidx[:, 0][:nseq], md.num_accepted_tokens,
                          cu, nseq, T, H, Hg, maxq, a, b, A_log, dt_bias, ssm_state, o, sidx,
