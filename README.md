@@ -5,7 +5,7 @@ ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom k
 this card, plus RDNA4-tuned GEMM / attention / all-reduce paths and a dynamic MTP draft controller, so you
 don't have to build the stack yourself.
 
-> **Status: early dev, experimental.** Repo version `0.10.0`; the pinned image is
+> **Status: early dev, experimental.** Repo version `0.11.0`; the pinned image is
 > `stilldeadcode/vllm-radiance:0.9.3`. Everything here was built and measured on a few exact setups:
 > **Qwen3.8-27B-FP8** and **Qwen3.6-27B-FP8** (gated-delta-net hybrids, architecturally identical),
 > **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8),
