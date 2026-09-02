@@ -65,7 +65,16 @@ def ar_add_rms_quant(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tens
                      eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, K = y.shape
     residual = residual.contiguous()
-    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=y.device)
+    import radiance_mxfp4 as _rm
+    # Fragment-tiled output for the prefill GEMM (see radiance_mxfp4.A_TILED_MIN_M). The storage
+    # is padded to 16 rows (the tiling writes whole fragments); the returned q is the [M, K] VIEW
+    # so the op's real and fake shapes agree. The decode fast path below is never tiled (the
+    # threshold is asserted > 512).
+    tiled = _rm.a_tiled_wanted(M)
+    if tiled:
+        q = torch.empty(((M + 15) // 16 * 16, K), dtype=torch.float8_e4m3fn, device=y.device)[:M]
+    else:
+        q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=y.device)
     sc = torch.empty((M,), dtype=torch.float32, device=y.device)
     ro = torch.empty((M, K), dtype=residual.dtype, device=y.device)
     stream = torch.cuda.current_stream().cuda_stream
@@ -87,7 +96,9 @@ def ar_add_rms_quant(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tens
     y = _ar(y)
     _ext().launch_add_rms_quant(y.data_ptr(), residual.data_ptr(), weight.data_ptr(),
                                 q.data_ptr(), sc.data_ptr(), ro.data_ptr(), M, K, eps,
-                                stream)
+                                stream, 1 if tiled else 0)
+    if tiled:
+        _rm.a_tiled_register(q, M, K)
     return q, sc, ro
 
 
@@ -103,10 +114,17 @@ def _(y, residual, weight, eps):
 def silu_mul_quant(gu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     M, N2 = gu.shape
     N = N2 // 2
-    q = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=gu.device)
+    import radiance_mxfp4 as _rm
+    tiled = _rm.a_tiled_wanted(M)                     # see ar_add_rms_quant
+    if tiled:
+        q = torch.empty(((M + 15) // 16 * 16, N), dtype=torch.float8_e4m3fn, device=gu.device)[:M]
+    else:
+        q = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=gu.device)
     sc = torch.empty((M,), dtype=torch.float32, device=gu.device)
     _ext().launch_silu_mul_quant(gu.contiguous().data_ptr(), q.data_ptr(), sc.data_ptr(),
-                                 M, N, torch.cuda.current_stream().cuda_stream)
+                                 M, N, torch.cuda.current_stream().cuda_stream, 1 if tiled else 0)
+    if tiled:
+        _rm.a_tiled_register(q, M, N)
     return q, sc
 
 
