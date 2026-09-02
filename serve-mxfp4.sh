@@ -59,7 +59,7 @@ Everything is an environment variable; these are the ones worth knowing.
   PORT=8080                 listen port
   IMAGE=...:0.9.3           container image (CACHE is keyed to it -- move both together)
   RUNTIME=podman|docker     container runtime (auto-detected)
-  CHAT_TEMPLATE=./qwen3.8-enhanced.jinja
+  CHAT_TEMPLATE=./qwen-fixed-v22.3.jinja
                             chat template; must be readable on the host
 
   SPEC_METHOD=dflash        speculative drafter: dflash (fastest, needs the DFlash2 checkpoint)
@@ -190,7 +190,7 @@ preflight() {
 
   [ -r "$CHAT_TEMPLATE" ] || die "chat template not readable: $CHAT_TEMPLATE" \
       "set CHAT_TEMPLATE=<path to a .jinja on the host>, or leave it unset to use the" \
-      "one shipped in this repo (qwen3.8-enhanced.jinja)"
+      "one shipped in this repo (qwen-fixed-v22.3.jinja)"
 }
 
 # Image and cache MUST move together: cache dirs validate on model + torch/Triton version and must
@@ -219,7 +219,7 @@ AR_OVERLAP=${RADIANCE_AR_OVERLAP:-0}
 # and enable the vLLM passes themselves (pass_config.fuse_norm_quant/fuse_act_quant -- the piece
 # the Aug-28 experiment missed: its serve config shows 'fuse_norm_quant': False, so that
 # "neutral" result was a null test). Changes the traced graph => own cache suffix.
-NQF=${RADIANCE_NORMQUANT_FUSION:-0}
+NQF=${RADIANCE_NORMQUANT_FUSION:-1}
 # FP8 residual stream (radiance_arnq): fuse each RowParallel linear's post-AR epilogue
 # (residual add + Gemma rmsnorm + per-token fp8 quant) into one HIP kernel and hand the next
 # linear a pre-quantized (q, scale). Kernel is bit-identical to the traced path; the contract
@@ -229,7 +229,17 @@ NQF=${RADIANCE_NORMQUANT_FUSION:-0}
 # tell the difference afterwards -- a later fixed launch silently replays the stock graph
 # (measured 2026-08-30: epilogue kernels 0/step, bench byte-identical). After fixing whatever
 # made the installer skip, rm the -fp8s cache dir.
-FP8S=${RADIANCE_FP8_STREAM:-0}
+FP8S=${RADIANCE_FP8_STREAM:-1}
+# NQF=1 and FP8S=1 are the DEFAULTS as of 2026-09-02: prod has served on them since 2026-08-30
+# and a bare ./serve-mxfp4.sh must reproduce prod (it did not -- every restart needed the two
+# overrides). Set either to 0 to fall back; the cache suffix follows.
+#
+# RADIANCE_MXFP4_A_TILED_MIN_M=513 (default, 0 = off): activations at M >= 513 are emitted
+# fragment-tiled and the prefill GEMM reads them straight into WMMA registers
+# (radiance_mxfp4_fp8_gemm_atiled). Measured 2026-09-02, BetterBench PP t/s vs the folded
+# kernel: +9.7% @2k, +6..+8% @8k-64k, +0.4% @250k (attention-bound there); GSM8K 500q 98.00%
+# (490/500). Must stay > 512 (the exact_nq decode epilogue writes row-major) and above
+# RADIANCE_MXFP4_DECODE_MAX_M.
 # Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
 # test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
 # single line of output. It bit exactly when a flag was 0.
@@ -339,9 +349,15 @@ MAXLEN=${MAXLEN:-262144}
 # Chat template. It is mounted into the container by path, so it must exist ON THE HOST: this was
 # hardcoded to a file under ~/.cache/huggingface that only ever existed on the box it was written
 # on, which made a fresh clone fail at startup with a missing-file error from vllm rather than
-# anything pointing at the cause. The repo's own template is the default now; point CHAT_TEMPLATE
-# at your own to override, e.g. the qwen-fixed series if you have it.
-CHAT_TEMPLATE=${CHAT_TEMPLATE:-$SCRIPT_DIR/qwen3.8-enhanced.jinja}
+# anything pointing at the cause. The repo ships the template, so the default works from a fresh
+# clone; point CHAT_TEMPLATE at your own to override.
+#
+# qwen-fixed-v22.3.jinja is the default, NOT qwen3.8-enhanced.jinja (still in the repo). Measured
+# 2026-09-02 on the same build, GSM8K 500q greedy conc 8: enhanced 96.00% (480/500, 14 answers
+# ran to the 3072-token cap, 340 s) vs fixed-v22.3 98.00% (490/500, 0 truncated, 211 s). Every
+# 97-98% record from Aug 24-31 was taken with fixed-v22.3; the 08-31 launcher rewrite silently
+# switched prod to enhanced and the band dropped to 95-96% with runaway answers.
+CHAT_TEMPLATE=${CHAT_TEMPLATE:-$SCRIPT_DIR/qwen-fixed-v22.3.jinja}
 CHAT_TEMPLATE="$(realpath -m "$CHAT_TEMPLATE")"
 PATCHES_DIR="$(realpath -m "${PATCHES:-$SCRIPT_DIR}")"
 # A template inside the repo rides the /patches mount that is already there (already SELinux
@@ -447,6 +463,22 @@ CAPTURE_SIZES=${CAPTURE_SIZES:-none}
 CC_ITEMS=""
 if [ -n "$CAPTURE_SIZES" ] && [ "$CAPTURE_SIZES" != none ]; then
   CC_ITEMS="\"cudagraph_capture_sizes\":$CAPTURE_SIZES"
+fi
+# Static-shape inductor specializations for the decode batch sizes, and cooperative reductions.
+# Both were in the serve that measured 22.66 ms/step (serve_final1.log, 2026-08-29) and neither
+# made it into the launch defaults. Re-measured 2026-09-02 on the current stack (bench_decode_ctx
+# ctx 0, gen 400, 2-3 reps each): defaults 23.91-23.98 ms/step at 2.069 acc/draft; COOP_RED=1
+# alone 23.95-23.97 / 2.069 (neutral); COMPILE_SIZES=[1,2,4,8] alone 23.79-23.82 but acc/draft
+# 1.837 (119 vs 128 tok/s, the static specializations change numerics enough to cost the
+# drafter); both 23.81-23.85 / 1.771 (116 tok/s). Neither recovers 22.66; both stay OFF.
+# COMPILE_SIZES="[1,2,4,8]"  COOP_RED=1
+COMPILE_SIZES=${COMPILE_SIZES:-none}
+COOP_RED=${COOP_RED:-0}
+if [ -n "$COMPILE_SIZES" ] && [ "$COMPILE_SIZES" != none ]; then
+  CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"compile_sizes\":$COMPILE_SIZES"
+fi
+if [ "$COOP_RED" = 1 ]; then
+  CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"inductor_compile_config\":{\"triton.cooperative_reductions\":true}"
 fi
 if [ "$NQF" = 1 ]; then
   CC_ITEMS="${CC_ITEMS:+$CC_ITEMS,}\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}"
@@ -618,6 +650,8 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_PADOUT="${RADIANCE_MXFP4_PADOUT:-0}" \
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
+  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-0}" \
+  -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
