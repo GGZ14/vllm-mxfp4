@@ -26,6 +26,36 @@ ENABLED = os.environ.get("RADIANCE_MXFP4_W4A8", "0") == "1"
 MIN_M = int(os.environ.get("RADIANCE_MXFP4_W4A8_MIN_M", "256"))
 # Decode band for the small-M kernel. 0 = dark. Also gates the scratch preallocation.
 DECODE_MAX_M = int(os.environ.get("RADIANCE_MXFP4_DECODE_MAX_M", "0"))
+# Fragment-tiled activations for the prefill GEMM (radiance_mxfp4_fp8_gemm_atiled): the fp8-stream
+# producers (radiance_arnq) emit the tiled layout at M >= this and the consumer takes the A-direct
+# kernel, measured 12-16% faster than the folded kernel at M >= 2048 on every shape (2026-09-01,
+# tier7/lf.hip). 0 = off. The layout is decided per TENSOR inside the opaque op bodies (eager ints,
+# no traced shape guard -- vLLM forbids recompiles) and handed producer -> consumer through
+# _A_TILED keyed by data_ptr, popped on consume; every other producer (traced quant, scaled_fp8_quant,
+# the exact_nq decode epilogue) stays row-major and never registers. Must stay above the decode band
+# (the decode kernel reads row-major A) and above 512 (the exact_nq epilogue writes row-major).
+A_TILED_MIN_M = int(os.environ.get("RADIANCE_MXFP4_A_TILED_MIN_M", "0"))
+if A_TILED_MIN_M and A_TILED_MIN_M <= max(512, DECODE_MAX_M):
+    raise RuntimeError("RADIANCE_MXFP4_A_TILED_MIN_M must exceed 512 and RADIANCE_MXFP4_DECODE_MAX_M")
+_A_TILED: dict = {}
+_A_TILED_STATS = [0]
+
+
+def a_tiled_wanted(M: int) -> bool:
+    return A_TILED_MIN_M > 0 and M >= A_TILED_MIN_M
+
+
+def a_tiled_register(q, M: int, K: int) -> None:
+    _A_TILED[q.data_ptr()] = (M, K)
+
+
+def a_tiled_take(q, M: int, K: int) -> bool:
+    ent = _A_TILED.pop(q.data_ptr(), None)
+    if ent is None:
+        return False
+    if ent != (M, K):
+        raise RuntimeError(f"radiance.mxfp4: tiled activation shape mismatch {ent} vs {(M, K)}")
+    return True
 # Store the weight in WMMA fragment order rather than the checkpoint's [N, K/2]. A B fragment maps
 # lane l onto N row l&15, so in checkpoint order a half-wave reads sixteen rows K/2 bytes apart --
 # fully strided, on the operand that dominates decode traffic. Reordering once here makes a wave's
@@ -507,12 +537,24 @@ def mxfp4_linear_pq(x_fp8: torch.Tensor, x_scale: torch.Tensor, weight: torch.Te
                     weight_scale: torch.Tensor, weight_ref: torch.Tensor) -> torch.Tensor:
     if not _stats_reported[0]:
         report_stats()
+    # A tiled activation is an [M, K] VIEW over 16-row-padded storage, so x_fp8.shape[0] is M in
+    # both layouts. (Reading M from x_scale instead faulted the drafter's profile pass on
+    # 2026-09-02 -- some caller's scale does not lead with M -- so the shape stays the contract.)
     M, N = x_fp8.shape[0], weight.shape[0]
     K = weight_scale.shape[0] * 32
     out = torch.empty((M, N), device=x_fp8.device, dtype=torch.bfloat16)
-    _ext.launch(x_fp8.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(),
-                weight_ref.data_ptr(), x_scale.data_ptr(), out.data_ptr(),
-                M, N, K, torch.cuda.current_stream().cuda_stream)
+    tiled = bool(A_TILED_MIN_M) and a_tiled_take(x_fp8, M, K)
+    launch = _ext.launch_at if tiled else _ext.launch
+    if tiled:
+        # Which-path counter: a gated fast path must prove it ran (the verify-head lesson).
+        _A_TILED_STATS[0] += 1
+        if _A_TILED_STATS[0] in (1, 100, 1000, 10000):
+            sys.stderr.write(f"[radiance.mxfp4] A-tiled GEMM path: call #{_A_TILED_STATS[0]} "
+                             f"(M={M} N={N} K={K})\n")
+            sys.stderr.flush()
+    launch(x_fp8.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(),
+           weight_ref.data_ptr(), x_scale.data_ptr(), out.data_ptr(),
+           M, N, K, torch.cuda.current_stream().cuda_stream)
     return out
 
 
