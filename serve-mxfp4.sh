@@ -59,7 +59,7 @@ Everything is an environment variable; these are the ones worth knowing.
   PORT=8080                 listen port
   IMAGE=...:0.9.3           container image (CACHE is keyed to it -- move both together)
   RUNTIME=podman|docker     container runtime (auto-detected)
-  CHAT_TEMPLATE=./qwen3.8-enhanced.jinja
+  CHAT_TEMPLATE=./qwen-fixed-v22.3.jinja
                             chat template; must be readable on the host
 
   SPEC_METHOD=dflash        speculative drafter: dflash (fastest, needs the DFlash2 checkpoint)
@@ -190,7 +190,7 @@ preflight() {
 
   [ -r "$CHAT_TEMPLATE" ] || die "chat template not readable: $CHAT_TEMPLATE" \
       "set CHAT_TEMPLATE=<path to a .jinja on the host>, or leave it unset to use the" \
-      "one shipped in this repo (qwen3.8-enhanced.jinja)"
+      "one shipped in this repo (qwen-fixed-v22.3.jinja)"
 }
 
 # Image and cache MUST move together: cache dirs validate on model + torch/Triton version and must
@@ -339,9 +339,15 @@ MAXLEN=${MAXLEN:-262144}
 # Chat template. It is mounted into the container by path, so it must exist ON THE HOST: this was
 # hardcoded to a file under ~/.cache/huggingface that only ever existed on the box it was written
 # on, which made a fresh clone fail at startup with a missing-file error from vllm rather than
-# anything pointing at the cause. The repo's own template is the default now; point CHAT_TEMPLATE
-# at your own to override, e.g. the qwen-fixed series if you have it.
-CHAT_TEMPLATE=${CHAT_TEMPLATE:-$SCRIPT_DIR/qwen3.8-enhanced.jinja}
+# anything pointing at the cause. The repo ships the template, so the default works from a fresh
+# clone; point CHAT_TEMPLATE at your own to override.
+#
+# qwen-fixed-v22.3.jinja is the default, NOT qwen3.8-enhanced.jinja (still in the repo). Measured
+# 2026-09-02 on the same build, GSM8K 500q greedy conc 8: enhanced 96.00% (480/500, 14 answers
+# ran to the 3072-token cap, 340 s) vs fixed-v22.3 98.00% (490/500, 0 truncated, 211 s). Every
+# 97-98% record from Aug 24-31 was taken with fixed-v22.3; the 08-31 launcher rewrite silently
+# switched prod to enhanced and the band dropped to 95-96% with runaway answers.
+CHAT_TEMPLATE=${CHAT_TEMPLATE:-$SCRIPT_DIR/qwen-fixed-v22.3.jinja}
 CHAT_TEMPLATE="$(realpath -m "$CHAT_TEMPLATE")"
 PATCHES_DIR="$(realpath -m "${PATCHES:-$SCRIPT_DIR}")"
 # A template inside the repo rides the /patches mount that is already there (already SELinux

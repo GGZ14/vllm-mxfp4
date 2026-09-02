@@ -156,7 +156,7 @@ one-line error rather than a traceback. The rest are what the log looks like whe
 | `port 8080 is already in use` | Another server holds the port and, more importantly, the GPUs. Stop the container `podman ps` shows, or its systemd unit if it has one (`systemctl --user stop qwen_vllm_38` on the dev box). Or `PORT=8081 ./serve-mxfp4.sh` |
 | `no checkpoint at .../Qwen3.8-27B-MXFP4-mtpfp8` | Run `./setup-mxfp4.sh`. AMD's release cannot be served directly -- see step 4 above |
 | `no dflash drafter at ...` | `./setup-mxfp4.sh` fetches it, or serve without it: `SPEC_METHOD=mtp ./serve-mxfp4.sh` |
-| `chat template not readable` | `CHAT_TEMPLATE=<path>`; unset uses this repo's `qwen3.8-enhanced.jinja`. It is mounted by path, so it must exist **on the host** |
+| `chat template not readable` | `CHAT_TEMPLATE=<path>`; unset uses this repo's `qwen-fixed-v22.3.jinja`. It is mounted by path, so it must exist **on the host** |
 | `/dev/kfd is missing` | The amdgpu kernel driver is not loaded. The image ships ROCm userspace, not the driver |
 | `AssertionError: Attempted to load weight (torch.Size([5120, 10240]))` | You pointed it at AMD's raw checkpoint instead of the one `fp8_mtp.py` builds |
 | Fluent but wrong output; perplexity in the hundreds of thousands | The stock libr4d NaNs the gated-delta-net. Confirm the launcher printed `[radiance] libr4d <pin> -> ...`; if you ran with `AUTO_R4D=0`, set `RADIANCE_MXFP4_SANITIZE=1` as a stopgap |
@@ -259,7 +259,7 @@ running it.
 | `IMAGE` | `stilldeadcode/vllm-radiance:0.9.3` | **moves with `CACHE`** |
 | `CACHE` | `~/.radiance-cache-w4a8-093` + suffixes | compile cache. Keyed on model + torch/Triton version **and** on every knob that changes the traced graph; never share one across configurations |
 | `RUNTIME` | auto | `podman` (preferred) or `docker` |
-| `CHAT_TEMPLATE` | `./qwen3.8-enhanced.jinja` | must exist on the host; mounted by path |
+| `CHAT_TEMPLATE` | `./qwen-fixed-v22.3.jinja` | must exist on the host; mounted by path |
 | `HF_CACHE` | `~/.cache/huggingface` | mounted for tokenizer files |
 | `DRY_RUN` / `PREPARE_ONLY` | off | print the command instead of running / do the one-time work and stop |
 
