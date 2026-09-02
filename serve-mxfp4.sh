@@ -219,7 +219,7 @@ AR_OVERLAP=${RADIANCE_AR_OVERLAP:-0}
 # and enable the vLLM passes themselves (pass_config.fuse_norm_quant/fuse_act_quant -- the piece
 # the Aug-28 experiment missed: its serve config shows 'fuse_norm_quant': False, so that
 # "neutral" result was a null test). Changes the traced graph => own cache suffix.
-NQF=${RADIANCE_NORMQUANT_FUSION:-0}
+NQF=${RADIANCE_NORMQUANT_FUSION:-1}
 # FP8 residual stream (radiance_arnq): fuse each RowParallel linear's post-AR epilogue
 # (residual add + Gemma rmsnorm + per-token fp8 quant) into one HIP kernel and hand the next
 # linear a pre-quantized (q, scale). Kernel is bit-identical to the traced path; the contract
@@ -229,7 +229,17 @@ NQF=${RADIANCE_NORMQUANT_FUSION:-0}
 # tell the difference afterwards -- a later fixed launch silently replays the stock graph
 # (measured 2026-08-30: epilogue kernels 0/step, bench byte-identical). After fixing whatever
 # made the installer skip, rm the -fp8s cache dir.
-FP8S=${RADIANCE_FP8_STREAM:-0}
+FP8S=${RADIANCE_FP8_STREAM:-1}
+# NQF=1 and FP8S=1 are the DEFAULTS as of 2026-09-02: prod has served on them since 2026-08-30
+# and a bare ./serve-mxfp4.sh must reproduce prod (it did not -- every restart needed the two
+# overrides). Set either to 0 to fall back; the cache suffix follows.
+#
+# RADIANCE_MXFP4_A_TILED_MIN_M=513 (default, 0 = off): activations at M >= 513 are emitted
+# fragment-tiled and the prefill GEMM reads them straight into WMMA registers
+# (radiance_mxfp4_fp8_gemm_atiled). Measured 2026-09-02, BetterBench PP t/s vs the folded
+# kernel: +9.7% @2k, +6..+8% @8k-64k, +0.4% @250k (attention-bound there); GSM8K 500q 98.00%
+# (490/500). Must stay > 512 (the exact_nq decode epilogue writes row-major) and above
+# RADIANCE_MXFP4_DECODE_MAX_M.
 # Built with if-appends, NOT $([ ... ] && echo ...): a command substitution that "fails" (the
 # test arm) makes the ASSIGNMENT fail, and under set -e that exits the script silently before a
 # single line of output. It bit exactly when a flag was 0.
@@ -641,7 +651,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-0}" \
-  -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-0}" \
+  -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-0}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \

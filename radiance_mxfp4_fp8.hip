@@ -480,14 +480,19 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
 // shape -- the fold is then done by all WM=4 waves and the 4 B/lane W loads add instructions;
 // a register-pipelined A prefetch (next slab in flight) 1.05-1.10x slower than this plain
 // form at 250 VGPRs, and it spills at TN=4 with a 64-k slab (93 VGPRs, 2.2-4.9x).
-template <int TN, bool WPERM>
+// LBK: K per slab. With no A tile in LDS a 128-deep W slab is affordable (17 KB at TN=4, 3
+// blocks/CU) and halves the barriers per K. Measured 2026-09-02 (tier7 lf.hip, bit-identical):
+// at TN=2 (M < 2048) LBK=128 is 2-4% faster than 64 on every shape (gate48 -22%); at TN=4 it
+// costs registers (246 VGPRs, occupancy 5) and loses 12-17%, so the launcher keys LBK on TN.
+template <int TN, bool WPERM, int LBK = BK>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K) {
-  constexpr int NS = BK / 16;
+  constexpr int NS = LBK / 16;
+  constexpr int LWSTR = LBK + PAD;
   constexpr int BNF_T = WN * TN * 16;
-  __shared__ unsigned char sW[BNF_T * WSTR];
+  __shared__ unsigned char sW[BNF_T * LWSTR];
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / WN, wn = wave % WN;
@@ -514,7 +519,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
 #pragma unroll
       for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
 
-  for (int k0 = 0; k0 < K; k0 += BK) {
+  for (int k0 = 0; k0 < K; k0 += LBK) {
     const int ks0 = k0 / 16;
     // A fragments straight from global, issued before the W staging so they land under it.
     int2_t af[TM][NS];
@@ -526,7 +531,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ Wb = W + ((size_t)n0 * K + k0) / 2;
     const unsigned char *__restrict__ Wsb = Ws + (size_t)(k0 / 32) * N + n0;
     const unsigned char *__restrict__ Wrefb = Wref + n0;
-    // ---- W tile: BN*BK/2 packed bytes, 8 B per thread per iteration -> 16 e4m3 bytes ----
+    // ---- W tile: BN*LBK/2 packed bytes, 8 B per thread per iteration -> 16 e4m3 bytes ----
     if constexpr (WPERM) {
       // Fragment order: slot s of the tile is one lane's four packed bytes (eight elements) for
       // one (n-tile, k-step), so consecutive threads read consecutive uint32 and a wave takes 128
@@ -539,7 +544,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
       // of prefill, two recovered most of it, and at TN=4 the remaining narrow-request penalty
       // was ~11% against checkpoint order (tier7, 2026-08-28). A 4-slot group never straddles
       // the k-half boundary because 16 % 4 == 0.
-      constexpr int KSTEPS_T = BK / 16, NTILES_T = BNF_T / 16;
+      constexpr int KSTEPS_T = LBK / 16, NTILES_T = BNF_T / 16;
       constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
       constexpr int WSLOTS = (TOT_SLOTS >= NTHREADS * 4) ? 4 : 2;
       const unsigned int *__restrict__ Wp = (const unsigned int *)W;
@@ -588,16 +593,16 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
                                 | ((ev & 0x08080808u) << 4);
           const unsigned int bo = __builtin_amdgcn_perm(t1, t0, od & 0x07070707u)
                                 | ((od & 0x08080808u) << 4);
-          *(uint2_t *)(&sW[(r + q) * WSTR + kloc]) =
+          *(uint2_t *)(&sW[(r + q) * LWSTR + kloc]) =
               uint2_t{__builtin_amdgcn_perm(bo, be, 0x05010400u),
                       __builtin_amdgcn_perm(bo, be, 0x07030602u)};
         }
       }
     } else
 #pragma unroll
-    for (int off = 0; off < BNF_T * BK / 2; off += NTHREADS * 8) {
+    for (int off = 0; off < BNF_T * LBK / 2; off += NTHREADS * 8) {
       const int idx = off + tid * 8;
-      const int r = idx / (BK / 2), c = idx % (BK / 2);
+      const int r = idx / (LBK / 2), c = idx % (LBK / 2);
       const int rc = r < N - 1 - n0 ? r : N - 1 - n0;          // clamp, never predicate
       // Same hoist as A. rc*(K/2) < 1.2e6 and the scale offset < 3*N, both comfortably int.
       const unsigned long long packed = *(const unsigned long long *)(Wb + (rc * (K / 2) + c));
@@ -622,7 +627,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
         outw[2 * h]     = __builtin_amdgcn_perm(bo, be, 0x05010400u);
         outw[2 * h + 1] = __builtin_amdgcn_perm(bo, be, 0x07030602u);
       }
-      *(uint4_t *)(&sW[r * WSTR + c * 2]) = uint4_t{outw[0], outw[1], outw[2], outw[3]};
+      *(uint4_t *)(&sW[r * LWSTR + c * 2]) = uint4_t{outw[0], outw[1], outw[2], outw[3]};
     }
     __syncthreads();
 
@@ -632,7 +637,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
       int2_t wf[TN];
 #pragma unroll
       for (int j = 0; j < TN; ++j) {
-        const unsigned char *p = &sW[(wn * TN * 16 + j * 16 + col) * WSTR + kk];
+        const unsigned char *p = &sW[(wn * TN * 16 + j * 16 + col) * LWSTR + kk];
         wf[j][0] = *(const int *)p; wf[j][1] = *(const int *)(p + 4);
       }
       __builtin_amdgcn_sched_barrier(0);
@@ -1442,7 +1447,7 @@ static void launch_add_rms_quant(uintptr_t y, uintptr_t res, uintptr_t w, uintpt
 // only: the decode kernel reads row-major A, so the Python side never tiles below its band.
 static void launch_at(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                       uintptr_t c, int M, int N, int K, uintptr_t stream) {
-  if (K % BK) throw std::runtime_error("radiance_mxfp4_fp8: K must be a multiple of 64");
+  if (K % 128) throw std::runtime_error("radiance_mxfp4_fp8: tiled A needs K % 128 == 0");
   if (!wref) throw std::runtime_error("radiance_mxfp4_fp8: tiled A needs the folded path (wref)");
   static const int tn4_min_m = [] {
     const char *e = getenv("RADIANCE_MXFP4_TN4_MIN_M");
@@ -1457,7 +1462,8 @@ static void launch_at(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, ui
   do {                                                                                          \
     constexpr int B_ = BNF_OF(TN_);                                                             \
     dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);                                         \
-    hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<TN_, WP_>), fgrid, fblock, 0,            \
+    hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<TN_, WP_, (TN_ == 2 ? 128 : 64)>),      \
+                       fgrid, fblock, 0,                                                        \
                        (hipStream_t)stream, (const unsigned char *)a, (const unsigned char *)w, \
                        (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, \
                        (__bf16 *)c, M, N, K);                                                   \
