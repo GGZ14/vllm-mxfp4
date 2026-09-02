@@ -273,6 +273,14 @@ if [ "$GNQ" = 1 ]; then CACHE_SUF="$CACHE_SUF-gnq"; fi
 # the custom-op inputs anyway). Left dark; the graph changes, so it keys the cache dir.
 SGATES=${RADIANCE_GDN_STRIDED_GATES:-0}
 if [ "$SGATES" = 1 ]; then CACHE_SUF="$CACHE_SUF-sg"; fi
+# RADIANCE_GDN_EMPTY_OUT=1 (default 0, MEASURED NEUTRAL 2026-09-02): core_attn_out via torch.empty,
+# the rx5 fused_update zeroing the cudagraph pad rows itself. Serve A/B on top of GNQ: 22.28-22.32
+# vs 22.29-22.33 ms/step, output byte-identical, GSM8K 500q @conc 8 98.00% (pad rows exercised).
+# Correct but worthless: with the strided-gates result this says a ~1 us kernel plus its gap is
+# hidden behind the queue at decode -- only kernel TIME moves the step now. Kept dark; keys the
+# cache dir because the fill kernel leaves the graph.
+EOUT=${RADIANCE_GDN_EMPTY_OUT:-0}
+if [ "$EOUT" = 1 ]; then CACHE_SUF="$CACHE_SUF-eo"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
@@ -411,7 +419,7 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx4"; fi
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx5"; fi   # rx5: fused_update zeroes the pad rows (o_rows arg)
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -679,6 +687,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e RADIANCE_GDN_NORM_QUANT="$GNQ" \
   -e RADIANCE_GDN_STRIDED_GATES="$SGATES" \
+  -e RADIANCE_GDN_EMPTY_OUT="$EOUT" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
   -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \

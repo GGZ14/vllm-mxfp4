@@ -20,7 +20,7 @@ index e0ee6a1..1e111cb 100755
    r4d_gemm_bf16_nt_m16.o r4d_registry.o r4d_module.o -o "${OUT}"
  echo "[build.sh] $(ls -la "${OUT}")"
 diff --git a/r4d.h b/r4d.h
-index c8c28c9..99e7cca 100644
+index c8c28c9..b1fe505 100644
 --- a/r4d.h
 +++ b/r4d.h
 @@ -147,6 +147,15 @@ int r4d_gdn_gated_rmsnorm_h128_bf16(const void* x, const void* z, const void* w,
@@ -35,7 +35,7 @@ index c8c28c9..99e7cca 100644
 +    const void* a, const void* b, long ab_stride, int ab_is_bf16,
 +    const void* A_log, const void* dt_bias, void* state, long st_slot, long st_head,
 +    void* o, const void* sidx, long sidx_stride, float scale, float softplus_thr,
-+    void* barrier_cnt, void* stream);
++    void* barrier_cnt, int o_rows, void* stream);
  int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
          const void* q, const void* k, const void* v, const void* a, const void* b,
          long ab_stride, int ab_is_bf16, const void* A_log, const void* dt_bias, void* state,
@@ -482,10 +482,10 @@ index 513d97f..da52a10 100644
                  for (int e = 0; e < 8; e += 2) pw[e >> 1] = D::pk(pf[e], pf[e + 1]);
 diff --git a/r4d_gdn_fused_update_w4k128v128.hip b/r4d_gdn_fused_update_w4k128v128.hip
 new file mode 100644
-index 0000000..82c99c9
+index 0000000..b86d201
 --- /dev/null
 +++ b/r4d_gdn_fused_update_w4k128v128.hip
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,289 @@
 +// r4d_gdn_fused_update_w4k128v128.hip -- the decode GDN step as ONE launch: the rolling
 +// speculative conv update, then the recurrent delta-rule update, separated by a grid-wide
 +// barrier instead of a kernel boundary.
@@ -546,7 +546,7 @@ index 0000000..82c99c9
 +    float* __restrict__ state, long st_slot, long st_head,
 +    unsigned short* __restrict__ o,
 +    const int* __restrict__ sidx, long sidx_stride,
-+    float scale, float sp_thr, int* __restrict__ bar, int numWG)
++    float scale, float sp_thr, int* __restrict__ bar, int numWG, int o_rows)
 +{
 +  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 +  const int units = 2 * Hg + H;
@@ -726,6 +726,21 @@ index 0000000..82c99c9
 +      }
 +    }
 +  }
++
++  // ---- phase 3: zero the cudagraph pad rows of o ---------------------------------------------
++  // The recurrent phase writes o only for rows a sequence covers, [0, cu[N]). core_attn_out is
++  // the padded batch (o_rows), and vLLM zero-fills it before this op precisely because a
++  // torch.empty there leaks garbage from the pad rows into the layers below (vLLM PR 28182).
++  // Zeroing the tail here lets the caller drop that fill: rows [cu[N], o_rows), H*V bf16 each,
++  // strided over the workgroups, ushort4 per thread. Disjoint from the rows phase 2 wrote.
++  {
++    const int first = cu[N];
++    const int rowv4 = (H * FU_V) >> 2;
++    for (int r = first + blockIdx.x; r < o_rows; r += numWG) {
++      ushort4* dst = (ushort4*)(o + (size_t)r * H * FU_V);
++      for (int i = tid; i < rowv4; i += 256) dst[i] = make_ushort4(0, 0, 0, 0);
++    }
++  }
 +}
 +
 +extern "C" int r4d_gdn_fused_update_w4k128v128_bf16(
@@ -736,7 +751,7 @@ index 0000000..82c99c9
 +    const void* a, const void* b, long ab_stride, int ab_is_bf16,
 +    const void* A_log, const void* dt_bias, void* state, long st_slot, long st_head,
 +    void* o, const void* sidx, long sidx_stride, float scale, float softplus_thr,
-+    void* barrier_cnt, void* stream)
++    void* barrier_cnt, int o_rows, void* stream)
 +{
 +  if (K != FU_K || V != FU_V || width != FU_W) return -1;
 +  if (H % Hg) return -2;
@@ -755,16 +770,16 @@ index 0000000..82c99c9
 +                     a, b, ab_stride, (const float*)A_log, (const float*)dt_bias,             \
 +                     (float*)state, st_slot, st_head, (unsigned short*)o,                     \
 +                     (const int*)sidx, sidx_stride, scale, softplus_thr,                      \
-+                     (int*)barrier_cnt, numWG)
++                     (int*)barrier_cnt, numWG, o_rows)
 +  if (ab_is_bf16) FU_LAUNCH(1); else FU_LAUNCH(0);
 +#undef FU_LAUNCH
 +  return (int)hipGetLastError();
 +}
 diff --git a/r4d_module.hip b/r4d_module.hip
-index e8913dd..0e6ea57 100644
+index e8913dd..466a681 100644
 --- a/r4d_module.hip
 +++ b/r4d_module.hip
-@@ -206,6 +206,34 @@ static void gdn_conv_update(int64_t x, int64_t xpitch, int64_t wgt, int64_t bias
+@@ -206,6 +206,35 @@ static void gdn_conv_update(int64_t x, int64_t xpitch, int64_t wgt, int64_t bias
                               std::to_string(rc) + ")");
  }
  
@@ -777,7 +792,8 @@ index e8913dd..0e6ea57 100644
 +                             int64_t b, int64_t ab_stride, int ab_is_bf16, int64_t A_log,
 +                             int64_t dt_bias, int64_t state, int64_t st_slot, int64_t st_head,
 +                             int64_t o, int64_t sidx, int64_t sidx_stride, double scale,
-+                             double softplus_thr, int64_t barrier_cnt, int64_t stream) {
++                             double softplus_thr, int64_t barrier_cnt, int o_rows,
++                             int64_t stream) {
 +  int rc = r4d_gdn_fused_update_w4k128v128_bf16(
 +      (const void*)x, xpitch, (const void*)wgt, (const void*)bias, (void*)cstate, cs_seq,
 +      cs_dim, cs_tok, state_len_max, (const void*)cache_idx, ci_stride,
@@ -785,7 +801,7 @@ index e8913dd..0e6ea57 100644
 +      head_v, width, max_query_len, (void*)q, (void*)k, (void*)v, (const void*)a,
 +      (const void*)b, ab_stride, ab_is_bf16, (const void*)A_log, (const void*)dt_bias,
 +      (void*)state, st_slot, st_head, (void*)o, (const void*)sidx, sidx_stride, (float)scale,
-+      (float)softplus_thr, (void*)barrier_cnt, (void*)stream);
++      (float)softplus_thr, (void*)barrier_cnt, o_rows, (void*)stream);
 +  if (rc == -1)
 +    throw std::runtime_error("r4d gdn_fused_update: this build is compiled for head dim 128 "
 +                             "and conv width 4");
@@ -799,7 +815,7 @@ index e8913dd..0e6ea57 100644
  static void gdn_gated_rmsnorm(int64_t x, int64_t z, int64_t w, int64_t o, int64_t rows,
                                int64_t xrow, int64_t zrow, int64_t orow, int width, double eps,
                                int act, int64_t stream) {
-@@ -592,6 +620,7 @@ PYBIND11_MODULE(r4d, m) {
+@@ -592,6 +621,7 @@ PYBIND11_MODULE(r4d, m) {
    m.def("gdn_kkt_solve_k128_c64_bf16", &gdn_kkt_solve);
    m.def("gdn_conv_prep_w4_h128_bf16", &gdn_conv_prep);
    m.def("gdn_conv_update_w4_h128_bf16", &gdn_conv_update);
@@ -807,7 +823,7 @@ index e8913dd..0e6ea57 100644
    m.def("gdn_recurrent_update_k128_v128_bf16_fp32state", &gdn_recurrent_update);
    m.def("gdn_gated_rmsnorm_h128_bf16", &gdn_gated_rmsnorm);
    {
-@@ -609,6 +638,7 @@ PYBIND11_MODULE(r4d, m) {
+@@ -609,6 +639,7 @@ PYBIND11_MODULE(r4d, m) {
    m.def("ar_ipc_memzero", &r4d_ar_ipc_memzero);
    m.def("ar_ipc_enable_peer", &r4d_ar_ipc_enable_peer);
    m.def("ar_oneshot_2rank_exact", &r4d_ar_oneshot_2rank_exact);
