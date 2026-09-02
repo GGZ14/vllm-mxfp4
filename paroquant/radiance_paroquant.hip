@@ -11,8 +11,27 @@
 
 #define PQ_DEC_MAX_N 32768
 #define PQ_DEC_KS 4                     // scratch is still SIZED for the widest split
-#define PQ_DEC_MAX_TM 4                 // covers M <= 64
+#define PQ_DEC_MAX_TM 8                 // covers M <= 128 (RADIANCE_PQ_DECODE_MAX_M gates the band)
 #define PQ_DEC_DWN 8
+
+static bool env_flag(const char *name, bool dflt) {
+  const char *e = getenv(name);
+  return (e && *e) ? atoi(e) != 0 : dflt;
+}
+static int env_int(const char *name, int dflt) {
+  const char *e = getenv(name);
+  return (e && *e) ? atoi(e) : dflt;
+}
+// Weight layout, decided once per process by the loader (radiance_paroquant.py WPERM) -- the
+// kernels read the flag here and it MUST agree with the tensor handed in, or the weight is read
+// as garbage. Fragment order is what lets the decode kernel take streaming (NT) loads.
+static bool wperm() { static const bool v = env_flag("RADIANCE_PQ_WPERM", true); return v; }
+static bool dec_nt() { static const bool v = env_flag("RADIANCE_PQ_DECODE_NT", true); return v; }
+// A-tiled prefill GEMM knobs (harness-measured defaults; see paroquant/RESULTS.md).
+static int at_lbk() { static const int v = env_int("RADIANCE_PQ_AT_LBK", 128); return v; }
+static bool at_hoist() { static const bool v = env_flag("RADIANCE_PQ_AT_HOIST", true); return v; }
+// Rotation prologue v2 (records in registers, no block sync); bit-exact vs v1, harness-gated.
+static bool rot_v2() { static const bool v = env_flag("RADIANCE_PQ_ROT_V2", true); return v; }
 
 static float *g_partial = nullptr;
 static size_t g_partial_bytes = 0;
@@ -26,8 +45,16 @@ static void set_decode_scratch(uintptr_t ptr, size_t bytes, uintptr_t cnt) {
 
 // Split-K policy copied from the AutoRound launcher; the shapes are the same family and the
 // partial-buffer economics (linear in M) are unchanged by the PARO deltas.
-static int split_k_for(int nblk, int M) {
+static int split_k_for(int nblk, int M, int K) {
   if (const char *e = getenv("RADIANCE_PQ_DECODE_KS")) return atoi(e);
+  if (M > 64) {
+    // The 16-concurrent band, copied from the AutoRound launcher's cell-by-cell sweep
+    // (2026-08-29, arsweep.hip): wide shapes never split; the nblk=40 shapes split by 2 until
+    // the partial traffic catches up, then diverge by K depth at M=128.
+    if (nblk >= 48) return 1;
+    if (M <= 112) return 2;
+    return (K >= 6144) ? PQ_DEC_KS : 1;
+  }
   int ks = (nblk >= 128) ? 1 : (nblk >= 64) ? 2 : PQ_DEC_KS;
   if (M > 48 && ks > 1) ks >>= 1;
   return ks;
@@ -54,32 +81,66 @@ static void launch_rotate_quant(uintptr_t x, uintptr_t t, uintptr_t cs, uintptr_
   const dim3 grid(K / PQ_GROUP, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P);
   const dim3 block(PQ_ROT_WAVES * 32);
   auto st = reinterpret_cast<hipStream_t>(stream);
-  if (mode == 1)
-    hipLaunchKernelGGL(pq_rotate_quant<true>, grid, block, 0, st,
-                       reinterpret_cast<const __bf16 *>(x),
-                       reinterpret_cast<const unsigned short *>(t),
-                       reinterpret_cast<const __half *>(cs),
-                       reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(asg),
-                       reinterpret_cast<float *>(rs), M, K, krot);
-  else
-    hipLaunchKernelGGL(pq_rotate_quant<false>, grid, block, 0, st,
-                       reinterpret_cast<const __bf16 *>(x),
-                       reinterpret_cast<const unsigned short *>(t),
-                       reinterpret_cast<const __half *>(cs),
-                       reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(asg),
-                       reinterpret_cast<float *>(rs), M, K, krot);
+#define PQ_ROT(KERN)                                                                            \
+  hipLaunchKernelGGL(KERN, grid, block, 0, st, reinterpret_cast<const __bf16 *>(x),             \
+                     reinterpret_cast<const unsigned short *>(t),                               \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<unsigned char *>(a), \
+                     reinterpret_cast<float *>(asg), reinterpret_cast<float *>(rs), M, K, krot)
+  if (rot_v2()) { if (mode == 1) PQ_ROT(pq_rotate_quant2<true>); else PQ_ROT(pq_rotate_quant2<false>); }
+  else          { if (mode == 1) PQ_ROT(pq_rotate_quant<true>);  else PQ_ROT(pq_rotate_quant<false>); }
+#undef PQ_ROT
 }
 
 // Prefill pass C: per-token scale + encode + plain code row-sums.
 // XR [P, M, K] bf16; ASG [P, M, K/128] f32 -> A [P, M, K] e4m3, AS [P, M] f32, RS [P, M, K/128]
+// tiled=1 writes A in the fragment-tiled layout the A-tiled GEMM reads ([P, Mt*16, K], see
+// pq_token_quant_tiled); the caller sizes A accordingly.
 static void launch_token_quant(uintptr_t xr, uintptr_t asg, uintptr_t a, uintptr_t as,
-                               uintptr_t rs, int M, int K, int P, uintptr_t stream) {
+                               uintptr_t rs, int M, int K, int P, uintptr_t stream,
+                               int tiled) {
+  auto st = reinterpret_cast<hipStream_t>(stream);
+  if (tiled) {
+    if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: tiled quant needs K % 128 == 0");
+    const dim3 grid((M + 15) / 16, P, pq_tq_zsplit(M));
+    hipLaunchKernelGGL(pq_token_quant_tiled, grid, dim3(PQ_ROT_WAVES * 32), 0, st,
+                       reinterpret_cast<const __bf16 *>(xr), reinterpret_cast<const float *>(asg),
+                       reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(as),
+                       reinterpret_cast<float *>(rs), M, K);
+    return;
+  }
   const dim3 grid((M + PQ_ROT_WAVES - 1) / PQ_ROT_WAVES, P);
-  hipLaunchKernelGGL(pq_token_quant, grid, dim3(PQ_ROT_WAVES * 32), 0,
-                     reinterpret_cast<hipStream_t>(stream),
+  hipLaunchKernelGGL(pq_token_quant, grid, dim3(PQ_ROT_WAVES * 32), 0, st,
                      reinterpret_cast<const __bf16 *>(xr), reinterpret_cast<const float *>(asg),
                      reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(as),
                      reinterpret_cast<float *>(rs), M, K);
+}
+
+// A-tiled per-token prefill GEMM: AT [P, Mt*16, K] fragment-tiled e4m3, AS [P, M], RS [P, M, G]
+// plain row-sums. Prefill-class M only -- the decode band reads row-major A.
+static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as, uintptr_t rs,
+                           uintptr_t c, int M, int N, int K, int pb1, int pb2,
+                           uintptr_t stream) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant kernel: K must be a multiple of 128");
+  const auto *A = reinterpret_cast<const unsigned char *>(a);
+  const auto *W = reinterpret_cast<const unsigned int *>(w);
+  const auto *SZ = reinterpret_cast<const __half *>(sz);
+  const auto *AS = reinterpret_cast<const float *>(as);
+  const auto *RS = reinterpret_cast<const float *>(rs);
+  auto *C = reinterpret_cast<__bf16 *>(c);
+  auto st = reinterpret_cast<hipStream_t>(stream);
+  constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
+  const dim3 grid((N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
+#define PQ_AT(WP_, LBK_, H_)                                                                     \
+  hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, WP_, LBK_, H_>), grid, block, 0, st, A, W,   \
+                     SZ, AS, RS, C, M, N, K, pb1, pb2)
+#define PQ_AT_LBK(WP_)                                                                           \
+  do {                                                                                           \
+    if (at_lbk() == 64) { if (at_hoist()) PQ_AT(WP_, 64, true); else PQ_AT(WP_, 64, false); }    \
+    else                { if (at_hoist()) PQ_AT(WP_, 128, true); else PQ_AT(WP_, 128, false); }  \
+  } while (0)
+  if (wperm()) PQ_AT_LBK(true); else PQ_AT_LBK(false);
+#undef PQ_AT_LBK
+#undef PQ_AT
 }
 
 // A [P, M, K] e4m3   W [N, K/8] u32   SZ [K/128, N, 2] f16 {scale, zscale}
@@ -100,7 +161,7 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
 
   constexpr int BND = PQ_DEC_DWN * 16;
   const int nblk = (N + BND - 1) / BND;
-  const int ks = split_k_for(nblk, M);
+  const int ks = split_k_for(nblk, M, K);
   const bool have_scratch =
       g_partial && g_cnt && (size_t)ks * M * N * sizeof(float) <= g_partial_bytes;
   // ptok tensors (per-token As, plain row-sums) only fit the prefill kernel's PTOK template;
@@ -109,15 +170,22 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
       N <= PQ_DEC_MAX_N && (ks == 1 || have_scratch)) {
     const dim3 grid(nblk, 1, ks), block(PQ_DEC_DWN * 32);
     const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;    // smallest tile that covers M
-#define PQ_DEC(KS_, TM_)                                                                        \
-    hipLaunchKernelGGL((pq_int4_fp8_gemm_decode<PQ_DEC_DWN, KS_, TM_>), grid, block, 0,          \
-                       st, A, W, SZ, ASG, RS, g_partial, g_cnt, C, M, N, K, pb1, pb2)
-#define PQ_DEC_TM(KS_)                                                                          \
-    do { if (tm == 1) PQ_DEC(KS_, 1); else if (tm == 2) PQ_DEC(KS_, 2);                          \
-         else if (tm == 3) PQ_DEC(KS_, 3); else PQ_DEC(KS_, 4); } while (0)
-    if (ks == 1) PQ_DEC_TM(1);
-    else if (ks == 2) PQ_DEC_TM(2);
-    else PQ_DEC_TM(4);
+#define PQ_DEC(KS_, TM_, WP_, NT_)                                                              \
+    hipLaunchKernelGGL((pq_int4_fp8_gemm_decode<PQ_DEC_DWN, KS_, TM_, true, 0, WP_, NT_>), grid, \
+                       block, 0, st, A, W, SZ, ASG, RS, g_partial, g_cnt, C, M, N, K, pb1, pb2)
+#define PQ_DEC_TM(KS_, WP_, NT_)                                                                \
+    do { if (tm == 1) PQ_DEC(KS_, 1, WP_, NT_); else if (tm == 2) PQ_DEC(KS_, 2, WP_, NT_);      \
+         else if (tm == 3) PQ_DEC(KS_, 3, WP_, NT_); else if (tm == 4) PQ_DEC(KS_, 4, WP_, NT_); \
+         else if (tm == 5) PQ_DEC(KS_, 5, WP_, NT_); else if (tm == 6) PQ_DEC(KS_, 6, WP_, NT_); \
+         else if (tm == 7) PQ_DEC(KS_, 7, WP_, NT_); else PQ_DEC(KS_, 8, WP_, NT_); } while (0)
+#define PQ_DEC_KS(WP_, NT_)                                                                     \
+    do { if (ks == 1) PQ_DEC_TM(1, WP_, NT_); else if (ks == 2) PQ_DEC_TM(2, WP_, NT_);          \
+         else PQ_DEC_TM(4, WP_, NT_); } while (0)
+    // Streaming loads pay only on the fragment-order layout (see pq_stage_w); the row layout
+    // ignores the NT flag.
+    if (wperm()) { if (dec_nt()) PQ_DEC_KS(true, true); else PQ_DEC_KS(true, false); }
+    else PQ_DEC_KS(false, false);
+#undef PQ_DEC_KS
 #undef PQ_DEC_TM
 #undef PQ_DEC
     return;
@@ -127,12 +195,12 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
 
   constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
   const dim3 grid((N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
-  if (ptok)
-    hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, true>), grid, block, 0, st, A, W,
-                       SZ, ASG, RS, C, M, N, K, pb1, pb2);
-  else
-    hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true>), grid, block, 0, st, A, W, SZ, ASG,
-                       RS, C, M, N, K, pb1, pb2);
+#define PQ_PRE(PT_, WP_)                                                                        \
+  hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, PT_, WP_>), grid, block, 0, st, A,   \
+                     W, SZ, ASG, RS, C, M, N, K, pb1, pb2)
+  if (ptok) { if (wperm()) PQ_PRE(true, true); else PQ_PRE(true, false); }
+  else      { if (wperm()) PQ_PRE(false, true); else PQ_PRE(false, false); }
+#undef PQ_PRE
 }
 
 PYBIND11_MODULE(radiance_paroquant_kernel, m) {
@@ -142,6 +210,8 @@ PYBIND11_MODULE(radiance_paroquant_kernel, m) {
         "fused pairwise-rotation + channel-scale + per-group fp8 quant + row-sums (gfx1201)");
   m.def("launch_gemm", &launch_gemm,
         "ParoQuant int4 g128-asym x fp8 W4A8 GEMM with partition select (gfx1201)");
+  m.def("launch_gemm_at", &launch_gemm_at,
+        "ParoQuant per-token GEMM on a fragment-tiled activation (prefill band)");
   m.def("set_decode_scratch", &set_decode_scratch,
         "register the split-K partial buffer (ptr, bytes) and the zeroed block counter");
 }

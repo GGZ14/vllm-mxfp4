@@ -94,6 +94,84 @@ __device__ __forceinline__ uint2_t ar_unpack8(unsigned int wv) {
                  __builtin_amdgcn_perm(bo, be, 0x07030602u)};
 }
 
+// ---------------------------------------------------------------- weight staging (both layouts)
+//
+// Two weight layouts, ONE sW tile. Row layout (WPERM=false) is the loader's [N, K/8] u32, eight
+// codes along K per word. Fragment order (WPERM=true) is the MXFP4 kernel's layout, ported
+// verbatim: one 32-lane uint32 slot per (n-tile, k-step); slot lane l of tile (nt, ks) holds row
+// nt*16 + (l & 15), k = ks*16 + (l >> 4)*8 .. +7. A wave's read is then 128 contiguous bytes
+// instead of sixteen rows K/2 bytes apart, which is what let the MXFP4 decode kernel take
+// nontemporal loads (NT: `global_load ... th:TH_LOAD_NT`, the slab is read exactly once per step
+// so keeping it out of L2/MALL protects A and the split-K partials). NT on the ROW layout is
+// 2-3.6x SLOWER on MXFP4 (a row's slab is half a line; the other half is only wanted by the next
+// slab and NT re-fetches it) -- the launcher never asks for it.
+//
+// Clamp, never predicate: N % 16 == 0 under WPERM (loader-asserted) so clamping to the last
+// WSLOTS-aligned row keeps the vector read aligned and every gc + q in bounds.
+template <bool NT, typename T>
+static __device__ __forceinline__ T pq_ld_w(const T *p) {
+  if constexpr (NT) return __builtin_nontemporal_load(p);
+  else return *p;
+}
+
+template <int ROWS, int LBK, int STR, int NTHREADS, bool WPERM, bool NT, int ABLATE = 0,
+          int WSLOT_OVR = 0>
+__device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
+                                           const unsigned int *__restrict__ W, int n0, int N,
+                                           int K, int k0, int tid) {
+  if constexpr (WPERM) {
+    constexpr int KSTEPS_T = LBK / 16, NTILES_T = ROWS / 16;
+    constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
+    constexpr int WSLOTS = WSLOT_OVR ? WSLOT_OVR : ((TOT_SLOTS >= NTHREADS * 4) ? 4 : 2);
+    static_assert(TOT_SLOTS % (NTHREADS * WSLOTS) == 0, "staging must be branch-free");
+    const int ksteps_g = K / 16, kstep0 = k0 / 16;
+#pragma unroll
+    for (int off = 0; off < TOT_SLOTS; off += NTHREADS * WSLOTS) {
+      const int sl = off + tid * WSLOTS;              // first of the group; WSLOTS-aligned
+      const int lane_ = sl & 31, rest = sl >> 5;
+      const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
+      const int r = ntl * 16 + (lane_ & 15), kloc = kst * 16 + (lane_ >> 4) * 8;
+      const int gn = n0 + r;
+      const int gc = gn < N - WSLOTS ? gn : N - WSLOTS;
+      const int lanec = (lane_ & 16) | (gc & 15);
+      const unsigned int *src = &W[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec];
+      unsigned int wq[WSLOTS];
+      if constexpr (WSLOTS == 4) {
+        const uint4_t v = pq_ld_w<NT>((const uint4_t *)src);
+        wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
+      } else {
+        const uint2_t v = pq_ld_w<NT>((const uint2_t *)src);
+        wq[0] = v[0]; wq[1] = v[1];
+      }
+#pragma unroll
+      for (int q = 0; q < WSLOTS; ++q) {
+        if constexpr (ABLATE & 1)
+          *(uint2_t *)(&sW[(r + q) * STR + kloc]) = uint2_t{wq[q], wq[q]};
+        else
+          *(uint2_t *)(&sW[(r + q) * STR + kloc]) = ar_unpack8(wq[q]);
+      }
+    }
+  } else {
+    constexpr int WPT = LBK / 16;                       // uint2 (16 codes) per row per slab
+    static_assert((ROWS * WPT) % NTHREADS == 0, "staging must be branch-free");
+    const int kw = K / 8;
+#pragma unroll
+    for (int off = 0; off < ROWS * WPT; off += NTHREADS) {
+      const int idx = off + tid;
+      const int r = idx / WPT, c = idx % WPT, gn = n0 + r;
+      const int gc = gn < N - 1 ? gn : N - 1;
+      const uint2_t wv = pq_ld_w<NT>((const uint2_t *)(W + (size_t)gc * kw + k0 / 8 + c * 2));
+      if constexpr (ABLATE & 1) {
+        *(uint2_t *)(&sW[r * STR + c * 16]) = uint2_t{wv[0], wv[0]};
+        *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
+      } else {
+        *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8(wv[0]);
+        *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8(wv[1]);
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------- e4m3 encode/decode (OCP)
 //
 // Software, not the v_cvt_pk_fp8 path, for two reasons: the builtin's availability/semantics on
@@ -252,6 +330,101 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant(
   }
 }
 
+// v2 of the prologue, same contract. The records of this lane's two pairs per layer live in
+// REGISTERS (16 x u64, loaded straight from global with the token's x and the channel scales in
+// the same latency window), so there is no record LDS fill, no __syncthreads, and a rotation
+// layer is 4 LDS reads + 4 writes instead of 10 reads + 4 writes. At decode this kernel is pure
+// latency chain (40 x P blocks on 64 CUs), so the two removed round trips are the win; at
+// prefill the LDS op count is the win. Arithmetic is identical (same fmaf on the same disjoint
+// pairs) -> bit-exact against v1, gated in par_harness.
+template <bool ROTOUT = false>
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
+    const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
+    const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ ASG,
+    float *__restrict__ RS, int M, int K, int krot) {
+  const int g = blockIdx.x, p = blockIdx.z;
+  const int G = K / PQ_GROUP;
+  const int m_lo = blockIdx.y * PQ_ROT_TCHUNK;
+  const int m_hi = min(M, m_lo + PQ_ROT_TCHUNK);
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
+  const int c0 = lane * 4;
+
+  // This lane's pairs: t = lane and lane + 32 of every layer. Layers past krot are clamped to
+  // the last real one and never applied (uniform branch below) -- clamp, never predicate.
+  const unsigned long long *__restrict__ Tb =
+      (const unsigned long long *)T + ((size_t)p * krot) * (K / 2) + (size_t)g * 64;
+  unsigned long long rec[PQ_KROT_MAX][2];
+#pragma unroll
+  for (int r = 0; r < PQ_KROT_MAX; ++r) {
+    const int rc = r < krot ? r : krot - 1;
+    rec[r][0] = Tb[(size_t)rc * (K / 2) + lane];
+    rec[r][1] = Tb[(size_t)rc * (K / 2) + lane + 32];
+  }
+  const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)g * PQ_GROUP + c0);
+  const float cs0 = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
+  const float cs1 = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
+  const float cs2 = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
+  const float cs3 = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
+
+  for (int m = m_lo + wave; m < m_hi; m += PQ_ROT_TPB) {
+    const uint2_t xv = *(const uint2_t *)(X + (size_t)m * K + (size_t)g * PQ_GROUP + c0);
+    float v0 = __uint_as_float(xv[0] << 16) * cs0, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * cs1;
+    float v2 = __uint_as_float(xv[1] << 16) * cs2, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * cs3;
+    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
+#pragma unroll
+        for (int t2 = 0; t2 < 2; ++t2) {
+          const unsigned long long rv = rec[r][t2];
+          const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+          const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+          const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+          const int i = ij & 0xFF, j = ij >> 8;
+          const float xi = s_x[wave][i], xj = s_x[wave][j];
+          s_x[wave][i] = fmaf(c, xi, sn * xj);
+          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
+    }
+
+    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1)
+      amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float inv = 1.f / scale;
+
+    if constexpr (ROTOUT) {
+      __bf16 *xr = (__bf16 *)A + ((size_t)p * M + m) * K + (size_t)g * PQ_GROUP + c0;
+      xr[0] = (__bf16)v0; xr[1] = (__bf16)v1; xr[2] = (__bf16)v2; xr[3] = (__bf16)v3;
+      if (lane == 0) ASG[((size_t)p * M + m) * G + g] = scale;
+      continue;
+    }
+
+    const unsigned char b0 = pq_e4m3_encode(v0 * inv), b1 = pq_e4m3_encode(v1 * inv);
+    const unsigned char b2 = pq_e4m3_encode(v2 * inv), b3 = pq_e4m3_encode(v3 * inv);
+    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1)
+      rs += __shfl_xor(rs, off, 32);
+    *(unsigned int *)(A + ((size_t)p * M + m) * K + (size_t)g * PQ_GROUP + c0) =
+        (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) |
+        ((unsigned int)b3 << 24);
+    if (lane == 0) {
+      ASG[((size_t)p * M + m) * G + g] = scale;
+      RS[((size_t)p * M + m) * G + g] = rs * scale;
+    }
+  }
+}
+
 // Prefill pass C: one wave per (partition, token). Reduces the per-group scales to the token
 // scale As = max_g ASG (they are amax/448, so their max IS the token amax/448), encodes the
 // rotated row against it, and writes plain code-domain row-sums per group (the PTOK GEMM applies
@@ -304,7 +477,8 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant(
 //   * fold becomes  acc += asg[m] * (sc * t - zsc * rs[m]); the epilogue As multiply is gone
 //     (the activation scale is per group now, so it HAS to fold per slab).
 //   * A/ASG/RS are indexed through the block's partition (pb1/pb2 boundaries).
-template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0>
+template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0, bool WPERM = false,
+          bool NT = false>
 __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
@@ -374,20 +548,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
         *(uint4_t *)(&sA[r * DASTR + c]) = *(const uint4_t *)(A + (size_t)rc * K + k0 + c);
       }
     }
-#pragma unroll
-    for (int off = 0; off < BND * (DBK / 16); off += DNTHREADS) {
-      const int idx = off + tid;
-      const int r = idx / (DBK / 16), c = idx % (DBK / 16), gn = n0 + r;
-      const int gc = gn < N - 1 ? gn : N - 1;
-      const uint2_t wv = *(const uint2_t *)(W + (size_t)gc * kw + k0 / 8 + c * 2);
-      if constexpr (ABLATE & 1) {
-        *(uint2_t *)(&sW[r * DWSTR + c * 16]) = uint2_t{wv[0], wv[0]};
-        *(uint2_t *)(&sW[r * DWSTR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
-      } else {
-        *(uint2_t *)(&sW[r * DWSTR + c * 16]) = ar_unpack8(wv[0]);
-        *(uint2_t *)(&sW[r * DWSTR + c * 16 + 8]) = ar_unpack8(wv[1]);
-      }
-    }
+    pq_stage_w<BND, DBK, DWSTR, DNTHREADS, WPERM, NT, ABLATE>(sW, W, n0, N, K, k0, tid);
     __syncthreads();
 
     if constexpr (IMAJOR) {
@@ -529,7 +690,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
 // collapses to AutoRound's single FMA per slab; the zero-point correction stays one FMA per
 // element per group against PLAIN code row-sums, and As multiplies once in the epilogue. The
 // per-group variant (PTOK=false) remains for the decode-band fallthrough and the harness.
-template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false>
+template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false, bool WPERM = false>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
@@ -612,20 +773,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
       const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
       *(uint4_t *)(&sA[r * AR_ASTR + c]) = *(const uint4_t *)(Ab + (rc * K + c));
     }
-#pragma unroll
-    for (int off = 0; off < BNF_T * (AR_BK / 16); off += AR_NTHREADS) {
-      const int idx = off + tid;
-      const int r = idx / (AR_BK / 16), c = idx % (AR_BK / 16);
-      const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
-      const uint2_t wv = *(const uint2_t *)(Wb + (size_t)rc * kw + c * 2);
-      if constexpr (ABLATE & 1) {
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16]) = uint2_t{wv[0], wv[0]};
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
-      } else {
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16]) = ar_unpack8(wv[0]);
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16 + 8]) = ar_unpack8(wv[1]);
-      }
-    }
+    pq_stage_w<BNF_T, AR_BK, AR_ASTR, AR_NTHREADS, WPERM, false, ABLATE>(sW, W, n0, N, K, k0,
+                                                                          tid);
     __syncthreads();
 
     if constexpr (IMAJOR) {
@@ -761,5 +910,275 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
           if constexpr (PTOK) o *= ASG[(size_t)m];
           C[(size_t)m * N + ncol[j]] = (__bf16)o;
         }
+      }
+}
+
+// ------------------------------------------------------------ A-tiled prefill path (per-token)
+//
+// The activation arrives in WMMA-FRAGMENT-TILED layout, the layout the MXFP4 A-tiled kernel
+// reads: each 16m x 16k e4m3 fragment is 256 contiguous bytes in lane order (lane l owns bytes
+// 8l..8l+7 = A[mt*16 + l%16][ks*16 + (l/16)*8 .. +7]); fragment (mt, ks) sits at
+// (mt*(K/16) + ks)*256 and a partition is Mt*16*K bytes (Mt = ceil(M/16); pad rows hold whatever
+// the producer left there -- they only reach accumulators the epilogue drops). One coalesced
+// global_load_b64 per fragment per wave lands straight in the af register the WMMA reads, so
+// the A tile, its LDS staging and both its LDS round trips are gone; only W goes through LDS
+// (8.7 KB at TN=2 / LBK=128), so three blocks share a CU instead of two. On MXFP4 this was
+// 12-16% off the folded kernel at M >= 1024, and the A tile is a LARGER share of this kernel
+// (the per-slab rescale keeps the tile in LDS for a temp accumulator round anyway).
+//
+// LBK=128 makes the slab the scale group: sc/zsc are loaded once, the temp accumulator runs
+// eight WMMA steps, and the fold (1 FMA/elem for the scale) plus the zero-point correction
+// (1 FMA/elem against the plain code row-sums) land once per 128 k -- half the fold VALU the
+// BK=64 PTOK kernel pays. The price is af[TM][8] = 64 VGPRs of fragments in flight; LBK=64 keeps
+// the old two-slab group structure (correction on the second slab) at 32. Both are built, the
+// launcher takes what the harness measured.
+//
+// WHOIST: read the slab's W fragments from LDS once per wave (wfa[NS][TN], 32 VGPRs at
+// LBK=128) instead of once per M-fragment (TM x the ds_reads). Measured either way.
+// Prefill pass C, tiled output. The first cut read each lane's 16 B from sixteen different rows
+// per k-step and measured 1.3-2x the row kernel (tier: passC bench). This one keeps the row
+// kernel's contiguous read (one wave sweeps one 256 B row segment per group), parks the encoded
+// 16 x 128 tile in LDS at a 136 B row stride (conflict-free for both the 4 B row writes and the
+// 8 B fragment reads), and writes each 256 B fragment with one wave store. Block = one m-tile
+// (16 rows) x 8 waves; wave w takes groups g = w, w+8, ... Codes/AS are identical to
+// pq_token_quant (same inv, same encode); RS is the same 32-lane tree per (row, group).
+#define PQ_TQ_STR 136
+// Group split for pq_token_quant_tiled: enough blocks to fill 64 CUs x ~4 blocks, capped at 4.
+static inline int pq_tq_zsplit(int M) {
+  const int Mt = (M + 15) / 16;
+  int z = 512 / (Mt > 0 ? Mt : 1);
+  return z < 1 ? 1 : (z > 4 ? 4 : z);
+}
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
+    const __bf16 *__restrict__ XR,          // [P, M, K] rotated values (pass A)
+    const float *__restrict__ ASG,          // [P, M, K/128] per-group scales (pass A)
+    unsigned char *__restrict__ AT,         // [P, Mt*16, K] e4m3 codes out, fragment-tiled
+    float *__restrict__ AS,                 // [P, M] per-token scale out
+    float *__restrict__ RS,                 // [P, M, K/128] code row-sums out
+    int M, int K) {
+  const int G = K / PQ_GROUP, ksteps = K / 16;
+  const int Mt = (M + 15) >> 4;
+  const int p = blockIdx.y, mt = blockIdx.x;
+  // gridDim.z splits the groups across blocks so a small M still fills the GPU (one block per
+  // m-tile is 128 blocks at M=2048); split z takes g = z*8 + wave, stepping by 8*gridDim.z.
+  const int zs = blockIdx.z, nz = gridDim.z;
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  __shared__ __align__(16) unsigned char s_t[PQ_ROT_WAVES][16 * PQ_TQ_STR];
+
+  // Token scales: lane l < 16 owns row mt*16 + l (clamped; pad rows recompute the last row and
+  // never write AS/RS). Broadcast per row below with a shuffle.
+  const int mrow = mt * 16 + (lane & 15);
+  const int mc = mrow < M ? mrow : M - 1;
+  float inv_l;
+  {
+    const float *asg_row = ASG + ((size_t)p * M + mc) * G;
+    float amx = 0.f;
+    int g4 = 0;
+    for (; g4 + 4 <= G; g4 += 4) {
+      const float4 v = *(const float4 *)(asg_row + g4);
+      amx = fmaxf(amx, fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w)));
+    }
+    for (; g4 < G; ++g4) amx = fmaxf(amx, asg_row[g4]);
+    const float scale = fmaxf(amx, 1e-10f);
+    inv_l = 1.f / scale;
+    if (zs == 0 && wave == 0 && lane < 16 && mrow < M) AS[(size_t)p * M + mrow] = scale;
+  }
+
+  unsigned char *tile = s_t[wave];
+  const int c0 = lane * 4;
+  unsigned char *at = AT + (size_t)p * Mt * 16 * K + (size_t)mt * ksteps * 256 + lane * 8;
+  for (int g = zs * PQ_ROT_WAVES + wave; g < G; g += PQ_ROT_WAVES * nz) {
+    // Phase 1: sixteen contiguous row reads, encode, park in LDS, row-sum per row.
+#pragma unroll 4
+    for (int r = 0; r < 16; ++r) {
+      const int m = mt * 16 + r, mr = m < M ? m : M - 1;
+      const float inv = __shfl(inv_l, r, 32);
+      const uint2_t xv = *(const uint2_t *)(XR + ((size_t)p * M + mr) * K + (size_t)g * PQ_GROUP + c0);
+      const float v0 = __uint_as_float(xv[0] << 16) * inv, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * inv;
+      const float v2 = __uint_as_float(xv[1] << 16) * inv, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * inv;
+      const unsigned char b0 = pq_e4m3_encode(v0), b1 = pq_e4m3_encode(v1);
+      const unsigned char b2 = pq_e4m3_encode(v2), b3 = pq_e4m3_encode(v3);
+      *(unsigned int *)(tile + r * PQ_TQ_STR + c0) =
+          (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+      if (lane == 0 && m < M) RS[((size_t)p * M + m) * G + g] = rs;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+    // Phase 2: eight fragment stores, 256 B contiguous each. Lane l reads row l&15, k-half l>>4.
+    const unsigned char *src = tile + (lane & 15) * PQ_TQ_STR + (lane >> 4) * 8;
+#pragma unroll
+    for (int st = 0; st < PQ_GROUP / 16; ++st) {
+      const uint2_t v = *(const uint2_t *)(src + st * 16);
+      *(uint2_t *)(at + (size_t)(g * (PQ_GROUP / 16) + st) * 256) = v;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");   // reads done before the next group's writes
+  }
+}
+
+template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0>
+__global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
+    const unsigned char *__restrict__ AT,   // [P, Mt*16, K] fragment-tiled e4m3
+    const unsigned int *__restrict__ W, const __half *__restrict__ SZ,
+    const float *__restrict__ AS,           // [P, M] per-token scale
+    const float *__restrict__ RS,           // [P, M, K/128] plain code row-sums
+    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2) {
+  static_assert(LBK == 64 || LBK == 128, "slab is one group or half a group");
+  constexpr int NS = LBK / 16;
+  constexpr int LWSTR = LBK + AR_PAD;
+  constexpr int BNF_T = AR_WN * TN * 16;
+  __shared__ unsigned char sW[BNF_T * LWSTR];
+  __shared__ float s_rs[AR_BMF];
+
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int wm = wave / AR_WN, wn = wave % AR_WN;
+  const int col = lane & 15, kb8 = (lane >> 4) * 8;
+  const int m0 = blockIdx.y * AR_BMF, n0 = blockIdx.x * BNF_T;
+  const int ksteps_g = K / 16;
+  const int Mt = (M + 15) >> 4;
+
+  // PARO: partition select.
+  const int prt = (n0 >= pb1 ? 1 : 0) + (n0 >= pb2 ? 1 : 0);
+  const int G = K / PQ_GROUP;
+  AT += (size_t)prt * Mt * 16 * K;
+  AS += (size_t)prt * M;
+  RS += (size_t)prt * M * G;
+
+  // Wave-uniform tile bases (SGPR) + one per-lane offset; tile-granular clamp, never predicate.
+  const unsigned char *abase[AR_TM];
+#pragma unroll
+  for (int i = 0; i < AR_TM; ++i) {
+    int mt = (m0 >> 4) + wm * AR_TM + i; mt = mt < Mt - 1 ? mt : Mt - 1;
+    abase[i] = AT + (size_t)mt * ksteps_g * 256;
+  }
+  const int aoff = lane * 8;
+
+  floatx8 acc[AR_TM][TN];
+#pragma unroll
+  for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+
+  int ncol[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) ncol[j] = n0 + wn * TN * 16 + j * 16 + col;
+
+  float sc[TN], zsc[TN];
+  for (int k0 = 0; k0 < K; k0 += LBK) {
+    const int ks0 = k0 / 16, g = k0 / PQ_GROUP;
+    // LBK=128: every slab is a whole group. LBK=64: the group's first slab loads the scales and
+    // stages the row-sums, the second applies the correction (both share sc/zsc/rs).
+    const bool first = (LBK == PQ_GROUP) || (((k0 / AR_BK) & 1) == 0);
+    const bool second = (LBK == PQ_GROUP) || !first;
+    // A fragments straight from global, issued before the W staging so they land under it.
+    int2_t af[AR_TM][NS];
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+      for (int st = 0; st < NS; ++st)
+        af[i][st] = *(const int2_t *)(abase[i] + ((ks0 + st) * 256 + aoff));
+    if (first) {
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        const __half2 szv =
+            *(const __half2 *)(SZ + (((size_t)g * N + (ncol[j] < N ? ncol[j] : N - 1)) * 2));
+        sc[j] = __half2float(szv.x);
+        zsc[j] = __half2float(szv.y);
+      }
+      const int r = tid;
+      const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
+      s_rs[r] = RS[(size_t)rc * G + g];
+    }
+    pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR>(sW, W, n0, N, K, k0,
+                                                                          tid);
+    __syncthreads();
+
+    int2_t wfa[WHOIST ? NS : 1][TN];
+    if constexpr (WHOIST) {
+#pragma unroll
+      for (int st = 0; st < NS; ++st)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          const unsigned char *pw = &sW[(wn * TN * 16 + j * 16 + col) * LWSTR + st * 16 + kb8];
+          wfa[st][j][0] = *(const int *)pw; wfa[st][j][1] = *(const int *)(pw + 4);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i) {
+      floatx8 t[TN];
+#pragma unroll
+      for (int j = 0; j < TN; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) t[j][e] = 0.f;
+#pragma unroll
+      for (int st = 0; st < NS; ++st) {
+        if constexpr (WHOIST) {
+          __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wfa[st][j], t[j]);
+        } else {
+          int2_t wf[TN];
+#pragma unroll
+          for (int j = 0; j < TN; ++j) {
+            const unsigned char *pw = &sW[(wn * TN * 16 + j * 16 + col) * LWSTR + st * 16 + kb8];
+            wf[j][0] = *(const int *)pw; wf[j][1] = *(const int *)(pw + 4);
+          }
+          __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wf[j], t[j]);
+        }
+      }
+      const int mlb = wm * AR_TM * 16 + i * 16 + kb8;
+      if (second) {
+        const float4 r4l = *(const float4 *)&s_rs[mlb], r4h = *(const float4 *)&s_rs[mlb + 4];
+        const float rv[8] = {r4l.x, r4l.y, r4l.z, r4l.w, r4h.x, r4h.y, r4h.z, r4h.w};
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e)
+            acc[i][j][e] = fmaf(sc[j], t[j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
+      } else {
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], t[j][e], acc[i][j][e]);
+      }
+    }
+    __syncthreads();
+  }
+
+  // Epilogue: As once per row. Full-tile fast path (no per-element guards) when the tile is
+  // interior, else the guarded form.
+  {
+    const bool full = (m0 + wm * AR_TM * 16 + (AR_TM - 1) * 16 + kb8 + 7 < M) &&
+                      (ncol[TN - 1] < N);
+    if (full) {
+      __bf16 *__restrict__ Cb = C + (size_t)(m0 + wm * AR_TM * 16) * N;
+      const float *__restrict__ Asb = AS + m0 + wm * AR_TM * 16;
+#pragma unroll
+      for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int r = i * 16 + kb8 + e;
+            Cb[r * N + ncol[j]] = (__bf16)(acc[i][j][e] * Asb[r]);
+          }
+      return;
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = m0 + wm * AR_TM * 16 + i * 16 + kb8 + e;
+        if (m < M && ncol[j] < N) C[(size_t)m * N + ncol[j]] = (__bf16)(acc[i][j][e] * AS[m]);
       }
 }
