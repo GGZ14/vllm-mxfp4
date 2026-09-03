@@ -1210,13 +1210,25 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
   }
 }
 
-template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0>
+// ABL (bench only): 1 = keep the temp accumulator but drop the scale/zero-point fold (acc += t);
+// 2 = accumulate straight into acc (no temp, no fold: the MXFP4-shaped inner loop). Prices what
+// the fp16 group scale costs on top of the WMMA stream.
+// ABL bit 4 (ZPE): the zero-point term leaves the main loop. It is the rank-G product
+// sum_g zsc[g][n] * rs[m][g]; with RSH = fp16 row-sums in WMMA fragment order ([P, Mt, Gp/16]
+// fragments of 16 rows x 16 groups, Gp = G rounded up to 16) and ZSH = fp16 zero-scales
+// [N, Gp] (k-contiguous), the epilogue does Gp/16 fp16 WMMAs per output tile -- under 1% of the
+// main stream -- and the loop keeps only the scale FMA (8 VALU per tile-group instead of 16,
+// which the ablation prices at ~10%). fp16 row-sums: |rs| <= 448*128 < 65504, 11-bit mantissa,
+// the correction's rounding lands ~1e-4 relative, under the bf16 output floor.
+template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT,   // [P, Mt*16, K] fragment-tiled e4m3
     const unsigned int *__restrict__ W, const __half *__restrict__ SZ,
     const float *__restrict__ AS,           // [P, M] per-token scale
     const float *__restrict__ RS,           // [P, M, K/128] plain code row-sums
-    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2) {
+    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2,
+    const __half *__restrict__ RSH = nullptr,   // ZPE: [P, Mt*Gp*16] fp16 row-sum fragments
+    const __half *__restrict__ ZSH = nullptr) { // ZPE: [N, Gp] fp16 zero-scales
   static_assert(LBK == 64 || LBK == 128, "slab is one group or half a group");
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + AR_PAD;
@@ -1299,6 +1311,19 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
           wfa[st][j][0] = *(const int *)pw; wfa[st][j][1] = *(const int *)(pw + 4);
         }
     }
+    if constexpr (ABL == 2) {
+#pragma unroll
+      for (int st = 0; st < NS; ++st) {
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+            acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wfa[st][j], acc[i][j]);
+      }
+      __syncthreads();
+      continue;
+    }
 #pragma unroll
     for (int i = 0; i < AR_TM; ++i) {
       floatx8 t[TN];
@@ -1327,7 +1352,14 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
         }
       }
       const int mlb = wm * AR_TM * 16 + i * 16 + kb8;
-      if (second) {
+      if constexpr (ABL == 1) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][j][e] += t[j][e];
+        continue;
+      }
+      if (second && (ABL & 4) == 0) {
         const float4 r4l = *(const float4 *)&s_rs[mlb], r4h = *(const float4 *)&s_rs[mlb + 4];
         const float rv[8] = {r4l.x, r4l.y, r4l.z, r4l.w, r4h.x, r4h.y, r4h.z, r4h.w};
 #pragma unroll
@@ -1345,6 +1377,44 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     __syncthreads();
   }
 
+  if constexpr ((ABL & 4) && !(ABL & 8)) {
+    // Zero-point correction: acc -= RSH[m, :] . ZSH[n, :] over Gp groups, fp16 WMMA. The
+    // block's 64 zero-scale rows (Gp halfs each) are staged into the dead W slab space with
+    // coalesced loads first: gathered straight from global they were 16 rows per wave-load,
+    // and with the weight stream owning L2 that cost ~20% on gate_up.
+    const int Gp = (G + 15) & ~15;
+    const int gsteps = Gp / 16;
+    typedef _Float16 halfx8 __attribute__((ext_vector_type(8)));
+    __half *sZ = (__half *)sW;                          // BNF_T * Gp halfs <= sW bytes for Gp <= 64
+    {
+      const int nz = BNF_T * Gp / 8;                    // 16-byte units
+      for (int u = tid; u < nz; u += AR_NTHREADS) {
+        const int r = u / (Gp / 8), c8 = u % (Gp / 8);
+        const int gn = n0 + r, gc = gn < N ? gn : N - 1;
+        *(uint4_t *)(sZ + (size_t)r * Gp + c8 * 8) = *(const uint4_t *)(ZSH + (size_t)gc * Gp + c8 * 8);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i) {
+      int mt = (m0 >> 4) + wm * AR_TM + i; mt = mt < Mt - 1 ? mt : Mt - 1;
+      const __half *rbase = RSH + (size_t)prt * Mt * Gp * 16 + (size_t)mt * gsteps * 256;
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        floatx8 corr;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) corr[e] = 0.f;
+        const __half *zrow = sZ + (size_t)(wn * TN * 16 + j * 16 + col) * Gp + kb8;
+        for (int gs = 0; gs < gsteps; ++gs) {
+          const halfx8 ra = *(const halfx8 *)(rbase + (size_t)gs * 256 + lane * 8);
+          const halfx8 zb = *(const halfx8 *)(zrow + gs * 16);
+          corr = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ra, zb, corr);
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[i][j][e] -= corr[e];
+      }
+    }
+  }
   // Epilogue: As once per row. Full-tile fast path (no per-element guards) when the tile is
   // interior, else the guarded form.
   {

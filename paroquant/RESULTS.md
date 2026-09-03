@@ -246,3 +246,32 @@ EVERY output between variants of a gate.
 **Re-check after the register-carry fix (2026-09-03, BetterBench prefill+decode single pass,
 `results/paro-0902-rs2-predec.json`):** prefill 3772/3702/3687/3648/3450 @2k/8k/16k/32k/64k
 (pre-stream 3789/3723/3668/3630/3427: parity, +-0.5%); update p50 24.0-24.4 ms. Served config.
+
+## 2026-09-03: prefill GEMM ablation ledger (what the fp16 group scale costs, and what does not help)
+
+`--bench2 abl` (DRAM-fed, order rotated per rep, best of 4), TN=2 LBK=128 fragment-order, M=2048:
+
+| variant | qkv | in_proj | gate_up |
+|---|--:|--:|--:|
+| shipped at128 (scale FMA + zero-point FMA per tile-group = 16 VALU) | 180 TF/s (1.00) | 179 (1.00) | 184 (1.00) |
+| no fold, temp accumulator kept (8 VALU) | 200 (0.90) | 199 (0.90) | 200 (0.92) |
+| accumulate straight into the WMMA output (0 VALU, the MXFP4 loop) | 224 (0.80) | 224 (0.80) | 225 (0.81) |
+| zero point out of the loop, fp16-WMMA epilogue product (ZPE, 8 VALU + epilogue) | 186 (0.97) | 183 (0.98) | 150 (1.22) |
+| ZPE loop alone, no epilogue | 194 (0.93) | 193 (0.93) | 152 (1.20) |
+
+Reading: the cost is LINEAR in VALU per tile-group (each 8 ops ~10%); the WMMA path is the
+same fp8 stream as MXFP4 and reaches MXFP4's number the moment the fold is gone. Measured and
+REJECTED on the way: (a) in-place rescale (acc *= s[g-1]/s[g], WMMAs write acc directly, zero
+point as an integer FMA) -- 16 VALU like the shipped kernel, no gain, plus the gate_up penalty;
+(b) the zero point as a rank-G epilogue product -- 4% for the epilogue on top of the 7% loop
+gain, and the loop variant without the zero-point FMA shows a +20% schedule pathology on the
+widest shape (same binary, 0.93 on qkv/in_proj, 1.20 on gate_up; not order, not the operand
+reads -- LDS-staged zero-scales did not move it). Left as ABL bit 4 for the bench only.
+Also rejected earlier today: TN=4 (register budget with the fold), pass A+C fusion (records
+re-read per row), chunk-size changes (the fold is per element, not per chunk).
+
+Conclusion: with fp16 group scales the kernel is at 180-188 TF/s against a 225 TF/s loop;
+the remaining 20% needs power-of-two (e8m0) scales folded into the weight bytes, i.e. a
+re-quantized checkpoint (ParoQuant toolchain scoped: layer-wise optimizer, pow2 constraint is a
+few lines in UniformAffineQuantizer, CUDA rotation kernel JIT-builds via cpp_extension --
+untested on ROCm; bf16 base model 55.6 GB downloaded to ~/models/Qwen3.8-27B-bf16). On hold.

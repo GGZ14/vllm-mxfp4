@@ -179,6 +179,28 @@ static std::vector<unsigned int> permute_w(const std::vector<unsigned int> &W, i
   return P;
 }
 
+// ZPE operands: fp16 row-sums in fragment order [P][Mt][Gp/16][32 lanes x 8], fp16 zero-scales
+// [N][Gp] (k-contiguous). Gp = G rounded up to 16, zero padded.
+static std::vector<__half> build_rsh(const std::vector<float> &RS, int P, int M, int G) {
+  const int Mt = (M + 15) / 16, Gp = (G + 15) & ~15, gsteps = Gp / 16;
+  std::vector<__half> out((size_t)P * Mt * Gp * 16, __float2half(0.f));
+  for (int p = 0; p < P; ++p)
+    for (int m = 0; m < M; ++m)
+      for (int g = 0; g < G; ++g) {
+        const int mt = m / 16, lrow = m % 16, gs = g / 16, half = (g / 8) % 2, b = g % 8;
+        out[(size_t)p * Mt * Gp * 16 + ((size_t)(mt * gsteps + gs) * 32 + lrow + 16 * half) * 8 + b] =
+            __float2half(RS[((size_t)p * M + m) * G + g]);
+      }
+  return out;
+}
+static std::vector<__half> build_zsh(const std::vector<__half> &SZ, int N, int G) {
+  const int Gp = (G + 15) & ~15;
+  std::vector<__half> out((size_t)N * Gp, __float2half(0.f));
+  for (int g = 0; g < G; ++g)
+    for (int n = 0; n < N; ++n) out[(size_t)n * Gp + g] = SZ[((size_t)g * N + n) * 2 + 1];
+  return out;
+}
+
 // ---- bench2: DRAM-fed (rotated weight copies), ABAB-interleaved kernel A/B ----
 // The original --bench keeps ONE weight buffer, which on gate_up (44.6 MB) sits inside the
 // 64 MB Infinity Cache and reads at ~1170 GB/s -- twice the DRAM stream, hiding exactly the
@@ -398,6 +420,66 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
         printf("wpexp %-8s M=%-5d ncopy=%d\n", sh.name, M, ncopy);
         for (auto &v : vs) printf("   %-18s %9.1f   %.3f\n", v.name, v.best, v.best / vs[0].best);
         hipFree(dAT); hipFree(dAS); hipFree(dRS); hipFree(dC);
+      }
+      hipFree(dSZ); free_w_copies(dw);
+    }
+  }
+
+  if (what == "abl") {
+    for (const Shape &sh : SHAPES) {
+      if (std::string(sh.name) != "gate_up" && std::string(sh.name) != "qkv" && std::string(sh.name) != "in_proj") continue;
+      if (only && *only && std::string(sh.name) != only) continue;
+      Buffers b;
+      b.N = sh.N; b.K = sh.K; b.P = sh.P; b.G = sh.K / PQ_GROUP;
+      fill_weights(b, rng);
+      const size_t wbytes = b.W.size() * 4;
+      const int ncopy = std::min<int>(12, std::max<int>(2, (int)((256u << 20) / wbytes) + 1));
+      DevW dw = upload_w_copies(b, ncopy);
+      __half *dSZ;
+      HIP_CHECK(hipMalloc(&dSZ, b.SZ.size() * 2));
+      HIP_CHECK(hipMemcpy(dSZ, b.SZ.data(), b.SZ.size() * 2, hipMemcpyHostToDevice));
+      for (const int M : {2048}) {
+        b.M = M;
+        fill_acts(b, rng, false, true);
+        const std::vector<unsigned char> At = tile_a(b.A, b.P, M, b.K);
+        unsigned char *dAT; float *dAS, *dRS; __bf16 *dC;
+        HIP_CHECK(hipMalloc(&dAT, At.size())); HIP_CHECK(hipMalloc(&dAS, b.AS.size() * 4));
+        HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+        HIP_CHECK(hipMemcpy(dAT, At.data(), At.size(), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(dAS, b.AS.data(), b.AS.size() * 4, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+        const std::vector<__half> RSH = build_rsh(b.RS, b.P, M, b.G), ZSH = build_zsh(b.SZ, b.N, b.G);
+        __half *dRSH, *dZSH;
+        HIP_CHECK(hipMalloc(&dRSH, RSH.size() * 2)); HIP_CHECK(hipMalloc(&dZSH, ZSH.size() * 2));
+        HIP_CHECK(hipMemcpy(dRSH, RSH.data(), RSH.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(dZSH, ZSH.data(), ZSH.size() * 2, hipMemcpyHostToDevice));
+        constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
+        const dim3 grid((b.N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
+        const int iters = M >= 4096 ? 10 : 20;
+        struct V { const char *name; double best; };
+        // Variant order is rotated per rep (a fixed order let the last variant measure a
+        // power-capped card on the long gate_up runs) and best-of-REPS is taken.
+        std::vector<V> vs = {{"at128 (shipped)", 1e30}, {"no fold (temp acc)", 1e30}, {"direct acc (mxfp4-shaped)", 1e30},
+                             {"at128 + epilogue zp (ZPE)", 1e30}, {"ZPE loop, no epilogue", 1e30}};
+        for (int rep = 0; rep < REPS; ++rep)
+          for (size_t vv = 0; vv < vs.size(); ++vv) {
+            const size_t v = (vv + rep) % vs.size();
+            auto L = [&](int it) {
+              const unsigned int *Wp = dw.perm[it % ncopy];
+              switch (v) {
+                case 0: hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 0>), grid, block, 0, 0, dAT, Wp, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2); break;
+                case 1: hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 1>), grid, block, 0, 0, dAT, Wp, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2); break;
+                case 2: hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 2>), grid, block, 0, 0, dAT, Wp, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2); break;
+                case 3: hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 4>), grid, block, 0, 0, dAT, Wp, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dRSH, dZSH); break;
+                case 4: hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 12>), grid, block, 0, 0, dAT, Wp, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dRSH, dZSH); break;
+              }
+            };
+            vs[v].best = std::min(vs[v].best, time_us(L, iters, e0, e1));
+          }
+        const double flops = 2.0 * M * b.N * b.K;
+        printf("abl %-8s M=%-5d (us / ratio / TF)\n", sh.name, M);
+        for (auto &v : vs) printf("   %-26s %9.1f   %.3f   %6.1f\n", v.name, v.best, v.best / vs[0].best, flops / v.best / 1e6);
+        hipFree(dAT); hipFree(dAS); hipFree(dRS); hipFree(dC); hipFree(dRSH); hipFree(dZSH);
       }
       hipFree(dSZ); free_w_copies(dw);
     }
@@ -904,6 +986,41 @@ int main(int argc, char **argv) {
             printf("  %-8s %-9s N=%-6d K=%-5d P=%d M=%-4d rel=%.2e rows-past-M=%-4d %s\n",
                    sh.name, vn[v], b.N, b.K, b.P, M, rel2, touched2, pass2 ? "OK" : "FAIL");
           }
+          // ---- epilogue zero-point (ZPE) variant, row + fragment-order layouts ----
+          const std::vector<__half> RSH = build_rsh(b.RS, b.P, M, b.G), ZSH = build_zsh(b.SZ, b.N, b.G);
+          __half *dRSH, *dZSH;
+          HIP_CHECK(hipMalloc(&dRSH, RSH.size() * 2)); HIP_CHECK(hipMalloc(&dZSH, ZSH.size() * 2));
+          HIP_CHECK(hipMemcpy(dRSH, RSH.data(), RSH.size() * 2, hipMemcpyHostToDevice));
+          HIP_CHECK(hipMemcpy(dZSH, ZSH.data(), ZSH.size() * 2, hipMemcpyHostToDevice));
+          for (int v = 0; v < 2; ++v) {
+            const bool wp = v == 1;
+            if (wp && !wp_ok_shape) continue;
+            if ((b.K % 128) != 0) continue;
+            HIP_CHECK(hipMemset(dC, 0x7B, (size_t)Mpad * b.N * 2));
+            const unsigned int *Wsel = wp ? dWp : dW;
+            if (!wp) hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, false, 128, true, 0, 4>), grid, block, 0, 0, dAT, Wsel, dSZ, dASG, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dRSH, dZSH);
+            else hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 4>), grid, block, 0, 0, dAT, Wsel, dSZ, dASG, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dRSH, dZSH);
+            HIP_CHECK(hipDeviceSynchronize());
+            std::vector<unsigned short> hT((size_t)Mpad * b.N);
+            HIP_CHECK(hipMemcpy(hT.data(), dC, hT.size() * 2, hipMemcpyDeviceToHost));
+            double num2 = 0, den2 = 0;
+            for (int m = 0; m < M; ++m)
+              for (int n = 0; n < b.N; ++n) {
+                const double d = bf16_to_f(hT[(size_t)m * b.N + n]) - refp[(size_t)m * b.N + n];
+                num2 += d * d;
+                den2 += (double)refp[(size_t)m * b.N + n] * refp[(size_t)m * b.N + n];
+              }
+            int touched2 = 0;
+            for (int m = M; m < Mpad; ++m)
+              for (int n = 0; n < b.N; ++n)
+                if (hT[(size_t)m * b.N + n] != 0x7B7B) ++touched2;
+            const double rel2 = sqrt(num2 / (den2 > 0 ? den2 : 1));
+            const bool pass2 = rel2 < 5e-3 && touched2 == 0;
+            if (!pass2) ++failures;
+            printf("  %-8s %-9s N=%-6d K=%-5d P=%d M=%-4d rel=%.2e rows-past-M=%-4d %s\n",
+                   sh.name, wp ? "zpe-wp" : "zpe", b.N, b.K, b.P, M, rel2, touched2, pass2 ? "OK" : "FAIL");
+          }
+          hipFree(dRSH); hipFree(dZSH);
           hipFree(dAT); hipFree(dWp);
         }
       }
