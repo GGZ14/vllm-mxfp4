@@ -1343,6 +1343,121 @@ int main(int argc, char **argv) {
     hipFree(dASG2); hipFree(dRS2);
   }
 
+  // ---------------- 2d. elementwise / gdn-norm producers + rotate + quant ----------------
+  for (const int MODE : {0, 1, 2}) {
+    for (const int M : {1, 5, 40, 64}) {
+      const int N = 3072, P = 1, krot = 8, G = N / PQ_GROUP;
+      std::uniform_real_distribution<float> uang(-1.5f, 1.5f);
+      std::normal_distribution<float> gauss(0.f, 1.f);
+      std::uniform_real_distribution<float> ucs(0.5f, 2.f);
+      std::vector<unsigned short> T((size_t)P * krot * (N / 2) * 4, 0);
+      for (int r = 0; r < krot; ++r)
+        for (int g = 0; g < G; ++g) {
+          std::vector<int> perm(PQ_GROUP);
+          for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i;
+          std::shuffle(perm.begin(), perm.end(), rng);
+          for (int t = 0; t < 64; ++t) {
+            const int i = perm[2 * t], j = perm[2 * t + 1];
+            const float th = uang(rng);
+            unsigned short *rec = &T[(((size_t)r) * (N / 2) + (size_t)g * 64 + t) * 4];
+            rec[0] = (unsigned short)(i | (j << 8));
+            const __half c = __float2half(cosf(th)), sh_ = __float2half(sinf(th));
+            memcpy(rec + 1, &c, 2); memcpy(rec + 2, &sh_, 2);
+          }
+        }
+      std::vector<__half> CS((size_t)N);
+      for (auto &vv : CS) vv = __float2half(ucs(rng));
+      auto rbf = [&](float f) { unsigned int w; memcpy(&w, &f, 4); return (unsigned short)(w >> 16); };
+      auto bfr = [&](float f) { unsigned int w; memcpy(&w, &f, 4); unsigned int lsb = (w >> 16) & 1u; w += 0x7FFFu + lsb; unsigned short hb = (unsigned short)(w >> 16); return bf16_to_f(hb); };
+      const int XW = (MODE == 0) ? 2 * N : N;
+      std::vector<unsigned short> Xh((size_t)M * XW), Yh((size_t)M * N), Wh(PQ_GROUP);
+      for (auto &vv : Xh) vv = rbf(gauss(rng) * 2.f);
+      for (auto &vv : Yh) vv = rbf(gauss(rng) * 2.f);
+      for (auto &vv : Wh) vv = rbf(gauss(rng) * 0.3f + 1.f);
+      const float eps = 1e-6f;
+      // CPU reference of the producer (torch op order)
+      std::vector<unsigned short> refHS((size_t)M * N);
+      for (int m = 0; m < M; ++m)
+        for (int g = 0; g < G; ++g) {
+          float inv = 0.f;
+          if (MODE == 2) {
+            double ssq = 0;
+            for (int c = 0; c < PQ_GROUP; ++c) { const float x = bf16_to_f(Xh[(size_t)m * N + g * PQ_GROUP + c]); ssq += (double)x * x; }
+            inv = 1.f / sqrtf((float)(ssq / PQ_GROUP) + eps);
+          }
+          for (int c = 0; c < PQ_GROUP; ++c) {
+            const int k = g * PQ_GROUP + c;
+            float v;
+            if (MODE == 0) {
+              const float gg = bf16_to_f(Xh[(size_t)m * XW + k]), u = bf16_to_f(Xh[(size_t)m * XW + N + k]);
+              const float t = bfr(gg / (1.f + expf(-gg)));
+              v = bfr(t * u);
+            } else if (MODE == 1) {
+              const float x = bf16_to_f(Xh[(size_t)m * N + k]), z = bf16_to_f(Yh[(size_t)m * N + k]);
+              const float sg = bfr(1.f / (1.f + expf(-z)));
+              v = bfr(x * sg);
+            } else {
+              const float x = bf16_to_f(Xh[(size_t)m * N + k]), z = bf16_to_f(Yh[(size_t)m * N + k]);
+              const float sg = z / (1.f + expf(-z));
+              v = bfr(((x * inv) * bf16_to_f(Wh[c])) * sg);
+            }
+            refHS[(size_t)m * N + k] = rbf(v);
+          }
+        }
+      unsigned short *dX, *dY, *dW, *dT, *dHS, *dHS2;
+      __half *dCS; unsigned char *dA, *dA2; float *dASG, *dRS, *dASG2, *dRS2;
+      HIP_CHECK(hipMalloc(&dX, Xh.size() * 2)); HIP_CHECK(hipMalloc(&dY, Yh.size() * 2));
+      HIP_CHECK(hipMalloc(&dW, Wh.size() * 2)); HIP_CHECK(hipMalloc(&dT, T.size() * 2));
+      HIP_CHECK(hipMalloc(&dCS, CS.size() * 2));
+      HIP_CHECK(hipMalloc(&dHS, (size_t)M * N * 2)); HIP_CHECK(hipMalloc(&dHS2, (size_t)M * N * 2));
+      HIP_CHECK(hipMalloc(&dA, (size_t)M * N)); HIP_CHECK(hipMalloc(&dA2, (size_t)M * N));
+      HIP_CHECK(hipMalloc(&dASG, (size_t)M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)M * G * 4));
+      HIP_CHECK(hipMalloc(&dASG2, (size_t)M * G * 4)); HIP_CHECK(hipMalloc(&dRS2, (size_t)M * G * 4));
+      HIP_CHECK(hipMemcpy(dX, Xh.data(), Xh.size() * 2, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dY, Yh.data(), Yh.size() * 2, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dW, Wh.data(), Wh.size() * 2, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dT, T.data(), T.size() * 2, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dCS, CS.data(), CS.size() * 2, hipMemcpyHostToDevice));
+      for (const int gpw : {1, 2}) {
+        HIP_CHECK(hipMemset(dA, 0, (size_t)M * N)); HIP_CHECK(hipMemset(dASG, 0, (size_t)M * G * 4));
+        HIP_CHECK(hipMemset(dRS, 0, (size_t)M * G * 4)); HIP_CHECK(hipMemset(dHS, 0, (size_t)M * N * 2));
+        const dim3 gf(M, (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw), 1), gp(M, (G + PQ_ROT_WAVES - 1) / PQ_ROT_WAVES, 1), blk(PQ_ROT_WAVES * 32);
+#define EW(MODE_, ROT_, GRID_, HS_, A_, ASG_, RS_, GPW_)                                                 \
+        hipLaunchKernelGGL((pq_ew_rot<MODE_, ROT_>), GRID_, blk, 0, 0, (const __bf16 *)dX,               \
+                           (const __bf16 *)dY, (long)N, (const __bf16 *)dW, eps, dT, dCS, (__bf16 *)HS_, \
+                           A_, ASG_, RS_, M, N, krot, GPW_)
+        if (MODE == 0) { EW(0, true, gf, dHS, dA, dASG, dRS, gpw); EW(0, false, gp, dHS2, dA2, dASG2, dRS2, 1); }
+        else if (MODE == 1) { EW(1, true, gf, dHS, dA, dASG, dRS, gpw); EW(1, false, gp, dHS2, dA2, dASG2, dRS2, 1); }
+        else { EW(2, true, gf, dHS, dA, dASG, dRS, gpw); EW(2, false, gp, dHS2, dA2, dASG2, dRS2, 1); }
+#undef EW
+        hipLaunchKernelGGL(pq_rotate_quant2<false>, dim3(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, 1),
+                           blk, 0, 0, (const __bf16 *)dHS2, dT, dCS, dA2, dASG2, dRS2, M, N, krot);
+        HIP_CHECK(hipDeviceSynchronize());
+        std::vector<unsigned short> hHS((size_t)M * N), hHS2((size_t)M * N);
+        std::vector<unsigned char> hA((size_t)M * N), hA2((size_t)M * N);
+        std::vector<float> hASG((size_t)M * G), hRS((size_t)M * G), hASG2((size_t)M * G), hRS2((size_t)M * G);
+        HIP_CHECK(hipMemcpy(hHS.data(), dHS, hHS.size() * 2, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hHS2.data(), dHS2, hHS2.size() * 2, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hA.data(), dA, hA.size(), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hA2.data(), dA2, hA2.size(), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hASG.data(), dASG, hASG.size() * 4, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hASG2.data(), dASG2, hASG2.size() * 4, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hRS.data(), dRS, hRS.size() * 4, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(hRS2.data(), dRS2, hRS2.size() * 4, hipMemcpyDeviceToHost));
+        size_t dhs = 0, dhs_ref = 0, da = 0, dsc = 0;
+        for (size_t i = 0; i < hHS.size(); ++i) { if (hHS[i] != hHS2[i]) ++dhs; if (hHS[i] != refHS[i]) ++dhs_ref; }
+        for (size_t i = 0; i < hA.size(); ++i) if (hA[i] != hA2[i]) ++da;
+        for (size_t i = 0; i < hASG.size(); ++i) if (memcmp(&hASG[i], &hASG2[i], 4) || memcmp(&hRS[i], &hRS2[i], 4)) ++dsc;
+        const bool pass = dhs == 0 && da == 0 && dsc == 0 && dhs_ref <= std::max<size_t>(2, hHS.size() / 50000);
+        if (!pass) ++failures;
+        printf("ewrot mode=%d  M=%-4d gpw=%d fused-vs-chain: hs=%zu codes=%zu sc=%zu | vs-cpu hs=%zu/%zu %s\n",
+               MODE, M, gpw, dhs, da, dsc, dhs_ref, hHS.size(), pass ? "OK" : "FAIL");
+      }
+      hipFree(dX); hipFree(dY); hipFree(dW); hipFree(dT); hipFree(dCS); hipFree(dHS); hipFree(dHS2);
+      hipFree(dA); hipFree(dA2); hipFree(dASG); hipFree(dRS); hipFree(dASG2); hipFree(dRS2);
+    }
+  }
+
   printf("\ncorrectness: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
   if (failures) return 1;
 

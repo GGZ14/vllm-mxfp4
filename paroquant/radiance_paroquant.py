@@ -94,6 +94,9 @@ WPERM = os.environ.get("RADIANCE_PQ_WPERM", "1") == "1"
 # from the shared post-load hook (radiance_gdnmerge.merge_model). Changes the traced graph:
 # the compile cache must be keyed (run_paroquant.sh adds -rs).
 ROT_STREAM = os.environ.get("RADIANCE_PQ_ROT_STREAM", "0") == "1"
+# Stream 2: the three single-partition producers (silu-mul -> down_proj, GDN gated norm ->
+# out_proj, attention gate -> o_proj) fused with rotate + quant the same way. Needs ROT_STREAM.
+ROT_STREAM2 = ROT_STREAM and os.environ.get("RADIANCE_PQ_ROT_STREAM2", "0") == "1"
 _checked = set()
 
 
@@ -188,6 +191,9 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None):
     out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
     if pre is not None and not ptok:
         a_codes, asg, rs = pre
+        if a_codes.shape[0] != P:
+            raise RuntimeError(f"paroquant: pre-quantized tuple has {a_codes.shape[0]} partition(s), "
+                               f"layer has {P} -- a producer was hooked to the wrong linear")
     else:
         a_codes = torch.empty((P, M, K), device=x.device, dtype=torch.uint8)
         asg = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
@@ -310,6 +316,205 @@ def _(y, residual, weight, eps, rec, cs):
             torch.empty((P, M, K // GROUP), device=y.device, dtype=torch.float32))
 
 
+@torch.library.custom_op("radiance::pq_ew_rot", mutates_args=())
+def pq_ew_rot(mode: int, x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, eps: float,
+              rec: torch.Tensor, cs: torch.Tensor
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Producer + rotate + quant for the single-partition sites: mode 0 silu-mul (x = gate_up
+    [M, 2N], y unused), mode 1 attention gate (x [M, N] * sigmoid(y)), mode 2 GDN gated rmsnorm
+    (x [M, N], z = y, w [128]). Returns (hs, A, ASG, RS); above the decode band only hs is
+    produced and the linear takes its tiled prefill path from it."""
+    x2 = x.reshape(-1, x.shape[-1])
+    M = x2.shape[0]
+    N = x2.shape[1] // 2 if mode == 0 else x2.shape[1]
+    G = N // GROUP
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    if mode == 0:
+        y2, ys = x2, 0
+    else:
+        y2 = y.reshape(M, -1)
+        if y2.stride(-1) != 1 or (y2.stride(0) & 7):
+            y2 = y2.contiguous()
+        ys = y2.stride(0)
+    hs = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    a = torch.empty((1, M, N), device=x.device, dtype=torch.uint8)
+    asg = torch.empty((1, M, G), device=x.device, dtype=torch.float32)
+    rs = torch.empty((1, M, G), device=x.device, dtype=torch.float32)
+    fused = M <= DECODE_MAX_M
+    _ext.launch_ew_rot(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
+                       rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
+                       asg.data_ptr(), rs.data_ptr(), M, N, rec.shape[1], 1 if fused else 0,
+                       torch.cuda.current_stream().cuda_stream)
+    return hs, a, asg, rs
+
+
+@pq_ew_rot.register_fake
+def _(mode, x, y, w, eps, rec, cs):
+    Kx = x.shape[-1]
+    M = x.numel() // Kx
+    N = Kx // 2 if mode == 0 else Kx
+    return (torch.empty((M, N), device=x.device, dtype=torch.bfloat16),
+            torch.empty((1, M, N), device=x.device, dtype=torch.uint8),
+            torch.empty((1, M, N // GROUP), device=x.device, dtype=torch.float32),
+            torch.empty((1, M, N // GROUP), device=x.device, dtype=torch.float32))
+
+
+class _PqSiluMulRot(torch.nn.Module):
+    """Drop-in for the MLP's SiluAndMul: (hs, A, ASG, RS) for the down_proj."""
+
+    def __init__(self, down):
+        super().__init__()
+        self._down = [down]                       # not a submodule (no double registration)
+
+    def forward(self, gu):
+        d = self._down[0]
+        hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(0, gu, gu, d.cs, 0.0, d.rec, d.cs)
+        return (hs, a, asg, rs)
+
+
+def _rot_gdn_output_projection(self, core_attn_out, z):
+    """QwenGatedDeltaNetAttention._output_projection: gated norm + rotate + quant in one launch,
+    tuple into out_proj."""
+    T = core_attn_out.shape[0]
+    x = core_attn_out.reshape(T, -1)
+    zz = z.reshape(T, -1)
+    op = self.out_proj
+    hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(2, x, zz, self.norm.weight, float(self.norm.eps),
+                                                  op.rec, op.cs)
+    output, _ = op((hs, a, asg, rs))
+    return output
+
+
+def _rot_attn_forward(self, positions, hidden_states):
+    """Qwen3NextAttention.forward with the gate multiply + rotate + quant fused into o_proj's
+    producer (mirrors the stock body)."""
+    qkv, _ = self.qkv_proj(hidden_states)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    attn_output = self.attn(q, k, v)
+    if gate is not None:
+        op = self.o_proj
+        hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(1, attn_output, gate, op.cs, 0.0, op.rec, op.cs)
+        output, _ = op((hs, a, asg, rs))
+        return output
+    output, _ = self.o_proj(attn_output)
+    return output
+
+
+def _gdn_norm_ok(la) -> str | None:
+    n = getattr(la, "norm", None)
+    if n is None or not _is_pq(getattr(la, "out_proj", None)):
+        return "no norm / out_proj not paroquant"
+    if getattr(n, "group_size", None) is not None or not getattr(n, "norm_before_gate", False):
+        return "norm shape"
+    if getattr(n, "activation", "swish") not in ("swish", "silu"):
+        return f"activation {n.activation}"
+    if n.weight.dtype != torch.bfloat16 or n.weight.numel() != 128:
+        return "norm weight"
+    if la.out_proj.input_size_per_partition % 128:
+        return "N % 128"
+    return None
+
+
+# ---- rotation stream 3: the all-reduce fused into the norm+rotate producer ----------------------
+# Contract (radiance_arnq's fp8 stream, adapted): a RowParallel linear whose consumer site is
+# fused stops reducing (reduce_results=False) and hands its PARTIAL to pq_ar_add_rms_rot, which
+# does the two-rank one-shot all-reduce + residual add + norm + rotate + quant in one launch in
+# the decode band; above the band it all-reduces through vLLM and runs the plain norm kernel.
+# Own IPC scratch/flags/counters (not the plain AR's -- slot parity must alternate per launch of
+# THIS kernel family). The last layer keeps the stock contract (model.norm / drafter inputs).
+ROT_STREAM3 = ROT_STREAM and os.environ.get("RADIANCE_PQ_ROT_STREAM3", "0") == "1"
+_AR = {"ok": False}
+
+
+def _ar_setup(device) -> bool:
+    """Allocate this kernel family's IPC scratch/flags and exchange handles. Once per process."""
+    if "tried" in _AR:
+        return _AR["ok"]
+    _AR["tried"] = True
+    try:
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+        tp = get_tp_group()
+        comm = getattr(tp.device_communicator, "radiance_comm", None)
+        if comm is None or comm.disabled or tp.world_size != 2:
+            sys.stderr.write("[radiance.paroquant] rot stream3: no 2-rank radiance comm, off\n")
+            return False
+        ext = comm._ext
+        slot_bytes = 128 * 5120 * 2 * 2           # M<=128 rows x K<=10240 bf16 per slot
+        nflags = 1024                             # M*chunks (<= 128*5 at gpw 1)
+        torch.cuda.set_device(device)
+        sc, sc_h, _ = comm._alloc(2 * slot_bytes, True)
+        fl, fl_h, _ = comm._alloc(nflags * 4, True)
+        sc_handles = [None] * 2
+        fl_handles = [None] * 2
+        dist.all_gather_object(sc_handles, sc_h, group=comm.group)
+        dist.all_gather_object(fl_handles, fl_h, group=comm.group)
+        peer = 1 - comm.rank
+        _AR.update(scratch=sc, flags=fl, peer_scratch=ext.ar_ipc_open(sc_handles[peer]),
+                   peer_flags=ext.ar_ipc_open(fl_handles[peer]),
+                   seq=torch.zeros(nflags, dtype=torch.int32, device=device),
+                   slot_bytes=slot_bytes, nflags=nflags, drain=comm.drain, acq=comm.acq,
+                   comm=comm, ok=True)
+        sys.stderr.write(f"[radiance.paroquant] rot stream3: fused AR buffers ready (rank {comm.rank}, "
+                         f"slot {slot_bytes >> 10} KiB, {nflags} flags, drain={comm.drain} acq={comm.acq})\n")
+        return True
+    except Exception as e:                                          # noqa: BLE001
+        sys.stderr.write(f"[radiance.paroquant] rot stream3: setup failed, off: {e!r}\n")
+        return False
+
+
+@torch.library.custom_op("radiance::pq_ar_add_rms_rot", mutates_args=())
+def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+                      rec: torch.Tensor, cs: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """y is this rank's PARTIAL sum. Decode band: fused AR+add+norm+rotate+quant; above it:
+    vLLM all-reduce then the plain norm kernel (same outputs as pq_add_rms_rot)."""
+    y2 = y.reshape(-1, y.shape[-1])
+    M, K = y2.shape
+    P = rec.shape[0]
+    G = K // GROUP
+    res = residual.reshape(M, K)
+    if not res.is_contiguous():
+        res = res.contiguous()
+    if not y2.is_contiguous():
+        y2 = y2.contiguous()
+    hs = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
+    ro = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
+    a = torch.empty((P, M, K), device=y.device, dtype=torch.uint8)
+    asg = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
+    rs = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
+    stream = torch.cuda.current_stream().cuda_stream
+    if M <= DECODE_MAX_M and _AR["ok"] and M * K * 2 <= _AR["slot_bytes"]:
+        _ext.launch_ar_add_rms_rot(y2.data_ptr(), _AR["peer_scratch"], _AR["scratch"],
+                                   _AR["slot_bytes"], _AR["peer_flags"], _AR["flags"],
+                                   _AR["seq"].data_ptr(), _AR["nflags"], res.data_ptr(),
+                                   weight.data_ptr(), float(eps), rec.data_ptr(), cs.data_ptr(),
+                                   hs.data_ptr(), ro.data_ptr(), a.data_ptr(), asg.data_ptr(),
+                                   rs.data_ptr(), M, K, P, rec.shape[1], _AR["drain"], _AR["acq"],
+                                   stream)
+        return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
+    from vllm.distributed import tensor_model_parallel_all_reduce as _tpar
+    yr = _tpar(y2).contiguous()
+    _ext.launch_add_rms_rot(yr.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+                            rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
+                            a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
+                            1 if M <= DECODE_MAX_M else 0, stream)
+    return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
+
+
+@pq_ar_add_rms_rot.register_fake
+def _(y, residual, weight, eps, rec, cs):
+    K = y.shape[-1]
+    M = y.numel() // K
+    P = rec.shape[0]
+    return (torch.empty(y.shape, device=y.device, dtype=torch.bfloat16),
+            torch.empty(residual.shape, device=y.device, dtype=torch.bfloat16),
+            torch.empty((P, M, K), device=y.device, dtype=torch.uint8),
+            torch.empty((P, M, K // GROUP), device=y.device, dtype=torch.float32),
+            torch.empty((P, M, K // GROUP), device=y.device, dtype=torch.float32))
+
+
 # ---- rotation stream: patched forwards + installer --------------------------------------------
 def _rot_layer_forward(self, hidden_states, residual, positions=None, **kwargs):
     """Decoder-layer forward under the rotation stream. Mirrors the stock body
@@ -321,7 +526,8 @@ def _rot_layer_forward(self, hidden_states, residual, positions=None, **kwargs):
         hs = hidden_states
     elif self._pq_rot_in is not None:
         cons = self._pq_rot_in
-        hsb, residual, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(
+        op = torch.ops.radiance.pq_ar_add_rms_rot if self._pq_ar_in else torch.ops.radiance.pq_add_rms_rot
+        hsb, residual, a, asg, rs = op(
             hidden_states, residual, self.input_layernorm.weight,
             float(self.input_layernorm.variance_epsilon), cons.rec, cons.cs)
         hs = (hsb, a, asg, rs)
@@ -336,7 +542,8 @@ def _rot_layer_forward(self, hidden_states, residual, positions=None, **kwargs):
 
     if self._pq_rot_mid is not None:
         cons = self._pq_rot_mid
-        hsb, residual, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(
+        op = torch.ops.radiance.pq_ar_add_rms_rot if self._pq_ar_mid else torch.ops.radiance.pq_add_rms_rot
+        hsb, residual, a, asg, rs = op(
             attn_out, residual, self.post_attention_layernorm.weight,
             float(self.post_attention_layernorm.variance_epsilon), cons.rec, cons.cs)
         hidden_states = self.mlp((hsb, a, asg, rs))
@@ -399,10 +606,14 @@ def install_stream(model) -> None:
     except Exception as e:                                          # noqa: BLE001
         sys.stderr.write(f"[radiance.paroquant] rot stream: GDN module probe failed {e!r}\n")
         gdn_ok = False
-    n_in = n_mid = n_gdn = 0
+    n_in = n_mid = n_gdn = n_act = n_gnq = n_attn = n_ar = 0
+    ar_ok = ROT_STREAM3 and _ar_setup(next(model.parameters()).device)
+    L = len(core.layers)
     for i, layer in enumerate(core.layers):
         layer._pq_rot_in = None
         layer._pq_rot_mid = None
+        layer._pq_ar_in = False
+        layer._pq_ar_mid = False
         if getattr(layer, "layer_scale", False) or getattr(layer, "use_attn_reduce_scatter_for_moe", False):
             sys.stderr.write(f"[radiance.paroquant] rot stream: layer {i} layer_scale/SP, stock\n")
             continue
@@ -430,8 +641,62 @@ def install_stream(model) -> None:
             layer._pq_rot_mid = cons_mid
             n_mid += 1
         layer.forward = types.MethodType(_rot_layer_forward, layer)
+        if ar_ok:
+            # mid: this layer's o_proj/out_proj stays partial, the mid epilogue reduces it
+            row = (layer.linear_attn.out_proj if layer.layer_type == "linear_attention"
+                   else layer.self_attn.o_proj)
+            if layer._pq_rot_mid is not None and _is_pq(row) and row.bias is None \
+                    and getattr(row, "reduce_results", False):
+                row.reduce_results = False
+                layer._pq_ar_mid = True
+                n_ar += 1
+            # down stream: this layer's down_proj stays partial, the NEXT layer's input epilogue
+            # reduces it. Never on the last layer (model.norm and the drafter read its output).
+            nxt = core.layers[i + 1] if i + 1 < L else None
+            down = getattr(mlp, "down_proj", None)
+            if nxt is not None and _is_pq(down) and down.bias is None \
+                    and getattr(down, "reduce_results", False) \
+                    and not getattr(nxt, "layer_scale", False) \
+                    and not getattr(nxt, "use_attn_reduce_scatter_for_moe", False) \
+                    and getattr(nxt.mlp, "expert_gate", None) is None:
+                nin = (getattr(nxt.linear_attn, "in_proj_qkvz", None)
+                       if nxt.layer_type == "linear_attention"
+                       else getattr(nxt.self_attn, "qkv_proj", None))
+                gdn_next_ok = (nxt.layer_type != "linear_attention"
+                               or (gdn_ok and getattr(nxt.linear_attn, "in_proj_ba", None) is not None))
+                if _is_pq(nin) and gdn_next_ok:
+                    down.reduce_results = False
+                    nxt._pq_ar_in = True
+                    n_ar += 1
+        if ROT_STREAM2:
+            down = getattr(mlp, "down_proj", None)
+            if _is_pq(down) and down.input_size_per_partition % 128 == 0 \
+                    and getattr(mlp, "act_fn", None) is not None:
+                mlp.act_fn = _PqSiluMulRot(down)
+                n_act += 1
+            if layer.layer_type == "linear_attention":
+                why = _gdn_norm_ok(layer.linear_attn)
+                if why is None:
+                    layer.linear_attn._output_projection = types.MethodType(
+                        _rot_gdn_output_projection, layer.linear_attn)
+                    n_gnq += 1
+                else:
+                    sys.stderr.write(f"[radiance.paroquant] rot stream2: layer {i} gdn norm stock ({why})\n")
+            else:
+                sa = layer.self_attn
+                op = getattr(sa, "o_proj", None)
+                if _is_pq(op) and op.input_size_per_partition % 128 == 0 and hasattr(sa, "_project_qkv_gate"):
+                    sa.forward = types.MethodType(_rot_attn_forward, sa)
+                    n_attn += 1
+    for layer in core.layers:
+        if getattr(layer, "_pq_ar_in", False) and layer._pq_rot_in is None:
+            # the down stream was granted but the consumer did not install: undo it
+            layer._pq_ar_in = False
+            sys.stderr.write("[radiance.paroquant] rot stream3: a down stream had no consumer, reverted\n")
     sys.stderr.write(f"[radiance.paroquant] rot stream installed: {n_in} input epilogues "
-                     f"({n_gdn} GDN), {n_mid} mid epilogues over {len(core.layers)} layers\n")
+                     f"({n_gdn} GDN), {n_mid} mid epilogues over {len(core.layers)} layers"
+                     f"{f'; stream2: {n_act} silu-mul, {n_gnq} gdn-norm, {n_attn} attn-gate' if ROT_STREAM2 else ''}"
+                     f"{f'; stream3: {n_ar} fused all-reduces' if ar_ok else ''}\n")
 
 
 def _narrow_tp(target_last, loaded):

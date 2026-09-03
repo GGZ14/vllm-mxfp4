@@ -275,3 +275,46 @@ the remaining 20% needs power-of-two (e8m0) scales folded into the weight bytes,
 re-quantized checkpoint (ParoQuant toolchain scoped: layer-wise optimizer, pow2 constraint is a
 few lines in UniformAffineQuantizer, CUDA rotation kernel JIT-builds via cpp_extension --
 untested on ROCm; bf16 base model 55.6 GB downloaded to ~/models/Qwen3.8-27B-bf16). On hold.
+
+## 2026-09-03: SPEC re-sweep on the rotation-stream build
+
+`spec_sweep.sh` (manual serve per SPEC, bench_decode_ctx 0/8k/32k + BetterBench decode single
+pass; SPEC=5 = the unit, numbers from the same-day gates):
+
+| SPEC | ms/step ctx0 / 8k / 32k | tok/s ctx0 / 8k / 32k (greedy, 1 prompt) | BetterBench combined t/s (8 prompts, temp 0.7) |
+|--:|--:|--:|--:|
+| 5 | 24.03 / 25.52 / 26.31 | 105.6 / 122.4 / 111.0 | 184-186 |
+| 6 | 24.42 / 26.39 / 27.06 | 113.7 / 119.9 / 102.6 | 198 |
+| 7 | 24.53 / 26.31 / 27.03 | 104.9 / 109.9 / 108.8 | 204 (weighted from the rows) |
+
+Single-stream: 7 > 6 > 5 by ~+10% combined -- the extra tokens per update outweigh the +2%
+step. The one-prompt greedy tok/s columns are trajectory noise (the memory's warning about
+judging by acc/draft on one prompt applies). Concurrency check at SPEC=7 vs today's SPEC=5
+(152/263/398/500/506 aggregate at conc 1/2/4/8/16) follows before the unit changes.
+
+**SPEC=7 chosen (2026-09-03):** concurrency at SPEC=7 (stream 1) 166/274/410/503/502 vs SPEC=5
+152/263/398/500/506 -- equal or better at every level, +10% single-stream. Unit updated.
+
+## 2026-09-03: rotation stream 2 (silu-mul, GDN gated norm, attention gate fused with rotate+quant)
+
+`pq_ew_rot<MODE, ROT>`: one wave per 128-group producer (no row reduction) + the rotate_quant2
+body; MODE 0 silu(g)*u (bf16-rounded silu, bf16 product), MODE 1 x*sigmoid(gate) (eager
+rounding), MODE 2 per-head RMSNormGated (head = group, fp32, ((x*rsqrt)*w)*silu(z) rounded once).
+Hooks: mlp.act_fn -> tuple into down_proj; linear_attn._output_projection -> tuple into
+out_proj; Qwen3NextAttention.forward tail -> tuple into o_proj. 64 + 48 + 16 sites.
+`RADIANCE_PQ_ROT_STREAM2=1` (default), cache suffix `-rs2`. The partition-count guard in
+`_linear_impl` exists because the module test once fed a single-partition tuple into a
+2-partition layer and the GEMM read past the activation buffer -- a silent GPU hang, not a fault.
+
+Gates: harness `ewrot` 24/24 bit-exact vs the unfused chain and matching the CPU reference
+(mode 2 at 1 ppm); module test on the real down_proj: modes 0/1 bit-identical to torch at every
+M, mode 2 within 5-26 flips per million above M=40; serve sanity (17*23, 7k-token prompt) OK.
+
+Serve (unit: SPEC=7 + stream 2, same day, vs SPEC=5 + stream 1):
+- bench_decode_ctx: 24.19 ms/step @ctx25 (SPEC=7 alone 24.53; stream 2 = -0.34 ms = -1.4%),
+  25.74 @8k, 26.70 @32k, 28.71 @103k, 32.55 @206k.
+- BetterBench single pass: update p50 24.3-24.7 ms; combined decode **226.2 t/s** (was 186.0;
+  MXFP4 prod 186.0); conc 1/2/4/8/16 **168/276/399/512/518** (was 152/263/398/500/506);
+  prefill 3782/3700/3725/3621/3450 @2k-64k (unchanged); KV cache profile 479k -> **622k tokens**
+  (fewer intermediates in the compiled graph).
+- GSM8K 500q: **97.40%** (487/500), 1 truncated.

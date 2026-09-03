@@ -40,7 +40,14 @@ R4D_KEY=${R4D_KEY:-b9e42ab-rx5}
 # Rotation stream: fused add+rmsnorm+rotate+quant producers for the norm-fed linears (decode
 # band); patches the decoder-layer forward, so the compile cache is keyed (-rs).
 ROT_STREAM=${RADIANCE_PQ_ROT_STREAM:-1}
+# Stream 2: silu-mul -> down, GDN gated norm -> out_proj, attention gate -> o_proj producers
+# fused with rotate+quant (default off until the serve gate lands; also patches the graph).
+ROT_STREAM2=${RADIANCE_PQ_ROT_STREAM2:-1}
+# Stream 3: the two-rank all-reduce fused into the norm+rotate producers (default off until gated).
+ROT_STREAM3=${RADIANCE_PQ_ROT_STREAM3:-0}
 CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && CACHE_SUF="$CACHE_SUF-rs"
+[ "$ROT_STREAM2" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs2"
+[ "$ROT_STREAM3" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs3"
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
@@ -90,7 +97,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_DECODE_NT="${RADIANCE_PQ_DECODE_NT:-1}" \
   -e RADIANCE_PQ_ATILED="${RADIANCE_PQ_ATILED:-1}" -e RADIANCE_PQ_AT_LBK="${RADIANCE_PQ_AT_LBK:-128}" \
   -e RADIANCE_PQ_AT_HOIST="${RADIANCE_PQ_AT_HOIST:-1}" -e RADIANCE_PQ_PTOK="${RADIANCE_PQ_PTOK:-1}" \
-  -e RADIANCE_PQ_ROT_STREAM="$ROT_STREAM" -e RADIANCE_PQ_ROT_V2="${RADIANCE_PQ_ROT_V2:-1}" \
+  -e RADIANCE_PQ_ROT_STREAM="$ROT_STREAM" -e RADIANCE_PQ_ROT_STREAM2="$ROT_STREAM2" \
+  -e RADIANCE_PQ_ROT_STREAM3="$ROT_STREAM3" \
+  -e RADIANCE_PQ_ROT_V2="${RADIANCE_PQ_ROT_V2:-1}" \
   -e RADIANCE_FAST_DRAFT=1 -e RADIANCE_DRAFT_TAU=0.20 -e RADIANCE_DRAFT_RERANK=80 \
   -e RADIANCE_VERIFY_HEAD=1 -e RADIANCE_VERIFY_HEAD_MAX_M=32 \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS=1 -e RADIANCE_SKINNY_GEMM=1 \

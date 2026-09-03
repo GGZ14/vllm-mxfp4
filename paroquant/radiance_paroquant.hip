@@ -141,6 +141,70 @@ static void launch_add_rms_rot(uintptr_t y, uintptr_t res, uintptr_t w, double e
 #undef PQ_ARR
 }
 
+// Elementwise / per-head producers fused with rotate + quant (decode band, fused=1) or the plain
+// producer writing hs only (fused=0). mode 0: silu-mul (x = gate_up [M, 2N]); mode 1: attention
+// gate (x [M, N] * sigmoid(y), y row stride ys); mode 2: GDN gated rmsnorm (x [M, N], z = y with
+// stride ys, w [128], eps). Single partition. Out: hs [M, N] bf16 always; A [M, N], ASG/RS
+// [M, N/128] when fused.
+static void launch_ew_rot(int mode, uintptr_t x, uintptr_t y, long ys, uintptr_t w, double eps,
+                          uintptr_t t, uintptr_t cs, uintptr_t hs, uintptr_t a, uintptr_t asg,
+                          uintptr_t rs, int M, int N, int krot, int fused, uintptr_t stream) {
+  if (N % PQ_GROUP) throw std::runtime_error("ParoQuant: N must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  auto st = reinterpret_cast<hipStream_t>(stream);
+  const int G = N / PQ_GROUP;
+  const int gpw = fused ? pq_rot_gpw(M) : 1;
+  const dim3 grid(M, (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw), 1);
+#define PQ_EW(KERN)                                                                              \
+  hipLaunchKernelGGL(KERN, grid, dim3(PQ_ROT_WAVES * 32), 0, st,                                 \
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const __bf16 *>(y),    \
+                     ys, reinterpret_cast<const __bf16 *>(w), (float)eps,                         \
+                     reinterpret_cast<const unsigned short *>(t),                                \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<__bf16 *>(hs),        \
+                     reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(asg),         \
+                     reinterpret_cast<float *>(rs), M, N, krot, gpw)
+  if (fused) {
+    if (mode == 0) PQ_EW((pq_ew_rot<0, true>));
+    else if (mode == 1) PQ_EW((pq_ew_rot<1, true>));
+    else PQ_EW((pq_ew_rot<2, true>));
+  } else {
+    if (mode == 0) PQ_EW((pq_ew_rot<0, false>));
+    else if (mode == 1) PQ_EW((pq_ew_rot<1, false>));
+    else PQ_EW((pq_ew_rot<2, false>));
+  }
+#undef PQ_EW
+}
+
+// Two-rank one-shot all-reduce fused with add + rmsnorm + rotate + quant (decode band). The
+// caller owns the IPC scratch (2 slots of slot_bytes), the flags (>= M*chunks u32, IPC-shared)
+// and the device seq counters (same count); grid (M, chunks) with chunks from gpw.
+static void launch_ar_add_rms_rot(uintptr_t inp, uintptr_t peer_scratch, uintptr_t my_scratch,
+                                  long slot_bytes, uintptr_t peer_flags, uintptr_t my_flags,
+                                  uintptr_t seq, int nflags, uintptr_t res, uintptr_t w,
+                                  double eps, uintptr_t t, uintptr_t cs, uintptr_t hs,
+                                  uintptr_t ro, uintptr_t a, uintptr_t asg, uintptr_t rs,
+                                  int M, int K, int P, int krot, int drain, int acq,
+                                  uintptr_t stream) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  if ((long)M * K * 2 > slot_bytes) throw std::runtime_error("ParoQuant AR: message exceeds the slot");
+  const int G = K / PQ_GROUP;
+  const int gpw = pq_rot_gpw(M);
+  const int chunks = (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw);
+  if (M * chunks > nflags) throw std::runtime_error("ParoQuant AR: M * chunks exceeds the flag array");
+  auto st = reinterpret_cast<hipStream_t>(stream);
+  hipLaunchKernelGGL(pq_ar_add_rms_rot, dim3(M, chunks, 1), dim3(PQ_ROT_WAVES * 32), 0, st,
+                     reinterpret_cast<const uint4_t *>(inp), reinterpret_cast<uint4_t *>(peer_scratch),
+                     reinterpret_cast<const uint4_t *>(my_scratch), (int)(slot_bytes / 16),
+                     reinterpret_cast<unsigned int *>(peer_flags), reinterpret_cast<unsigned int *>(my_flags),
+                     reinterpret_cast<unsigned int *>(seq), reinterpret_cast<const __bf16 *>(res),
+                     reinterpret_cast<const __bf16 *>(w), (float)eps,
+                     reinterpret_cast<const unsigned short *>(t), reinterpret_cast<const __half *>(cs),
+                     reinterpret_cast<__bf16 *>(hs), reinterpret_cast<__bf16 *>(ro),
+                     reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(asg),
+                     reinterpret_cast<float *>(rs), M, K, P, krot, gpw, drain, acq);
+}
+
 // A-tiled per-token prefill GEMM: AT [P, Mt*16, K] fragment-tiled e4m3, AS [P, M], RS [P, M, G]
 // plain row-sums. Prefill-class M only -- the decode band reads row-major A.
 static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as, uintptr_t rs,
@@ -236,6 +300,10 @@ PYBIND11_MODULE(radiance_paroquant_kernel, m) {
         "fused pairwise-rotation + channel-scale + per-group fp8 quant + row-sums (gfx1201)");
   m.def("launch_gemm", &launch_gemm,
         "ParoQuant int4 g128-asym x fp8 W4A8 GEMM with partition select (gfx1201)");
+  m.def("launch_ar_add_rms_rot", &launch_ar_add_rms_rot,
+        "two-rank one-shot all-reduce + residual add + rmsnorm + rotate + quant (decode band)");
+  m.def("launch_ew_rot", &launch_ew_rot,
+        "silu-mul / attention-gate / gdn-gated-norm producer (+ rotate + quant in the decode band)");
   m.def("launch_add_rms_rot", &launch_add_rms_rot,
         "fused residual-add + Gemma rmsnorm (+ rotate + per-group fp8 quant in the decode band)");
   m.def("launch_gemm_at", &launch_gemm_at,
