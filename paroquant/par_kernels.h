@@ -487,13 +487,18 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
   float cs[4] = {1.f, 1.f, 1.f, 1.f};
   if constexpr (ROT) pq_load_group(T, CS, p, g0 < G ? g0 : G - 1, K, krot, lane, rec, cs);
 
-  // Row pass: v = y + res (fp32), sum of squares, residual out.
+  // Row pass: v = y + res (fp32), sum of squares, residual out. The plain-norm path (prefill
+  // sizes, one block per row) keeps v in registers for the second pass so the row is read once,
+  // like inductor's fused norm; the ROT path re-reads only its own group.
   const uint4_t *__restrict__ y4 = (const uint4_t *)(Y + (size_t)m * K);
   const uint4_t *__restrict__ r4 = (const uint4_t *)(RES + (size_t)m * K);
   uint4_t *__restrict__ o4 = (uint4_t *)(RO + (size_t)m * K);
   const int KV = K >> 3;
+  constexpr int MAXG = 5;                     // 8704 / (256 * 8) rounds up to 5 (K <= 10240)
+  float sv[ROT ? 1 : MAXG][8];
   float ssq = 0.f;
-  for (int i = tid; i < KV; i += PQ_ROT_WAVES * 32) {
+  int nsv = 0;
+  for (int i = tid; i < KV; i += PQ_ROT_WAVES * 32, ++nsv) {
     const uint4_t vy = y4[i], vr = r4[i];
     uint4_t vo;
 #pragma unroll
@@ -502,6 +507,9 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
       const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
       ssq = fmaf(a0, a0, ssq);
       ssq = fmaf(a1, a1, ssq);
+      if constexpr (!ROT) {
+        if (nsv < MAXG) { sv[nsv][2 * h] = a0; sv[nsv][2 * h + 1] = a1; }
+      }
       const __bf16 b0 = (__bf16)a0, b1 = (__bf16)a1;
       vo[h] = (unsigned int)__bfloat16_as_ushort(b0) | ((unsigned int)__bfloat16_as_ushort(b1) << 16);
     }
@@ -517,16 +525,26 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
   const float inv = rsqrtf(tot / (float)K + eps);
 
   if constexpr (!ROT) {
-    for (int i = tid; i < KV; i += PQ_ROT_WAVES * 32) {
-      const uint4_t vy = y4[i], vr = r4[i];
+    int gg = 0;
+    for (int i = tid; i < KV; i += PQ_ROT_WAVES * 32, ++gg) {
       const uint4_t vw = ((const uint4_t *)Wn)[i];
       uint4_t vo;
+      float a[8];
+      if (gg < MAXG) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) a[e] = sv[gg][e];
+      } else {                                    // K > 10240: re-read (never on this model)
+        const uint4_t vy = y4[i], vr = r4[i];
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+          a[2 * h] = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+          a[2 * h + 1] = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+        }
+      }
 #pragma unroll
       for (int h = 0; h < 4; ++h) {
-        const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
-        const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
         const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
-        const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
+        const __bf16 n0 = (__bf16)((a[2 * h] * inv) * w0), n1 = (__bf16)((a[2 * h + 1] * inv) * w1);
         vo[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
       }
       ((uint4_t *)(HS + (size_t)m * K))[i] = vo;

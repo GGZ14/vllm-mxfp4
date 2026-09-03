@@ -204,3 +204,45 @@ MXFP4's tiled 215-220 -- the remaining 20% is the per-slab scale fold (a temp ac
 2 ms/step to MXFP4 is the rotation launch (192 x ~4 us kernel time; fusing it into the norm
 producers is the next lever), the GDN in_proj merge + norm-quant fusion (fp8-linear-only),
 and drafter acceptance (1.74 vs 2.07 on the same drafter).
+
+## 2026-09-02/03: rotation stream (fused add + RMSNorm + rotate + quant producers)
+
+Decode-band producer for every norm-fed linear as ONE kernel: `pq_add_rms_rot<ROT>`
+(residual add + Gemma RMSNorm in vLLM's exact op order + channel scale + rotation + per-group
+quant; one workgroup per (row, 8-group chunk, partition), records in registers, gpw=1 chain
+per wave to M=40 and 2 above). `radiance::pq_add_rms_rot` -> (hs, residual, A, ASG, RS);
+`radiance::paroquant_linear_pre` consumes the tuple in the decode band and takes the tiled
+prefill path from hs above it (the M branch stays inside the ops -- no dynamo guard).
+Patched decoder-layer forward (mirror of radiance_arnq._stream_forward) + a tuple-aware GDN
+forward_hip (in_proj_ba keeps the bf16 hidden); installed from radiance_gdnmerge.merge_model;
+`RADIANCE_PQ_ROT_STREAM=1`, cache suffix `-rs`. 64 input + 64 mid epilogues over 64 layers.
+
+Kernel (DRAM-fed `--bench2 fuse`, M/P, fused vs norm-kernel + pq_rotate_quant2 chain):
+M=1-8: 5.0-5.2 vs 8.1-9.0 us (0.59-0.63); M=16: 5.3-6.9 vs 9.7-9.9; M=40: 6.5/8.8/11.9 vs
+13.0-13.6 (P=1/2/3); M=64 (gpw 2): 7.6/11.6/15.2 vs 16.4-17.6. Gates: harness fused ==
+chain bit-exact at every M x gpw; vs CPU reference residual exact, hs <= 20 ppm; module test
+vs vLLM GemmaRMSNorm + bf16 linear: bit-identical at M<=17, hs 1-7 per M at 40-300 (ppm),
+out-rel <= 5e-4.
+
+Serve (vs the fused-GDN build of the same day): bench_decode_ctx 24.27 -> **24.03 ms/step**
+@ctx25, 25.80 -> 25.52 @8k, 26.91 -> 26.31 @32k, 28.80 -> 28.73 @103k, 32.14 -> 31.90 @206k;
+BetterBench single pass update p50 24.4-24.7 -> **24.2-24.5 ms**, combined decode 184.0 ->
+**186.0 t/s (= MXFP4 prod)**, conc 1/2/4/8/16 152/263/398/500/506 (noise-level vs before);
+**GSM8K 500q 98.00% (490/500)**, 1 truncated. KV cache profile 432k -> 479k tokens (smaller
+compiled-graph activation footprint). First cut cost prefill -1..-1.5% (3789/3723/3630/3427 ->
+3753/3671/3587/3377): the plain-norm fallthrough re-read the row for its second pass; fixed by
+carrying the row in registers (radiance_add_rms_quant's shape). Re-check below.
+
+Gap to MXFP4 prod after this: decode step 24.0 vs 22.3 (-7%), combined decode equal, conc-8
+500 vs 529 (-5%), prefill -25%. Remaining decode ledger: silu_mul -> down (48 rotations),
+GDN gated norm -> out_proj (48), attention out -> o_proj (16) still launch the standalone
+prologue; GDN in_proj merge + fp8-only norm-quant fusions; drafter acceptance 1.5-2.1.
+
+TRAP (cost an hour): the harness gate launched the fused kernel with a hard-coded gpw=1 while
+sizing the grid for 2/4, and the un-cleared ASG/RS/HS buffers from the gpw=1 pass masked the
+unwritten groups -- "codes wrong, scales right" was a harness bug, not a kernel bug. Clear
+EVERY output between variants of a gate.
+
+**Re-check after the register-carry fix (2026-09-03, BetterBench prefill+decode single pass,
+`results/paro-0902-rs2-predec.json`):** prefill 3772/3702/3687/3648/3450 @2k/8k/16k/32k/64k
+(pre-stream 3789/3723/3668/3630/3427: parity, +-0.5%); update p50 24.0-24.4 ms. Served config.
