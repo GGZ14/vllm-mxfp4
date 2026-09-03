@@ -188,12 +188,10 @@ static void launch_ar_add_rms_rot(uintptr_t inp, uintptr_t peer_scratch, uintptr
   if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
   if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
   if ((long)M * K * 2 > slot_bytes) throw std::runtime_error("ParoQuant AR: message exceeds the slot");
-  const int G = K / PQ_GROUP;
-  const int gpw = pq_rot_gpw(M);
-  const int chunks = (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw);
-  if (M * chunks > nflags) throw std::runtime_error("ParoQuant AR: M * chunks exceeds the flag array");
+  // One workgroup per row (see the kernel): the grid must stay fully resident on both ranks.
+  if (M > nflags || M > 128) throw std::runtime_error("ParoQuant AR: too many rows for the fused path");
   auto st = reinterpret_cast<hipStream_t>(stream);
-  hipLaunchKernelGGL(pq_ar_add_rms_rot, dim3(M, chunks, 1), dim3(PQ_ROT_WAVES * 32), 0, st,
+  hipLaunchKernelGGL(pq_ar_add_rms_rot, dim3(M), dim3(PQ_AR_WAVES * 32), 0, st,
                      reinterpret_cast<const uint4_t *>(inp), reinterpret_cast<uint4_t *>(peer_scratch),
                      reinterpret_cast<const uint4_t *>(my_scratch), (int)(slot_bytes / 16),
                      reinterpret_cast<unsigned int *>(peer_flags), reinterpret_cast<unsigned int *>(my_flags),
@@ -202,7 +200,7 @@ static void launch_ar_add_rms_rot(uintptr_t inp, uintptr_t peer_scratch, uintptr
                      reinterpret_cast<const unsigned short *>(t), reinterpret_cast<const __half *>(cs),
                      reinterpret_cast<__bf16 *>(hs), reinterpret_cast<__bf16 *>(ro),
                      reinterpret_cast<unsigned char *>(a), reinterpret_cast<float *>(asg),
-                     reinterpret_cast<float *>(rs), M, K, P, krot, gpw, drain, acq);
+                     reinterpret_cast<float *>(rs), M, K, P, krot, drain, acq);
 }
 
 // A-tiled per-token prefill GEMM: AT [P, Mt*16, K] fragment-tiled e4m3, AS [P, M], RS [P, M, G]

@@ -424,6 +424,10 @@ def _gdn_norm_ok(la) -> str | None:
 # Own IPC scratch/flags/counters (not the plain AR's -- slot parity must alternate per launch of
 # THIS kernel family). The last layer keeps the stock contract (model.norm / drafter inputs).
 ROT_STREAM3 = ROT_STREAM and os.environ.get("RADIANCE_PQ_ROT_STREAM3", "0") == "1"
+AR_CHECK = int(os.environ.get("RADIANCE_PQ_AR_CHECK", "0"))
+# Debug: keep the reduce-later contract but take the unfused path (vLLM AR + plain kernel)
+# inside pq_ar_add_rms_rot -- separates a kernel/protocol fault from a contract fault.
+AR_FALLBACK = os.environ.get("RADIANCE_PQ_AR_FALLBACK", "0") == "1"
 _AR = {"ok": False}
 
 
@@ -485,7 +489,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
     asg = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
     rs = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
     stream = torch.cuda.current_stream().cuda_stream
-    if M <= DECODE_MAX_M and _AR["ok"] and M * K * 2 <= _AR["slot_bytes"]:
+    if M <= DECODE_MAX_M and _AR["ok"] and M * K * 2 <= _AR["slot_bytes"] and not AR_FALLBACK:
         _ext.launch_ar_add_rms_rot(y2.data_ptr(), _AR["peer_scratch"], _AR["scratch"],
                                    _AR["slot_bytes"], _AR["peer_flags"], _AR["flags"],
                                    _AR["seq"].data_ptr(), _AR["nflags"], res.data_ptr(),
@@ -493,6 +497,25 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
                                    hs.data_ptr(), ro.data_ptr(), a.data_ptr(), asg.data_ptr(),
                                    rs.data_ptr(), M, K, P, rec.shape[1], _AR["drain"], _AR["acq"],
                                    stream)
+        if AR_CHECK and _AR.get("checks", 0) < AR_CHECK:
+            # RADIANCE_PQ_AR_CHECK=N: for the first N decode-band calls also run the unfused
+            # path (vLLM all-reduce + plain kernel) on the same inputs and report the divergence
+            # per output. Eager only (the compare syncs) -- use with --enforce-eager.
+            _AR["checks"] = _AR.get("checks", 0) + 1
+            from vllm.distributed import tensor_model_parallel_all_reduce as _tpar
+            yr = _tpar(y2).contiguous()
+            hs2 = torch.empty_like(hs); ro2 = torch.empty_like(ro); a2 = torch.empty_like(a)
+            asg2 = torch.empty_like(asg); rs2 = torch.empty_like(rs)
+            _ext.launch_add_rms_rot(yr.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+                                    rec.data_ptr(), cs.data_ptr(), hs2.data_ptr(), ro2.data_ptr(),
+                                    a2.data_ptr(), asg2.data_ptr(), rs2.data_ptr(), M, K, P,
+                                    rec.shape[1], 1, stream)
+            torch.cuda.synchronize()
+            rows_bad = int((ro != ro2).view(M, -1).any(dim=1).sum())
+            sys.stderr.write(f"[radiance.paroquant] AR_CHECK call {_AR['checks']} M={M} K={K} P={P}: "
+                             f"ro diff elems {int((ro != ro2).sum())} (rows {rows_bad}/{M}), "
+                             f"hs diff {int((hs != hs2).sum())}, codes diff {int((a != a2).sum())}, "
+                             f"asg maxrel {float(((asg - asg2).abs() / asg2.abs().clamp_min(1e-12)).max()):.2e}\n")
         return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
     from vllm.distributed import tensor_model_parallel_all_reduce as _tpar
     yr = _tpar(y2).contiguous()
@@ -609,11 +632,15 @@ def install_stream(model) -> None:
     n_in = n_mid = n_gdn = n_act = n_gnq = n_attn = n_ar = 0
     ar_ok = ROT_STREAM3 and _ar_setup(next(model.parameters()).device)
     L = len(core.layers)
-    for i, layer in enumerate(core.layers):
+    # Flags are initialised in a pre-pass: layer i's iteration grants layer i+1's `_pq_ar_in`
+    # (its down_proj goes partial), so the per-layer init must not run after that grant --
+    # it did once, and every layer but the last normalised an un-reduced partial.
+    for layer in core.layers:
         layer._pq_rot_in = None
         layer._pq_rot_mid = None
         layer._pq_ar_in = False
         layer._pq_ar_mid = False
+    for i, layer in enumerate(core.layers):
         if getattr(layer, "layer_scale", False) or getattr(layer, "use_attn_reduce_scatter_for_moe", False):
             sys.stderr.write(f"[radiance.paroquant] rot stream: layer {i} layer_scale/SP, stock\n")
             continue

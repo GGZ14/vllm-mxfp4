@@ -318,3 +318,33 @@ Serve (unit: SPEC=7 + stream 2, same day, vs SPEC=5 + stream 1):
   prefill 3782/3700/3725/3621/3450 @2k-64k (unchanged); KV cache profile 479k -> **622k tokens**
   (fewer intermediates in the compiled graph).
 - GSM8K 500q: **97.40%** (487/500), 1 truncated.
+
+## 2026-09-03: rotation stream 3 (two-rank all-reduce fused into the norm+rotate producer) -- REJECTED
+
+`pq_ar_add_rms_rot`: the r4d one-shot P2P push/flag/reduce protocol with the fused norm +
+rotate + quant epilogue, own IPC scratch/flags/counters. Three designs on the way:
+1. (row, chunk, partition) grid with gpw keyed on M: DEADLOCK at capture size 12 -- the peer-flag
+   wait compares the peer's per-slice sequence numbers against this workgroup's own, which only
+   works when every slice index of a row has the same launch history; a mapping that changes with
+   M breaks that.
+2. (row, chunk) grid with a fixed mapping: DEADLOCK at capture size 8 -- the grid outgrew
+   residency and resident workgroups spun on peer slices whose pushers were never scheduled (the
+   classic spin-wait deadlock; r4d's kernels are one block per row for exactly this reason).
+3. One 512-thread workgroup per row, 16 waves splitting the groups and looping the partitions:
+   correct (single-rank loopback bit-exact vs pq_add_rms_rot at M=1/5/40, reduction-order ulps
+   at 64; in-serve AR_CHECK: fused == vLLM AR + plain kernel on every call, both ranks; GSM8K
+   97.40%; sanity prompts identical) but SLOWER: 25.10 ms/step ctx0 vs 24.19 with stream 2,
+   26.79 vs 25.74 @8k, update p50 25.4-25.7 vs 24.3-24.7, combined 202 vs 226 t/s, conc-8 506
+   vs 512. +7 us per site: with one workgroup per row the rotation chains (2-3 groups x up to 3
+   partitions per wave) serialize on one CU, and the push uses M CUs instead of r4d's 24 blocks.
+   The MXFP4 exact_nq wins with the same structure because its epilogue has no rotation.
+   Restoring the parallelism means either the deadlock risk of design 2 or a two-launch split
+   (push kernel + wait/rotate kernel), which gives back the launch saving that was the point.
+Also found on the way: an installer bug (the per-layer flag init ran AFTER the previous
+iteration granted the next layer's fused-input flag, so every layer but the last normalised an
+un-reduced partial -- semi-coherent, looping output, bit-identical fused/unfused checks). Fixed;
+the pattern (initialise all flags in a pre-pass) is worth remembering.
+`RADIANCE_PQ_ROT_STREAM3` stays default 0; kernel, launcher, op, check mode (`RADIANCE_PQ_AR_CHECK`)
+and fallback (`RADIANCE_PQ_AR_FALLBACK`) remain in the tree, dark.
+
+**Served config after today:** SPEC=7, stream 1 + 2 on, stream 3 off, cache `-fu-rs-rs2`.

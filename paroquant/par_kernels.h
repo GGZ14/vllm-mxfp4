@@ -1587,19 +1587,19 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ew_rot(
 // The r4d_ar_oneshot_2rank_exact protocol (radiance extras, libr4d) with pq_add_rms_rot's body
 // as the epilogue: a decoder layer's post-all-reduce chain (AR -> add -> norm -> rotate -> quant)
 // in one launch per site, the Paro analog of the MXFP4 fp8 stream's exact_nq kernel. Protocol,
-// copied: each rank PUSHES its input slice into the peer's IPC scratch (double-buffered by
-// seq & 1), publishes a per-slice flag with a system-scope release, spins on its own flags, then
+// copied: each rank PUSHES its input row into the peer's IPC scratch (double-buffered by seq &
+// 1), publishes a per-row flag with a system-scope release, spins on its own row's flag, then
 // reduces local input + peer data (now in local scratch) rounded to bf16 exactly as the plain
 // kernel does, so both ranks see the identical reduced row.
 //
-// ONE workgroup per (row, chunk) owns slice f = row * chunks + chunk: it pushes it, publishes
-// flag f, waits for all of the row's slices, reads the whole row from local fine-grained memory
-// for the variance, then loops over the consumer's partitions (P <= 3 rotation chains per wave).
-// This kernel family gets its OWN scratch/flags/counters (not the plain AR's): every launch
-// increments every used counter exactly once, so slot parity alternates per launch and a slice
-// is never overwritten while the peer may still read it. Both ranks issue identical launch
-// sequences (SPMD, grids included), so the counters stay in rank lockstep. Caller checks
-// M * chunks <= the flag array and M * K * 2 <= the slot size.
+// ONE 512-thread workgroup per row, exactly like exact_nq, and for the same reason: a
+// workgroup must never spin on work that belongs to a workgroup of the SAME launch that may not
+// be resident yet. (A (row, chunk) grid deadlocked at capture time once the grid outgrew the
+// GPU.) With M <= 128 rows the grid is always fully resident on both ranks, each row's flag is
+// set by the peer's own row-workgroup before it waits, and the per-row seq counters see the
+// same launch history on both ranks (row m is in every launch with M > m). The 16 waves split
+// the groups (G=40: waves 0-7 take 3, 8-15 take 2) and loop the consumer's partitions.
+// This kernel family gets its OWN scratch/flags/counters, so slot parity alternates per launch.
 __device__ __forceinline__ void pq_store_sys_rel(unsigned int *p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
@@ -1607,8 +1607,9 @@ __device__ __forceinline__ unsigned int pq_load_sys_acq(const unsigned int *p) {
   return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 #define PQ_AR_SPIN_MAX 4000000000ULL
+#define PQ_AR_WAVES 16
 
-__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ar_add_rms_rot(
+__global__ __launch_bounds__(PQ_AR_WAVES * 32) void pq_ar_add_rms_rot(
     const uint4_t *__restrict__ in4,        // my partial [M, K] bf16 as 16 B words
     uint4_t *peer_base, const uint4_t *my_base, int slot_stride16,
     unsigned int *peer_flags, unsigned int *my_flags, unsigned int *seq_ctrs,
@@ -1616,49 +1617,42 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ar_add_rms_rot(
     const unsigned short *__restrict__ T, const __half *__restrict__ CS,
     __bf16 *__restrict__ HS, __bf16 *__restrict__ RO,
     unsigned char *__restrict__ A, float *__restrict__ ASG, float *__restrict__ RS,
-    int M, int K, int P, int krot, int gpw, int drain, int acq) {
-  const int m = blockIdx.x, chunk = blockIdx.y;
-  const int nchunks = gridDim.y;
+    int M, int K, int P, int krot, int drain, int acq) {
+  constexpr int NT = PQ_AR_WAVES * 32;
+  const int m = blockIdx.x;
   const int G = K / PQ_GROUP;
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-  const int g0 = (chunk * gpw) * PQ_ROT_WAVES + wave;
-  int ng = 0;
-  for (int gi = 0; gi < gpw; ++gi) ng += (g0 + gi * PQ_ROT_WAVES < G) ? 1 : 0;
-  __shared__ float s_red[PQ_ROT_WAVES];
-  __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
+  __shared__ float s_red[PQ_AR_WAVES];
+  __shared__ float s_x[PQ_AR_WAVES][PQ_GROUP];
   __shared__ unsigned int s_seq;
   const int c0 = lane * 4;
 
   const int K16 = K / 8;
-  const int cw = (K16 + nchunks - 1) / nchunks;
-  const int f = m * nchunks + chunk;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[f], 1u) + 1u;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[m], 1u) + 1u;
   __syncthreads();
   const unsigned int sq = s_seq;
   const int slot = (int)(sq & 1u);
   uint4_t *ps = peer_base + (size_t)slot * slot_stride16;
   const uint4_t *ms = my_base + (size_t)slot * slot_stride16;
-  const int ws = m * K16 + chunk * cw;
-  int we = ws + cw; if (we > (m + 1) * K16) we = (m + 1) * K16;
-  for (int k = ws + tid; k < we; k += PQ_ROT_WAVES * 32) ps[k] = in4[k];
+  const int ws = m * K16, we = ws + K16;
+  for (int k = ws + tid; k < we; k += NT) ps[k] = in4[k];
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
-    pq_store_sys_rel(&peer_flags[f], sq);
-  }
-  if (tid < nchunks) {
+    pq_store_sys_rel(&peer_flags[m], sq);
     unsigned long long z = 0;
-    while (pq_load_sys_acq(&my_flags[m * nchunks + tid]) < sq) { if (++z > PQ_AR_SPIN_MAX) break; }
+    while (pq_load_sys_acq(&my_flags[m]) < sq) { if (++z > PQ_AR_SPIN_MAX) break; }
   }
   __syncthreads();
   if (acq) __threadfence_system();
 
+  // reduce the row (bf16, like the plain kernel) + residual add + variance
   const uint4_t *__restrict__ r4 = (const uint4_t *)(RES + (size_t)m * K);
   uint4_t *__restrict__ o4 = (uint4_t *)(RO + (size_t)m * K);
   float ssq = 0.f;
-  for (int i = tid; i < K16; i += PQ_ROT_WAVES * 32) {
+  for (int i = tid; i < K16; i += NT) {
     const uint4_t vy = in4[(size_t)m * K16 + i], vp = ms[(size_t)m * K16 + i], vr = r4[i];
     uint4_t vo;
 #pragma unroll
@@ -1672,7 +1666,7 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ar_add_rms_rot(
       const __bf16 b0 = (__bf16)a0, b1 = (__bf16)a1;
       vo[h] = (unsigned int)__bfloat16_as_ushort(b0) | ((unsigned int)__bfloat16_as_ushort(b1) << 16);
     }
-    if (chunk == 0) o4[i] = vo;
+    o4[i] = vo;
   }
 #pragma unroll
   for (int off = 16; off >= 1; off >>= 1) ssq += __shfl_xor(ssq, off, 32);
@@ -1680,35 +1674,34 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ar_add_rms_rot(
   __syncthreads();
   float tot = 0.f;
 #pragma unroll
-  for (int w = 0; w < PQ_ROT_WAVES; ++w) tot += s_red[w];
+  for (int w = 0; w < PQ_AR_WAVES; ++w) tot += s_red[w];
   const float inv = rsqrtf(tot / (float)K + eps);
 
   unsigned long long rec[PQ_KROT_MAX][2];
   float cs[4];
-  for (int p = 0; p < P; ++p) {
-    for (int gi = 0; gi < ng; ++gi) {
-      const int g = g0 + gi * PQ_ROT_WAVES;
-      pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
-      const int kb = g * PQ_GROUP + c0;
-      const uint2_t vy = *(const uint2_t *)((const __bf16 *)in4 + (size_t)m * K + kb);
-      const uint2_t vp = *(const uint2_t *)((const __bf16 *)ms + (size_t)m * K + kb);
-      const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
-      const uint2_t vw = *(const uint2_t *)(Wn + kb);
-      float nv[4];
-      unsigned int hsw[2];
+  for (int g = wave; g < G; g += PQ_AR_WAVES) {
+    const int kb = g * PQ_GROUP + c0;
+    const uint2_t vy = *(const uint2_t *)((const __bf16 *)in4 + (size_t)m * K + kb);
+    const uint2_t vp = *(const uint2_t *)((const __bf16 *)ms + (size_t)m * K + kb);
+    const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
+    const uint2_t vw = *(const uint2_t *)(Wn + kb);
+    float nv[4];
+    unsigned int hsw[2];
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const float y0 = (float)(__bf16)(__uint_as_float(vy[h] << 16) + __uint_as_float(vp[h] << 16));
-        const float y1 = (float)(__bf16)(__uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vp[h] & 0xFFFF0000u));
-        const float a0 = y0 + __uint_as_float(vr[h] << 16);
-        const float a1 = y1 + __uint_as_float(vr[h] & 0xFFFF0000u);
-        const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
-        const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
-        nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
-        hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
-      }
-      if (p == 0) *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
+    for (int h = 0; h < 2; ++h) {
+      const float y0 = (float)(__bf16)(__uint_as_float(vy[h] << 16) + __uint_as_float(vp[h] << 16));
+      const float y1 = (float)(__bf16)(__uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vp[h] & 0xFFFF0000u));
+      const float a0 = y0 + __uint_as_float(vr[h] << 16);
+      const float a1 = y1 + __uint_as_float(vr[h] & 0xFFFF0000u);
+      const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
+      const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
+      nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
+      hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
+    }
+    *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
 
+    for (int p = 0; p < P; ++p) {
+      pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
       float v0 = nv[0] * cs[0], v1 = nv[1] * cs[1], v2 = nv[2] * cs[2], v3 = nv[3] * cs[3];
       s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
       s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
