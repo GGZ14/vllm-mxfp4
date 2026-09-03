@@ -169,6 +169,14 @@ def merge_model(model) -> None:
         radiance_gdn.init_fused_counter()           # before any CUDA-graph capture
     except Exception as e:                          # noqa: BLE001
         _log(f"gdn fused counter init failed: {e!r}")
+    # ParoQuant rotation stream (radiance_paroquant.install_stream, env-gated inside); only
+    # probed on a paroquant serve so the mxfp4 serve never imports the module.
+    if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
+        try:
+            import radiance_paroquant
+            radiance_paroquant.install_stream(model)
+        except Exception as e:                      # noqa: BLE001
+            _log(f"paroquant rot stream install failed, serving without it: {e!r}")
     # fp8-stream epilogue contract (env-gated inside). AFTER _merge_one has run on every GDN
     # module would be ideal, but install only reads _rad_merged which _merge_one sets -- so it
     # must run at the END of merge_model; see the deferred call below.

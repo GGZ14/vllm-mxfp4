@@ -63,6 +63,23 @@ _FUSED_UPDATE = _bind("gdn_fused_update", conv_width=CONV_WIDTH, head_k=HEAD_K, 
 # boundary per GDN layer per forward. Bit-identical to the pair by construction. Off by default
 # until the serving A/B has run; needs a build whose registry has gdn_fused_update.
 FUSED_UPDATE_ON = os.environ.get("RADIANCE_GDN_FUSED_UPDATE", "0") == "1" and _FUSED_UPDATE is not None
+# (seq, v-head) items above which the decode step takes the conv+recurrent PAIR instead of the
+# fused kernel; 32 = the fused kernel's FU_MAXWG, i.e. one sequence at H=24. Env-tunable for A/B.
+FUSED_MAX_ITEMS = int(os.environ.get("RADIANCE_GDN_FUSED_MAX_ITEMS", "32"))
+# patch_gdn_glue.py reads this: skip vLLM's .contiguous() on the (b, a) gate slices; the R4D
+# kernels take the row stride. Default 0 until the serving A/B lands.
+STRIDED_GATES = os.environ.get("RADIANCE_GDN_STRIDED_GATES", "0") == "1"
+# patch_gdn_glue.py reads this: allocate core_attn_out with torch.empty instead of torch.zeros.
+# Safe ONLY because the rx5 fused_update kernel zeroes the cudagraph pad rows [cu[N], o_rows)
+# itself (vLLM PR 28182 is why the fill exists), and the non-fused paths below zero the tail in
+# Python. Default 0 until the serving A/B lands.
+EMPTY_OUT = os.environ.get("RADIANCE_GDN_EMPTY_OUT", "0") == "1"
+
+
+def _zero_tail(core_attn_out, T):
+    """Pad rows [T, num_tokens) of the padded batch buffer, for paths that do not write them."""
+    if EMPTY_OUT and T < core_attn_out.shape[0]:
+        core_attn_out[T:].zero_()
 # The barrier counter must exist BEFORE any CUDA-graph capture replays the kernel, and must NOT
 # be allocated at import -- that grabs a CUDA context before vLLM sets the device and breaks its
 # memory snapshot (the split-K decode scratch learned the same lesson; it allocates at weight
@@ -322,8 +339,10 @@ def conv_update(x, conv_w, conv_bias, conv_state, state_len_max, cache_idx, num_
 
 def fused_update(x, conv_w, conv_bias, conv_state, state_len_max, cache_idx, num_accepted,
                  cu, num_seqs, T, H, Hg, max_query_len, a, b, A_log, dt_bias, ssm_state, o,
-                 sidx, scale):
-    """conv_update + recurrent_update as one launch. Arguments are the union of the pair's."""
+                 sidx, scale, o_rows):
+    """conv_update + recurrent_update as one launch. Arguments are the union of the pair's.
+    o_rows is the PADDED row count of the buffer o lives in (core_attn_out.shape[0]): the kernel
+    zeroes rows [cu[num_seqs], o_rows) so the caller may allocate that buffer uninitialized."""
     dev, dt = x.device, torch.bfloat16
     q = torch.empty((T, Hg, HEAD_K), device=dev, dtype=dt)
     k = torch.empty((T, Hg, HEAD_K), device=dev, dtype=dt)
@@ -340,7 +359,7 @@ def fused_update(x, conv_w, conv_bias, conv_state, state_len_max, cache_idx, num
         A_log.data_ptr(), dt_bias.data_ptr(),
         ssm_state.data_ptr(), ssm_state.stride(0), ssm_state.stride(1),
         o.data_ptr(), sidx.data_ptr(), sidx.stride(0),
-        float(scale), SOFTPLUS_THRESHOLD, _FUSED_CNT.data_ptr(), _stream())
+        float(scale), SOFTPLUS_THRESHOLD, _FUSED_CNT.data_ptr(), int(o_rows), _stream())
 
 
 def kkt_solve(k, beta, g, cu, num_seqs, T, H, Hg):
@@ -465,11 +484,20 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         maxq = sidx.size(-1)
         cu = md.spec_query_start_loc[: nseq + 1]
         o = core_attn_out[:T].view(T, H, HEAD_V)
-        if FUSED_UPDATE_ON:
+        # The fused kernel's resident grid is capped at 32 workgroups (deadlock-free barrier), so
+        # past one sequence it work-loops nseq*H (seq, head) items over 32 WGs while the pair's
+        # recurrent kernel launches one WG per item. Microbench 2026-09-02 (gdn_decode_bench.py,
+        # one state slot per candidate): N=1 fused 32.0 / pair 26.6 us at T=8 -- but in the serve
+        # the fused step measured -0.4% (its barrier hides one launch gap); N=2 40.2 / 31.2,
+        # N=4 60.1 / 45.8, N=8 89.8 / 72.9 us. So: fused for a single sequence, the pair beyond.
+        # Serve-level (2026-09-02): conc-4 32.8-33.4 -> 31.7-33.0, conc-8 43.0-45.2 -> 43.3-47.3
+        # ms/step, single-stream unchanged -- neutral, because at conc-8 the step is paced by the
+        # serial CPU/IPC chain, not the GPU. Kept: less GPU time for the same step.
+        if FUSED_UPDATE_ON and nseq * H <= FUSED_MAX_ITEMS:
             fused_update(mixed_qkv, conv_w, self.conv1d.bias, conv_state,
                          (4 - 1) + (maxq - 1), sidx[:, 0][:nseq], md.num_accepted_tokens,
                          cu, nseq, T, H, Hg, maxq, a, b, A_log, dt_bias, ssm_state, o, sidx,
-                         HEAD_K ** -0.5)
+                         HEAD_K ** -0.5, core_attn_out.shape[0])
             _first("decode(fused)")
             return True
         q, k, v = conv_update(mixed_qkv, conv_w, self.conv1d.bias, conv_state,
@@ -478,6 +506,7 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         _first("decode")
         recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx,
                          md.num_accepted_tokens, nseq, H, Hg, HEAD_K ** -0.5)
+        _zero_tail(core_attn_out, T)
         return True
 
     # ---- chunked prefill, with or without a spec group riding along --------------------------
@@ -532,4 +561,5 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         dst = core_attn_out[:T]
         dst.index_copy_(0, md.spec_token_indx, spec_o)
         dst.index_copy_(0, md.non_spec_token_indx, o_buf.squeeze(0))
+    _zero_tail(core_attn_out, T)
     return True
