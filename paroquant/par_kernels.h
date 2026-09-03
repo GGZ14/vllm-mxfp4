@@ -1292,6 +1292,9 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
             *(const __half2 *)(SZ + (((size_t)g * N + (ncol[j] < N ? ncol[j] : N - 1)) * 2));
         sc[j] = __half2float(szv.x);
         zsc[j] = __half2float(szv.y);
+        // NB: the compiler feeds these f16 values straight into v_fma_mix_f32 for the fold (128
+        // per slab, no VOPD pairing). Pinning them as fp32 (asm "+v") gets 31 v_dual_fmac pairs
+        // and is 3.5-4% SLOWER on every shape (measured 2026-09-03) -- leave the mix form.
       }
       const int r = tid;
       const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
