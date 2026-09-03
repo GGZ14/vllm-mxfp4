@@ -443,6 +443,39 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
     }
   }
 
+  if (what == "fuse" || what == "all") {
+    // fused add+rms+rot vs (plain norm kernel + rotate_quant2) vs rotate_quant2 alone
+    for (const int M : {1, 5, 8, 16, 40, 64}) {
+      for (const int P : {1, 2, 3}) {
+        const int K = 5120, krot = 8, G = K / PQ_GROUP;
+        unsigned short *dY, *dR, *dW, *dT, *dHS, *dRO; __half *dCS; unsigned char *dA; float *dASG, *dRS;
+        HIP_CHECK(hipMalloc(&dY, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dR, (size_t)M * K * 2));
+        HIP_CHECK(hipMalloc(&dW, (size_t)K * 2)); HIP_CHECK(hipMalloc(&dT, (size_t)P * krot * (K / 2) * 8));
+        HIP_CHECK(hipMalloc(&dCS, (size_t)P * K * 2)); HIP_CHECK(hipMalloc(&dHS, (size_t)M * K * 2));
+        HIP_CHECK(hipMalloc(&dRO, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dA, (size_t)P * M * K));
+        HIP_CHECK(hipMalloc(&dASG, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)P * M * G * 4));
+        HIP_CHECK(hipMemset(dY, 0x3C, (size_t)M * K * 2)); HIP_CHECK(hipMemset(dR, 0x3C, (size_t)M * K * 2));
+        HIP_CHECK(hipMemset(dW, 0, (size_t)K * 2)); HIP_CHECK(hipMemset(dT, 0, (size_t)P * krot * (K / 2) * 8));
+        HIP_CHECK(hipMemset(dCS, 0x3C, (size_t)P * K * 2));
+        const dim3 blk(PQ_ROT_WAVES * 32);
+        const int iters = 200;
+        double tf[3] = {1e30, 1e30, 1e30}, tn = 1e30, tr = 1e30;
+        const int gpws[3] = {1, 2, 4};
+        for (int rep = 0; rep < REPS; ++rep) {
+          for (int gi = 0; gi < 3; ++gi) {
+            const int gpw = gpws[gi];
+            tf[gi] = std::min(tf[gi], time_us([&](int) { hipLaunchKernelGGL(pq_add_rms_rot<true>, dim3(M, (G + 8 * gpw - 1) / (8 * gpw), P), blk, 0, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS, (__bf16 *)dRO, dA, dASG, dRS, M, K, krot, gpw); }, iters, e0, e1));
+          }
+          tn = std::min(tn, time_us([&](int) { hipLaunchKernelGGL(pq_add_rms_rot<false>, dim3(M, 1, 1), blk, 0, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS, (__bf16 *)dRO, dA, dASG, dRS, M, K, krot, 1); }, iters, e0, e1));
+          tr = std::min(tr, time_us([&](int) { hipLaunchKernelGGL(pq_rotate_quant2<false>, dim3(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P), blk, 0, 0, (const __bf16 *)dHS, dT, dCS, dA, dASG, dRS, M, K, krot); }, iters, e0, e1));
+        }
+        printf("fuse    M=%-3d P=%d  fused gpw1 %7.2f gpw2 %7.2f gpw4 %7.2f us   norm-only %7.2f + rotquant2 %7.2f = %7.2f   (best %.3f)\n",
+               M, P, tf[0], tf[1], tf[2], tn, tr, tn + tr, std::min(tf[0], std::min(tf[1], tf[2])) / (tn + tr));
+        hipFree(dY); hipFree(dR); hipFree(dW); hipFree(dT); hipFree(dCS); hipFree(dHS); hipFree(dRO); hipFree(dA); hipFree(dASG); hipFree(dRS);
+      }
+    }
+  }
+
   if (what == "passc" || what == "all") {
     for (const int M : {64, 2048, 8192}) {
       for (const int P : {1, 2, 3}) {
@@ -1069,6 +1102,122 @@ int main(int argc, char **argv) {
     }
     hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dXR); hipFree(dA);
     hipFree(dASG); hipFree(dAS); hipFree(dRS);
+  }
+
+  // ---------------- 2c. fused add + rmsnorm + rotate + quant ----------------
+  for (const int M : {1, 5, 8, 40, 64}) {
+    const int K = 5120, P = 2, krot = 8, G = K / PQ_GROUP;
+    std::uniform_real_distribution<float> uang(-1.5f, 1.5f);
+    std::normal_distribution<float> gauss(0.f, 1.f);
+    std::uniform_real_distribution<float> ucs(0.5f, 2.f);
+    std::vector<unsigned short> T((size_t)P * krot * (K / 2) * 4, 0);
+    for (int p = 0; p < P; ++p)
+      for (int r = 0; r < krot; ++r)
+        for (int g = 0; g < G; ++g) {
+          std::vector<int> perm(PQ_GROUP);
+          for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i;
+          std::shuffle(perm.begin(), perm.end(), rng);
+          for (int t = 0; t < 64; ++t) {
+            const int i = perm[2 * t], j = perm[2 * t + 1];
+            const float th = uang(rng);
+            unsigned short *rec = &T[(((size_t)p * krot + r) * (K / 2) + (size_t)g * 64 + t) * 4];
+            rec[0] = (unsigned short)(i | (j << 8));
+            const __half c = __float2half(cosf(th)), sh_ = __float2half(sinf(th));
+            memcpy(rec + 1, &c, 2); memcpy(rec + 2, &sh_, 2);
+          }
+        }
+    std::vector<__half> CS((size_t)P * K);
+    for (auto &vv : CS) vv = __float2half(ucs(rng));
+    auto rbf = [&](float f) { unsigned int w; memcpy(&w, &f, 4); return (unsigned short)(w >> 16); };
+    std::vector<unsigned short> Yh((size_t)M * K), Rh((size_t)M * K), Wh(K);
+    for (auto &vv : Yh) vv = rbf(gauss(rng));
+    for (auto &vv : Rh) vv = rbf(gauss(rng) * 3.f);
+    for (auto &vv : Wh) vv = rbf(gauss(rng) * 0.1f);
+    const float eps = 1e-6f;
+    // CPU reference of the norm (torch op order): v fp32, res bf16(v), var = mean(v^2),
+    // hs = bf16((v*rsqrt(var+eps))*(w+1)).
+    std::vector<unsigned short> refRO((size_t)M * K), refHS((size_t)M * K);
+    for (int m = 0; m < M; ++m) {
+      std::vector<float> v(K);
+      double ssq = 0;
+      for (int k = 0; k < K; ++k) {
+        v[k] = bf16_to_f(Yh[(size_t)m * K + k]) + bf16_to_f(Rh[(size_t)m * K + k]);
+        ssq += (double)v[k] * v[k];
+      }
+      const float inv = 1.f / sqrtf((float)(ssq / K) + eps);
+      for (int k = 0; k < K; ++k) {
+        unsigned int w; float f = v[k]; memcpy(&w, &f, 4);
+        // bf16 RNE
+        unsigned int lsb = (w >> 16) & 1u; w += 0x7FFFu + lsb; refRO[(size_t)m * K + k] = (unsigned short)(w >> 16);
+        float hs = (v[k] * inv) * (bf16_to_f(Wh[k]) + 1.f);
+        memcpy(&w, &hs, 4); lsb = (w >> 16) & 1u; w += 0x7FFFu + lsb; refHS[(size_t)m * K + k] = (unsigned short)(w >> 16);
+      }
+    }
+    unsigned short *dY, *dR, *dW, *dT, *dHS, *dRO, *dHS2, *dRO2;
+    __half *dCS; unsigned char *dA, *dA2; float *dASG, *dRS, *dASG2, *dRS2;
+    HIP_CHECK(hipMalloc(&dY, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dR, (size_t)M * K * 2));
+    HIP_CHECK(hipMalloc(&dW, (size_t)K * 2)); HIP_CHECK(hipMalloc(&dT, T.size() * 2));
+    HIP_CHECK(hipMalloc(&dCS, CS.size() * 2));
+    HIP_CHECK(hipMalloc(&dHS, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dRO, (size_t)M * K * 2));
+    HIP_CHECK(hipMalloc(&dHS2, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dRO2, (size_t)M * K * 2));
+    HIP_CHECK(hipMalloc(&dA, (size_t)P * M * K)); HIP_CHECK(hipMalloc(&dA2, (size_t)P * M * K));
+    HIP_CHECK(hipMalloc(&dASG, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)P * M * G * 4));
+    HIP_CHECK(hipMalloc(&dASG2, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS2, (size_t)P * M * G * 4));
+    HIP_CHECK(hipMemcpy(dY, Yh.data(), Yh.size() * 2, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dR, Rh.data(), Rh.size() * 2, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dW, Wh.data(), Wh.size() * 2, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dT, T.data(), T.size() * 2, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dCS, CS.data(), CS.size() * 2, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemset(dHS, 0, (size_t)M * K * 2)); HIP_CHECK(hipMemset(dRO, 0, (size_t)M * K * 2));
+    // fused
+    // gate every gpw the launcher can pick (1, 2, 4) -- the grid.y changes with it
+    for (const int gpw : {1, 2, 4}) {
+    HIP_CHECK(hipMemset(dA, 0, (size_t)P * M * K));
+    hipLaunchKernelGGL(pq_add_rms_rot<true>, dim3(M, (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw), P),
+                       dim3(PQ_ROT_WAVES * 32), 0, 0, (const __bf16 *)dY, (const __bf16 *)dR,
+                       (const __bf16 *)dW, eps, dT, dCS, (__bf16 *)dHS, (__bf16 *)dRO, dA, dASG,
+                       dRS, M, K, krot, 1);
+    // reference chain on GPU: plain norm kernel + rotate_quant2
+    hipLaunchKernelGGL(pq_add_rms_rot<false>, dim3(M, 1, 1), dim3(PQ_ROT_WAVES * 32), 0, 0,
+                       (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, eps, dT, dCS,
+                       (__bf16 *)dHS2, (__bf16 *)dRO2, dA2, dASG2, dRS2, M, K, krot, 1);
+    hipLaunchKernelGGL(pq_rotate_quant2<false>, dim3(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P),
+                       dim3(PQ_ROT_WAVES * 32), 0, 0, (const __bf16 *)dHS2, dT, dCS, dA2, dASG2,
+                       dRS2, M, K, krot);
+    HIP_CHECK(hipDeviceSynchronize());
+    std::vector<unsigned short> hHS((size_t)M * K), hRO((size_t)M * K), hHS2((size_t)M * K), hRO2((size_t)M * K);
+    std::vector<unsigned char> hA((size_t)P * M * K), hA2((size_t)P * M * K);
+    std::vector<float> hASG((size_t)P * M * G), hRS((size_t)P * M * G), hASG2((size_t)P * M * G), hRS2((size_t)P * M * G);
+    HIP_CHECK(hipMemcpy(hHS.data(), dHS, hHS.size() * 2, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hRO.data(), dRO, hRO.size() * 2, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hHS2.data(), dHS2, hHS2.size() * 2, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hRO2.data(), dRO2, hRO2.size() * 2, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hA.data(), dA, hA.size(), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hA2.data(), dA2, hA2.size(), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hASG.data(), dASG, hASG.size() * 4, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hASG2.data(), dASG2, hASG2.size() * 4, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hRS.data(), dRS, hRS.size() * 4, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hRS2.data(), dRS2, hRS2.size() * 4, hipMemcpyDeviceToHost));
+    size_t dro = 0, dhs = 0, dro_ref = 0, dhs_ref = 0, da = 0, dsc = 0;
+    for (size_t i = 0; i < hHS.size(); ++i) {
+      if (hHS[i] != hHS2[i]) ++dhs;
+      if (hRO[i] != hRO2[i]) ++dro;
+      if (hHS[i] != refHS[i]) ++dhs_ref;
+      if (hRO[i] != refRO[i]) ++dro_ref;
+    }
+    for (size_t i = 0; i < hA.size(); ++i) if (hA[i] != hA2[i]) ++da;
+    for (size_t i = 0; i < hASG.size(); ++i) if (memcmp(&hASG[i], &hASG2[i], 4) || memcmp(&hRS[i], &hRS2[i], 4)) ++dsc;
+    // fused == plain-norm + rotate_quant2 must be bit-exact; vs the CPU reference the residual
+    // is exact and hs may differ by an ulp flip a few times per million (reduction order).
+    const bool pass = dro == 0 && dhs == 0 && da == 0 && dsc == 0 && dro_ref == 0 &&
+                      dhs_ref <= std::max<size_t>(2, hHS.size() / 50000);   // <= 20 ppm, floor 2
+    if (!pass) ++failures;
+    printf("addrmsrot     M=%-4d P=%d gpw=%d fused-vs-chain: hs=%zu ro=%zu codes=%zu sc=%zu | vs-cpu: ro=%zu hs=%zu/%zu %s\n",
+           M, P, gpw, dhs, dro, da, dsc, dro_ref, dhs_ref, hHS.size(), pass ? "OK" : "FAIL");
+    }
+    hipFree(dY); hipFree(dR); hipFree(dW); hipFree(dT); hipFree(dCS); hipFree(dHS); hipFree(dRO);
+    hipFree(dHS2); hipFree(dRO2); hipFree(dA); hipFree(dA2); hipFree(dASG); hipFree(dRS);
+    hipFree(dASG2); hipFree(dRS2);
   }
 
   printf("\ncorrectness: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
