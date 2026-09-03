@@ -441,6 +441,26 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
 // bf16 rounding of hs a few times per million elements -- same class as gdn_norm_quant; the
 // harness gates fused == (ROT=false kernel + pq_rotate_quant2) bit-exact and both against the
 // CPU reference at ppm.
+__device__ __forceinline__ void pq_load_group(const unsigned short *__restrict__ T,
+                                              const __half *__restrict__ CS, int p, int g, int K,
+                                              int krot, int lane,
+                                              unsigned long long (&rec)[PQ_KROT_MAX][2],
+                                              float (&cs)[4]) {
+  const unsigned long long *__restrict__ Tb =
+      (const unsigned long long *)T + ((size_t)p * krot) * (K / 2) + (size_t)g * 64;
+#pragma unroll
+  for (int r = 0; r < PQ_KROT_MAX; ++r) {
+    const int rc = r < krot ? r : krot - 1;
+    rec[r][0] = Tb[(size_t)rc * (K / 2) + lane];
+    rec[r][1] = Tb[(size_t)rc * (K / 2) + lane + 32];
+  }
+  const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)g * PQ_GROUP + lane * 4);
+  cs[0] = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
+  cs[1] = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
+  cs[2] = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
+  cs[3] = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
+}
+
 template <bool ROT>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
     const __bf16 *__restrict__ Y, const __bf16 *__restrict__ RES,
@@ -456,30 +476,16 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
   const int G = K / PQ_GROUP;
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int g0 = (chunk * gpw) * PQ_ROT_WAVES + wave;
+  // wave-uniform count of real groups this wave owns
+  int ng = 0;
+  for (int gi = 0; gi < gpw; ++gi) ng += (g0 + gi * PQ_ROT_WAVES < G) ? 1 : 0;
   __shared__ float s_red[PQ_ROT_WAVES];
   __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
   const int c0 = lane * 4;
 
-  // First group's records + channel scales, issued before the row pass so they land under it.
   unsigned long long rec[PQ_KROT_MAX][2];
-  float cs0 = 1.f, cs1 = 1.f, cs2 = 1.f, cs3 = 1.f;
-  auto load_group = [&](int g) {
-    const int gc = g < G ? g : G - 1;                 // clamp, never predicate
-    const unsigned long long *__restrict__ Tb =
-        (const unsigned long long *)T + ((size_t)p * krot) * (K / 2) + (size_t)gc * 64;
-#pragma unroll
-    for (int r = 0; r < PQ_KROT_MAX; ++r) {
-      const int rc = r < krot ? r : krot - 1;
-      rec[r][0] = Tb[(size_t)rc * (K / 2) + lane];
-      rec[r][1] = Tb[(size_t)rc * (K / 2) + lane + 32];
-    }
-    const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)gc * PQ_GROUP + c0);
-    cs0 = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
-    cs1 = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
-    cs2 = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
-    cs3 = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
-  };
-  if constexpr (ROT) load_group(g0);
+  float cs[4] = {1.f, 1.f, 1.f, 1.f};
+  if constexpr (ROT) pq_load_group(T, CS, p, g0 < G ? g0 : G - 1, K, krot, lane, rec, cs);
 
   // Row pass: v = y + res (fp32), sum of squares, residual out.
   const uint4_t *__restrict__ y4 = (const uint4_t *)(Y + (size_t)m * K);
@@ -528,71 +534,71 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
     return;
   }
 
-  for (int gi = 0; gi < gpw; ++gi) {
-  const int g = g0 + gi * PQ_ROT_WAVES;
-  if (g >= G) return;                                   // wave-uniform
-  if (gi) load_group(g);
-  const int kb = g * PQ_GROUP + c0;
-  const uint2_t vy = *(const uint2_t *)(Y + (size_t)m * K + kb);
-  const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
-  const uint2_t vw = *(const uint2_t *)(Wn + kb);
-  float nv[4];
-  unsigned int hsw[2];
+  for (int gi = 0; gi < ng; ++gi) {
+    const int g = g0 + gi * PQ_ROT_WAVES;
+    if (gi) pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
+    const int kb = g * PQ_GROUP + c0;
+    const uint2_t vy = *(const uint2_t *)(Y + (size_t)m * K + kb);
+    const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
+    const uint2_t vw = *(const uint2_t *)(Wn + kb);
+    float nv[4];
+    unsigned int hsw[2];
 #pragma unroll
-  for (int h = 0; h < 2; ++h) {
-    const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
-    const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
-    const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
-    const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
-    nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
-    hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
-  }
-  if (p == 0) *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
-
-  // rotate_quant2 body on the normalized values
-  float v0 = nv[0] * cs0, v1 = nv[1] * cs1, v2 = nv[2] * cs2, v3 = nv[3] * cs3;
-  s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
-  s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
-  __asm__ volatile("s_waitcnt lgkmcnt(0)");
-#pragma unroll
-  for (int r = 0; r < PQ_KROT_MAX; ++r) {
-    if (r < krot) {
-#pragma unroll
-      for (int t2 = 0; t2 < 2; ++t2) {
-        const unsigned long long rv = rec[r][t2];
-        const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
-        const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
-        const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
-        const int i = ij & 0xFF, j = ij >> 8;
-        const float xi = s_x[wave][i], xj = s_x[wave][j];
-        s_x[wave][i] = fmaf(c, xi, sn * xj);
-        s_x[wave][j] = fmaf(c, xj, -sn * xi);
-      }
-      __asm__ volatile("s_waitcnt lgkmcnt(0)");
+    for (int h = 0; h < 2; ++h) {
+      const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+      const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+      const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
+      const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
+      nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
+      hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
     }
-  }
-  v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
-  v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
-  float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    if (p == 0) *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
+
+    // rotate_quant2 body on the normalized values
+    float v0 = nv[0] * cs[0], v1 = nv[1] * cs[1], v2 = nv[2] * cs[2], v3 = nv[3] * cs[3];
+    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
 #pragma unroll
-  for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
-  const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
-  const float qi = 1.f / scale;
-  const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
-  const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
-  float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
 #pragma unroll
-  for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
-  *(unsigned int *)(A + ((size_t)p * M + m) * K + kb) =
-      (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
-  if (lane == 0) {
-    ASG[((size_t)p * M + m) * G + g] = scale;
-    RS[((size_t)p * M + m) * G + g] = rs * scale;
-  }
-  __asm__ volatile("s_waitcnt lgkmcnt(0)");           // s_x reuse across groups
+        for (int t2 = 0; t2 < 2; ++t2) {
+          const unsigned long long rv = rec[r][t2];
+          const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+          const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+          const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+          const int i = ij & 0xFF, j = ij >> 8;
+          const float xi = s_x[wave][i], xj = s_x[wave][j];
+          s_x[wave][i] = fmaf(c, xi, sn * xj);
+          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
+    }
+    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float qi = 1.f / scale;
+    const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
+    const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
+    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+    *(unsigned int *)(A + ((size_t)p * M + m) * K + kb) =
+        (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+    if (lane == 0) {
+      ASG[((size_t)p * M + m) * G + g] = scale;
+      RS[((size_t)p * M + m) * G + g] = rs * scale;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");         // s_x reuse across groups
   }
 }
-static inline int pq_rot_gpw(int M) { return M <= 16 ? 1 : (M <= 32 ? 2 : 4); }
+// Measured 2026-09-02 (--bench2 fuse): one chain per wave to M=40, two above; four never wins.
+static inline int pq_rot_gpw(int M) { return M <= 40 ? 1 : 2; }
 
 // Prefill pass C: one wave per (partition, token). Reduces the per-group scales to the token
 // scale As = max_g ASG (they are amax/448, so their max IS the token amax/448), encodes the

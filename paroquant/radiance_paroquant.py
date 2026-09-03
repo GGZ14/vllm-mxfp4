@@ -87,6 +87,13 @@ ATILED_ENABLED = os.environ.get("RADIANCE_PQ_ATILED", "1") == "1"
 # agree or the weight is read as garbage. Fragment order is what makes the decode kernel's
 # streaming (NT) loads pay (RADIANCE_PQ_DECODE_NT, honoured only under WPERM).
 WPERM = os.environ.get("RADIANCE_PQ_WPERM", "1") == "1"
+# Rotation stream: the decode-band producers of the norm-fed linears (input_layernorm -> qkv /
+# in_proj_qkvz, post_attention_layernorm -> gate_up) run residual-add + RMSNorm + rotate + quant
+# as ONE kernel and hand the linear a (hs, A, ASG, RS) tuple; 96 rotation launches per step gone
+# and the norm itself is one kernel instead of inductor's pair. Installed by install_stream()
+# from the shared post-load hook (radiance_gdnmerge.merge_model). Changes the traced graph:
+# the compile cache must be keyed (run_paroquant.sh adds -rs).
+ROT_STREAM = os.environ.get("RADIANCE_PQ_ROT_STREAM", "0") == "1"
 _checked = set()
 
 
@@ -165,26 +172,29 @@ def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None):
     return out.to(torch.bfloat16)
 
 
-@torch.library.custom_op("radiance::paroquant_linear", mutates_args=())
-def paroquant_linear(x: torch.Tensor, qweight: torch.Tensor, sz: torch.Tensor,
-                     rec: torch.Tensor, cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
-    """Owns the whole dispatch so no shape branch is visible to dynamo (see the AutoRound module
-    for why: a data-dependent M branch in apply() splits the compiled graph at every linear)."""
+def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None):
+    """The whole dispatch, opaque to dynamo. pre = (A, ASG, RS) already rotated+quantized by the
+    fused norm producer (decode band only; ignored -- recomputed from x2 -- above the band)."""
     N, K = qweight.shape[0], qweight.shape[1] * PACK
     P, krot = rec.shape[0], rec.shape[1]
     G = K // GROUP
-    x2 = x.reshape(-1, K)
+    x = x2
     M = x2.shape[0]
     _ensure_scratch(x.device)
-    a_codes = torch.empty((P, M, K), device=x.device, dtype=torch.uint8)
-    asg = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
-    rs = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
     stream = torch.cuda.current_stream().cuda_stream
     ptok = PTOK_ENABLED and M > DECODE_MAX_M
     tiled = ptok and ATILED_ENABLED
     as_tok = None
     out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
-    if ptok:
+    if pre is not None and not ptok:
+        a_codes, asg, rs = pre
+    else:
+        a_codes = torch.empty((P, M, K), device=x.device, dtype=torch.uint8)
+        asg = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
+        rs = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
+    if pre is not None and not ptok:
+        gemm_scale = asg
+    elif ptok:
         # Prefill: pass A (rotate -> bf16 scratch + per-group scales), pass C (token scale +
         # encode + plain row-sums), PTOK GEMM (AutoRound-cost fold, As in the epilogue).
         # Tiled: pass C emits the fragment-tiled layout (16-row padded) and the A-direct GEMM
@@ -222,14 +232,206 @@ def paroquant_linear(x: torch.Tensor, qweight: torch.Tensor, sz: torch.Tensor,
         num = (out.float() - ref.float()).pow(2).sum().sqrt()
         den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
         sys.stderr.write(f"[radiance.paroquant] CHECKALL N={N} K={K} M={M} P={P} "
-                         f"path={'tiled' if tiled else 'ptok' if ptok else 'decode'} "
+                         f"path={'tiled' if tiled else 'ptok' if ptok else 'decode'}"
+                         f"{'+pre' if pre is not None and not ptok else ''} "
                          f"rel={float(num / den):.5f}\n")
-    return out.view(*x.shape[:-1], N)
+    return out
+
+
+@torch.library.custom_op("radiance::paroquant_linear", mutates_args=())
+def paroquant_linear(x: torch.Tensor, qweight: torch.Tensor, sz: torch.Tensor,
+                     rec: torch.Tensor, cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
+    """Owns the whole dispatch so no shape branch is visible to dynamo (see the AutoRound module
+    for why: a data-dependent M branch in apply() splits the compiled graph at every linear)."""
+    K = qweight.shape[1] * PACK
+    out = _linear_impl(x.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2)
+    return out.view(*x.shape[:-1], qweight.shape[0])
 
 
 @paroquant_linear.register_fake
 def _(x, qweight, sz, rec, cs, pb1, pb2):
     return torch.empty((*x.shape[:-1], qweight.shape[0]), device=x.device, dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("radiance::paroquant_linear_pre", mutates_args=())
+def paroquant_linear_pre(hs: torch.Tensor, a: torch.Tensor, asg: torch.Tensor, rs: torch.Tensor,
+                         qweight: torch.Tensor, sz: torch.Tensor, rec: torch.Tensor,
+                         cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
+    """Linear on the rotation-stream tuple: (A, ASG, RS) from pq_add_rms_rot in the decode band,
+    hs (bf16) for the prefill path above it."""
+    K = qweight.shape[1] * PACK
+    out = _linear_impl(hs.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, pre=(a, asg, rs))
+    return out.view(*hs.shape[:-1], qweight.shape[0])
+
+
+@paroquant_linear_pre.register_fake
+def _(hs, a, asg, rs, qweight, sz, rec, cs, pb1, pb2):
+    return torch.empty((*hs.shape[:-1], qweight.shape[0]), device=hs.device, dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("radiance::pq_add_rms_rot", mutates_args=())
+def pq_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+                   rec: torch.Tensor, cs: torch.Tensor
+                   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Residual add + Gemma RMSNorm (+ rotate + per-group quant in the decode band) -> (hs,
+    residual_out, A, ASG, RS). Above the band A/ASG/RS are allocated but untouched; the consumer
+    recomputes from hs on the tiled prefill path. The M branch lives here, opaque to dynamo."""
+    y2 = y.reshape(-1, y.shape[-1])
+    M, K = y2.shape
+    P = rec.shape[0]
+    G = K // GROUP
+    res = residual.reshape(M, K)
+    if not res.is_contiguous():
+        res = res.contiguous()
+    if not y2.is_contiguous():
+        y2 = y2.contiguous()
+    hs = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
+    ro = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
+    a = torch.empty((P, M, K), device=y.device, dtype=torch.uint8)
+    asg = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
+    rs = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
+    fused = M <= DECODE_MAX_M
+    _ext.launch_add_rms_rot(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+                            rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
+                            a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
+                            1 if fused else 0, torch.cuda.current_stream().cuda_stream)
+    return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
+
+
+@pq_add_rms_rot.register_fake
+def _(y, residual, weight, eps, rec, cs):
+    K = y.shape[-1]
+    M = y.numel() // K
+    P = rec.shape[0]
+    return (torch.empty(y.shape, device=y.device, dtype=torch.bfloat16),
+            torch.empty(residual.shape, device=y.device, dtype=torch.bfloat16),
+            torch.empty((P, M, K), device=y.device, dtype=torch.uint8),
+            torch.empty((P, M, K // GROUP), device=y.device, dtype=torch.float32),
+            torch.empty((P, M, K // GROUP), device=y.device, dtype=torch.float32))
+
+
+# ---- rotation stream: patched forwards + installer --------------------------------------------
+def _rot_layer_forward(self, hidden_states, residual, positions=None, **kwargs):
+    """Decoder-layer forward under the rotation stream. Mirrors the stock body
+    (qwen3_next.py Qwen3NextDecoderLayer.forward) minus the branches install_stream() proves dead
+    (sequence parallel, layer_scale), exactly as radiance_arnq._stream_forward does."""
+    if residual is None:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hs = hidden_states
+    elif self._pq_rot_in is not None:
+        cons = self._pq_rot_in
+        hsb, residual, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(
+            hidden_states, residual, self.input_layernorm.weight,
+            float(self.input_layernorm.variance_epsilon), cons.rec, cons.cs)
+        hs = (hsb, a, asg, rs)
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hs = hidden_states
+
+    if self.layer_type == "linear_attention":
+        attn_out = self.linear_attn(hidden_states=hs)
+    else:
+        attn_out = self.self_attn(hidden_states=hs, positions=positions)
+
+    if self._pq_rot_mid is not None:
+        cons = self._pq_rot_mid
+        hsb, residual, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(
+            attn_out, residual, self.post_attention_layernorm.weight,
+            float(self.post_attention_layernorm.variance_epsilon), cons.rec, cons.cs)
+        hidden_states = self.mlp((hsb, a, asg, rs))
+    else:
+        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        hidden_states = self.mlp(hidden_states)
+    return hidden_states, residual
+
+
+def _rot_gdn_forward_hip(self, hidden_states):
+    """QwenGatedDeltaNetAttention.forward_hip (AITER-Triton branch) made tuple-aware: the
+    quantized in_proj_qkvz takes the stream tuple, the fp16 in_proj_ba takes the bf16 hidden."""
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as _g
+    if isinstance(hidden_states, tuple):
+        hsb, pre = hidden_states[0], hidden_states
+    else:
+        hsb, pre = hidden_states, hidden_states
+    num_tokens = hsb.size(0)
+    projected_states_qkvz, _ = self.in_proj_qkvz(pre)
+    projected_states_ba, _ = self.in_proj_ba(hsb)
+    projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
+    projected_states_ba = projected_states_ba.view(num_tokens, -1)
+    core_attn_out = torch.empty(
+        (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        dtype=hsb.dtype, device=hsb.device)
+    z = torch.empty(
+        (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        dtype=projected_states_qkvz.dtype, device=projected_states_qkvz.device)
+    torch.ops.vllm.qwen_gdn_attention_core(
+        projected_states_qkvz, projected_states_ba, z, core_attn_out,
+        layer_name=_g._encode_layer_name(self.prefix), use_aiter=True)
+    return self._output_projection(core_attn_out, z)
+
+
+def _is_pq(lin) -> bool:
+    return (lin is not None and getattr(lin, "rec", None) is not None
+            and isinstance(getattr(lin, "quant_method", None), ParoQuantLinearMethod))
+
+
+def install_stream(model) -> None:
+    """Patch the decoder layers for the rotation stream. Best-effort and loud: any guard that
+    fails leaves that layer stock."""
+    if not ROT_STREAM:
+        return
+    import types
+    core = None
+    for m in model.modules():
+        if hasattr(m, "layers") and hasattr(m, "aux_hidden_state_layers"):
+            core = m
+            break
+    if core is None:
+        sys.stderr.write("[radiance.paroquant] rot stream: no decoder core found, skipping\n")
+        return
+    if tuple(getattr(core, "aux_hidden_state_layers", ()) or ()):
+        sys.stderr.write("[radiance.paroquant] rot stream: aux hidden taps set, skipping\n")
+        return
+    try:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as _g
+        gdn_ok = bool(getattr(_g, "GDN_AITER_TRITON_AVAILABLE", False))
+    except Exception as e:                                          # noqa: BLE001
+        sys.stderr.write(f"[radiance.paroquant] rot stream: GDN module probe failed {e!r}\n")
+        gdn_ok = False
+    n_in = n_mid = n_gdn = 0
+    for i, layer in enumerate(core.layers):
+        layer._pq_rot_in = None
+        layer._pq_rot_mid = None
+        if getattr(layer, "layer_scale", False) or getattr(layer, "use_attn_reduce_scatter_for_moe", False):
+            sys.stderr.write(f"[radiance.paroquant] rot stream: layer {i} layer_scale/SP, stock\n")
+            continue
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None or getattr(mlp, "expert_gate", None) is not None:
+            sys.stderr.write(f"[radiance.paroquant] rot stream: layer {i} mlp shape, stock\n")
+            continue
+        if layer.layer_type == "linear_attention":
+            la = layer.linear_attn
+            cons_in = getattr(la, "in_proj_qkvz", None)
+            if (gdn_ok and _is_pq(cons_in) and getattr(la, "in_proj_ba", None) is not None
+                    and getattr(la, "_forward_method", None) == getattr(la, "forward_hip", None)):
+                la.forward_hip = types.MethodType(_rot_gdn_forward_hip, la)
+                la._forward_method = la.forward_hip
+                layer._pq_rot_in = cons_in
+                n_gdn += 1
+        else:
+            cons_in = getattr(layer.self_attn, "qkv_proj", None)
+            if _is_pq(cons_in):
+                layer._pq_rot_in = cons_in
+        if layer._pq_rot_in is not None:
+            n_in += 1
+        cons_mid = getattr(mlp, "gate_up_proj", None)
+        if _is_pq(cons_mid):
+            layer._pq_rot_mid = cons_mid
+            n_mid += 1
+        layer.forward = types.MethodType(_rot_layer_forward, layer)
+    sys.stderr.write(f"[radiance.paroquant] rot stream installed: {n_in} input epilogues "
+                     f"({n_gdn} GDN), {n_mid} mid epilogues over {len(core.layers)} layers\n")
 
 
 def _narrow_tp(target_last, loaded):
@@ -467,9 +669,15 @@ class ParoQuantLinearMethod(LinearMethodBase):
         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
 
-    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        out = torch.ops.radiance.paroquant_linear(x, layer.qweight, layer.sz, layer.rec,
-                                                  layer.cs, layer.pq_pb1, layer.pq_pb2)
+    def apply(self, layer, x, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if isinstance(x, tuple):          # rotation stream: (hs, A, ASG, RS)
+            hs, a, asg, rs = x
+            out = torch.ops.radiance.paroquant_linear_pre(hs, a, asg, rs, layer.qweight,
+                                                          layer.sz, layer.rec, layer.cs,
+                                                          layer.pq_pb1, layer.pq_pb2)
+        else:
+            out = torch.ops.radiance.paroquant_linear(x, layer.qweight, layer.sz, layer.rec,
+                                                      layer.cs, layer.pq_pb1, layer.pq_pb2)
         if bias is not None:
             out = out + bias
         return out
@@ -479,4 +687,4 @@ if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
     sys.stderr.write("[radiance.paroquant] registered (int4 g128 asym + rotations, W4A8, "
                      f"gfx1201; weight layout {'FRAGMENT ORDER' if WPERM else 'row'}, "
                      f"prefill {'A-tiled' if ATILED_ENABLED else 'row'}, decode band M<="
-                     f"{DECODE_MAX_M})\n")
+                     f"{DECODE_MAX_M}, rot stream {'on' if ROT_STREAM else 'off'})\n")

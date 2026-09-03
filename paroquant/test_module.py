@@ -129,6 +129,30 @@ def run_case(name, prefixes):
         failures += not ok
         print(f"  {name:8s} M={M:<4d} N={N} K={K} P={len(parts)} rel={rel:.2e} "
               f"{'OK' if ok else 'FAIL'}")
+
+    # Rotation stream: fused add+rmsnorm+rotate+quant + tuple-fed linear vs vLLM's own
+    # GemmaRMSNorm followed by the bf16 linear. Residual must be exact; hs may differ by a bf16
+    # ulp a few times per million (reduction order); the outputs then agree to the same ppm.
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    norm = GemmaRMSNorm(K, eps=1e-6).to(DEV)
+    torch.manual_seed(7)
+    norm.weight.data = (torch.randn(K, device=DEV) * 0.1).to(torch.bfloat16)
+    for M in (1, 5, 17, 40, 64, 300):
+        torch.manual_seed(100 + M)
+        y = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+        res = (torch.randn(M, K, device=DEV) * 3).to(torch.bfloat16)
+        hs_ref, ro_ref = norm(y.clone(), res.clone())
+        out_ref = method.apply(layer, hs_ref).float()
+        hs, ro, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(y, res, norm.weight, 1e-6,
+                                                                layer.rec, layer.cs)
+        out = method.apply(layer, (hs, a, asg, rs)).float()
+        ro_bad = int((ro != ro_ref).sum())
+        hs_bad = int((hs != hs_ref).sum())
+        rel = float((out - out_ref).norm() / out_ref.norm().clamp_min(1e-30))
+        ok = ro_bad == 0 and hs_bad <= max(2, hs.numel() // 50000) and rel < 2e-3
+        failures += not ok
+        print(f"  {name:8s} M={M:<4d} stream: residual-diff={ro_bad} hs-diff={hs_bad}/{hs.numel()} "
+              f"out-rel={rel:.2e} {'OK' if ok else 'FAIL'}")
     return failures
 
 

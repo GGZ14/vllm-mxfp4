@@ -1173,10 +1173,12 @@ int main(int argc, char **argv) {
     // gate every gpw the launcher can pick (1, 2, 4) -- the grid.y changes with it
     for (const int gpw : {1, 2, 4}) {
     HIP_CHECK(hipMemset(dA, 0, (size_t)P * M * K));
+    HIP_CHECK(hipMemset(dASG, 0, (size_t)P * M * G * 4)); HIP_CHECK(hipMemset(dRS, 0, (size_t)P * M * G * 4));
+    HIP_CHECK(hipMemset(dHS, 0, (size_t)M * K * 2)); HIP_CHECK(hipMemset(dRO, 0, (size_t)M * K * 2));
     hipLaunchKernelGGL(pq_add_rms_rot<true>, dim3(M, (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw), P),
                        dim3(PQ_ROT_WAVES * 32), 0, 0, (const __bf16 *)dY, (const __bf16 *)dR,
                        (const __bf16 *)dW, eps, dT, dCS, (__bf16 *)dHS, (__bf16 *)dRO, dA, dASG,
-                       dRS, M, K, krot, 1);
+                       dRS, M, K, krot, gpw);
     // reference chain on GPU: plain norm kernel + rotate_quant2
     hipLaunchKernelGGL(pq_add_rms_rot<false>, dim3(M, 1, 1), dim3(PQ_ROT_WAVES * 32), 0, 0,
                        (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, eps, dT, dCS,
@@ -1205,7 +1207,11 @@ int main(int argc, char **argv) {
       if (hHS[i] != refHS[i]) ++dhs_ref;
       if (hRO[i] != refRO[i]) ++dro_ref;
     }
-    for (size_t i = 0; i < hA.size(); ++i) if (hA[i] != hA2[i]) ++da;
+    for (size_t i = 0; i < hA.size(); ++i) if (hA[i] != hA2[i]) {
+      if (da < 6) printf("      mismatch idx=%zu (p=%zu m=%zu g=%zu c=%zu) fused=%02x chain=%02x\n", i,
+                         i / ((size_t)M * K), (i / K) % M, (i % K) / PQ_GROUP, i % PQ_GROUP, hA[i], hA2[i]);
+      ++da;
+    }
     for (size_t i = 0; i < hASG.size(); ++i) if (memcmp(&hASG[i], &hASG2[i], 4) || memcmp(&hRS[i], &hRS2[i], 4)) ++dsc;
     // fused == plain-norm + rotate_quant2 must be bit-exact; vs the CPU reference the residual
     // is exact and hs may differ by an ulp flip a few times per million (reduction order).

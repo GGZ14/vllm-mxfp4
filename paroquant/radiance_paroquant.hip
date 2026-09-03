@@ -115,6 +115,32 @@ static void launch_token_quant(uintptr_t xr, uintptr_t asg, uintptr_t a, uintptr
                      reinterpret_cast<float *>(rs), M, K);
 }
 
+// Fused residual-add + Gemma RMSNorm (+ rotate + per-group quant when fused=1, the decode band).
+// Y/RES [M, K] bf16, W [K] bf16; T/CS the consumer linear's rotation; out HS/RO [M, K] bf16,
+// A [P, M, K], ASG/RS [P, M, K/128] (fused only).
+static void launch_add_rms_rot(uintptr_t y, uintptr_t res, uintptr_t w, double eps, uintptr_t t,
+                               uintptr_t cs, uintptr_t hs, uintptr_t ro, uintptr_t a,
+                               uintptr_t asg, uintptr_t rs, int M, int K, int P, int krot,
+                               int fused, uintptr_t stream) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  auto st = reinterpret_cast<hipStream_t>(stream);
+  const int G = K / PQ_GROUP;
+  const int gpw = pq_rot_gpw(M);
+#define PQ_ARR(KERN, GRID)                                                                       \
+  hipLaunchKernelGGL(KERN, GRID, dim3(PQ_ROT_WAVES * 32), 0, st,                                 \
+                     reinterpret_cast<const __bf16 *>(y), reinterpret_cast<const __bf16 *>(res),  \
+                     reinterpret_cast<const __bf16 *>(w), (float)eps,                             \
+                     reinterpret_cast<const unsigned short *>(t),                                \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<__bf16 *>(hs),        \
+                     reinterpret_cast<__bf16 *>(ro), reinterpret_cast<unsigned char *>(a),        \
+                     reinterpret_cast<float *>(asg), reinterpret_cast<float *>(rs), M, K, krot,   \
+                     gpw)
+  if (fused) PQ_ARR(pq_add_rms_rot<true>, dim3(M, (G + PQ_ROT_WAVES * gpw - 1) / (PQ_ROT_WAVES * gpw), P));
+  else PQ_ARR(pq_add_rms_rot<false>, dim3(M, 1, 1));
+#undef PQ_ARR
+}
+
 // A-tiled per-token prefill GEMM: AT [P, Mt*16, K] fragment-tiled e4m3, AS [P, M], RS [P, M, G]
 // plain row-sums. Prefill-class M only -- the decode band reads row-major A.
 static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as, uintptr_t rs,
@@ -210,6 +236,8 @@ PYBIND11_MODULE(radiance_paroquant_kernel, m) {
         "fused pairwise-rotation + channel-scale + per-group fp8 quant + row-sums (gfx1201)");
   m.def("launch_gemm", &launch_gemm,
         "ParoQuant int4 g128-asym x fp8 W4A8 GEMM with partition select (gfx1201)");
+  m.def("launch_add_rms_rot", &launch_add_rms_rot,
+        "fused residual-add + Gemma rmsnorm (+ rotate + per-group fp8 quant in the decode band)");
   m.def("launch_gemm_at", &launch_gemm_at,
         "ParoQuant per-token GEMM on a fragment-tiled activation (prefill band)");
   m.def("set_decode_scratch", &set_decode_scratch,
