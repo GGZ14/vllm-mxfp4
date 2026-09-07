@@ -72,6 +72,13 @@ Everything is an environment variable; these are the ones worth knowing.
 
   TP=<auto>                 tensor-parallel size; defaults to the largest of 8/4/2/1 that the
                             detected cards can fill (head counts rule out 3, 6 and 12)
+  TP=3                      three cards, via zero-weight dummy heads (36 q / 6 kv / 18 GDN-k /
+                            54 GDN-v, MLP 17472, vocab 248448 -- RADIANCE_TP_PAD=3, set for you).
+                            Explicit only until it has passed its hardware gate. Forces
+                            RADIANCE_MXFP4_WPERM=0 and RADIANCE_FP8_STREAM=0; own cache dir.
+  RADIANCE_TP_PAD=3         the same padding at TP=1/2 (validation gates only; see
+                            TP3_PADDING_PLAN.md). _INTERMEDIATE=17408 keeps the MLP stock,
+                            _DRAFTER=0 leaves the DFlash2 drafter unpadded (A/B lever)
   GPUS=0,1                  HIP indices to serve on; defaults to every card with enough VRAM
   MIN_GPU_MIB=8192          VRAM floor for "usable"; excludes iGPUs from the count
   KV_MEM=auto               KV cache size: auto uses a pin measured for your hardware if
@@ -85,6 +92,9 @@ Everything is an environment variable; these are the ones worth knowing.
   AUTO_R4D=1                build the pinned libr4d on first run (cached); 0 uses the image's
   R4D_SO=<dir>              use your own libr4d checkout instead of building one
   EXTRA="--enforce-eager"   extra `vllm serve` flags (same as passing them as arguments)
+  HIP_FORCE_DEV_KERNARG=1   ROCm runtime knobs passed through when set: kernargs in VRAM,
+  HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
+  MXFP4_CUMODE=1            compile the MXFP4 GEMM .hip with -mcumode (A/B; output-identical)
   DRY_RUN=1                 print the container command instead of running it
   PREPARE_ONLY=1            do the one-time work (image, libr4d) and stop before serving
 
@@ -150,9 +160,12 @@ preflight() {
   [ "$RAD_GPU_COUNT" -gt 0 ] || die "no AMD GPU with at least ${RAD_MIN_GPU_MIB} MiB of VRAM" \
       "found:$([ -n "$RAD_GPU_SKIPPED" ] && echo "$RAD_GPU_SKIPPED" || echo " nothing on the amdgpu driver")" \
       "lower the floor with MIN_GPU_MIB=<mib>, or name the cards with GPUS=0,1"
+  [ "$RAD_GPU_COUNT" -ge "$TP" ] || die "TP=$TP but only $RAD_GPU_COUNT usable GPU(s) (indices ${RAD_GPU_INDICES:-none})" \
+      "lower TP, or name the cards with GPUS=0,1,2 (MIN_GPU_MIB=<mib> lowers the VRAM floor)"
   if [ "$RAD_GPU_COUNT" -gt "$TP" ]; then
     echo "[serve-mxfp4] note: $RAD_GPU_COUNT usable GPUs, serving on $TP (indices $GPU_IDS)." >&2
-    echo "  TP must divide the model's head counts -- $RAD_TP_ALLOWED are the supported sizes." >&2
+    echo "  TP must divide the model's head counts -- $RAD_TP_ALLOWED are the native sizes;" >&2
+    echo "  TP=3 is available explicitly through dummy-head padding (TP=3 ./serve-mxfp4.sh)." >&2
   fi
 
   [ -d "$MODELS" ] || die "MODELS=$MODELS does not exist" \
@@ -234,6 +247,50 @@ FP8S=${RADIANCE_FP8_STREAM:-1}
 # and a bare ./serve-mxfp4.sh must reproduce prod (it did not -- every restart needed the two
 # overrides). Set either to 0 to fall back; the cache suffix follows.
 #
+# Tensor parallelism, defaulted from the cards actually present. This was hardcoded to 2, which
+# is right for the reference box and wrong for every host that is not it: a single-card user got
+# a startup failure from inside a TP worker, and a four-card user got two idle cards. Resolved
+# HERE, above the cache-suffix block, because TP=3 changes what that block has to key on.
+TP=${TP:-$RAD_TP}
+GPU_IDS=${GPU_IDS:-$RAD_GPU_INDICES}
+# TP=3 via zero-weight dummy heads (radiance_tp3pad.py + patch_tp3_pad.py; TP3_PADDING_PLAN.md).
+# The checkpoint's head counts (24 q / 4 kv / 16 GDN-k / 48 GDN-v) do not divide by 3, so at
+# TP=3 the config is widened to 36 / 6 / 18 / 54, MLP 17408 -> 17472 and vocab 248320 -> 248448
+# with dummies whose weights are exactly zero; contiguous sharding puts every dummy on rank 2 and
+# per-rank GQA stays 6, so the R4D attention kernels still bind. Automatic at TP=3; RADIANCE_TP_PAD=3
+# asks for the same padding at TP=1/2, which is how it is validated on a two-card host (Gates A and
+# B in the plan). Every hook the patch installs returns immediately with RADIANCE_TP_PAD unset,
+# and that is what every TP != 3 serve passes into the container: those serves are byte-identical
+# to what they were before this block existed, cache dir included.
+TP_PAD=${RADIANCE_TP_PAD:-0}
+if [ "$TP" = 3 ] && [ "$TP_PAD" = 0 ]; then TP_PAD=3; fi
+if [ "$TP_PAD" != 0 ]; then
+  [ "$TP_PAD" = 3 ] || die "RADIANCE_TP_PAD=$TP_PAD: only 3 is supported"
+  case "$TP" in
+    1|2|3) ;;
+    *) die "RADIANCE_TP_PAD=3 pads the heads to 36/6/18/54, which TP=$TP does not divide" \
+           "serve TP=3 (the target), or TP=1 / TP=2 for the validation gates" ;;
+  esac
+  # Two production defaults cannot serve a padded geometry and are switched off here, loudly,
+  # rather than failing minutes later inside a worker:
+  #   WPERM   the fragment-order weight layout needs N % 16 per rank, and the padded in_proj_ba
+  #           is N = 108 / 54 / 36 at TP 1 / 2 / 3 -- the kernel raises at load. Checkpoint
+  #           layout instead (RADIANCE_MXFP4_DECODE_NT is only honoured under WPERM anyway).
+  #   FP8S    the fp8 residual stream needs every GDN in_proj merged, and gdnmerge skips any
+  #           layer whose in_proj_ba N is not a multiple of 16: all 48 here. Left on, the arnq
+  #           installer would skip at startup and the cache dir would hold a stock graph under
+  #           an -fp8s name (the trap documented above), so it is off. Both are the known
+  #           ~3-6% decode cost of padding until the gdnmerge gate is relaxed for WPERM=0.
+  if [ "${RADIANCE_MXFP4_WPERM:-1}" = 1 ]; then
+    echo "[serve-mxfp4] note: TP padding active -- RADIANCE_MXFP4_WPERM forced to 0 (padded in_proj_ba N=$((108 / TP)) fails the fragment-order %16 rule)" >&2
+  fi
+  export RADIANCE_MXFP4_WPERM=0
+  if [ "$FP8S" = 1 ]; then
+    echo "[serve-mxfp4] note: TP padding active -- RADIANCE_FP8_STREAM forced to 0 (needs the GDN in_proj merge, which the padded in_proj_ba width rules out)" >&2
+    FP8S=0
+  fi
+fi
+#
 # RADIANCE_MXFP4_A_TILED_MIN_M=513 (default, 0 = off): activations at M >= 513 are emitted
 # fragment-tiled and the prefill GEMM reads them straight into WMMA registers
 # (radiance_mxfp4_fp8_gemm_atiled). Measured 2026-09-02, BetterBench PP t/s vs the folded
@@ -281,6 +338,10 @@ if [ "$SGATES" = 1 ]; then CACHE_SUF="$CACHE_SUF-sg"; fi
 # cache dir because the fill kernel leaves the graph.
 EOUT=${RADIANCE_GDN_EMPTY_OUT:-0}
 if [ "$EOUT" = 1 ]; then CACHE_SUF="$CACHE_SUF-eo"; fi
+# Dummy-head padding changes EVERY traced shape, and a stale torch_aot_compile slot ignores shape
+# (the 08-30 selector-graph burn), so a padded serve gets its own dir, keyed on TP as well since
+# the per-rank shapes differ between the TP=1/2 gates and TP=3. Unpadded serves keep their dir.
+if [ "$TP_PAD" != 0 ]; then CACHE_SUF="$CACHE_SUF-tp${TP}pad"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
@@ -304,11 +365,7 @@ KV_MEM=${KV_MEM:-auto}
 # check further down prints the command if it is missing). SPEC_METHOD=mtp needs no drafter at all
 # and is the fallback if you do not want the second checkpoint.
 SPEC_METHOD=${SPEC_METHOD:-dflash}
-# Tensor parallelism, defaulted from the cards actually present. This was hardcoded to 2, which
-# is right for the reference box and wrong for every host that is not it: a single-card user got
-# a startup failure from inside a TP worker, and a four-card user got two idle cards.
-TP=${TP:-$RAD_TP}
-GPU_IDS=${GPU_IDS:-$RAD_GPU_INDICES}
+# TP / GPU_IDS are resolved above the cache-suffix block (the TP=3 padding keys on them).
 # MODELS is bind-mounted at /models below, so SNAP and DRAFTER must live somewhere under it.
 # Resolved HERE rather than next to SNAP further down: DRAFTER's default dereferences it, and under
 # `set -u` that made an un-exported MODELS an "unbound variable" abort rather than a default.
@@ -419,7 +476,7 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
 R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx5"; fi   # rx5: fused_update zeroes the pad rows (o_rows arg)
+if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx6"; fi   # rx6: + ar_oneshot_3rank_exact (TP=3 all-reduce); rx5: fused_update zeroes the pad rows
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -568,6 +625,13 @@ if [ "$R4D_ATTN" = "1" ]; then ATTN=R4D; else ATTN=ROCM_AITER_UNIFIED_ATTN; fi
 # MTP, where the drafter runs a SERIAL loop of forwards and the padding is paid once per position.
 # Under dflash the drafter emits the whole block in one graphed pass, so it is worth re-testing
 # which side of that trade wins.
+# 2026-09-04 re-test with the width cap applied under async (patch_async_dynwidth.py) and a per-step
+# trace (patch_step_trace.py, RADIANCE_STEP_TRACE=N): async now matches sync EXACTLY -- single 22.35
+# vs 22.30 ms/step, conc-8 period 38.0 vs 38.0 ms, acceptance byte-identical, engine verified two
+# batches deep. There is nothing to overlap: the worker CPU chain is 8.5 ms at conc-8 (prep 6.5 +
+# sample 1.5 + engine/IPC 0.45) and the drafter's GPU tail after sampling is 5.4 ms (3.6 single),
+# so the GPU idles <=1.5 ms/step in sync mode, and both modes sit at the 209 W cap / ~2.83 GHz.
+# Keep 0: sync has the simpler failure modes and identical numbers.
 ASYNC=${ASYNC:-0}
 if [ "$ASYNC" = 1 ]; then ASYNC_FLAG="--async-scheduling"; UNPAD=false; else ASYNC_FLAG="--no-async-scheduling"; UNPAD=true; fi
 
@@ -606,6 +670,12 @@ fi
 # The AR size gate compares the raw bf16 byte count: CHUNK x hidden(5120) x 2. Derive it rather
 # than hardcoding it, so changing CHUNK cannot silently drop prefill back onto RCCL.
 AR_MAX_KB=$(( (CHUNK * 5120 * 2) / 1024 + 4096 ))
+# At TP=3 the 3-rank exact kernel (libr4d extras rx6, wired by patch_ar_3rank.py) takes messages
+# up to this cutoff and everything larger rides RCCL: decode-size messages (M <= ~200) only, until
+# the third card's link has been measured (Gate M in TP3_PADDING_PLAN.md; p2p3_bench). The 3-rank
+# scratch is 2 regions x 2 slots x this, so it is deliberately small. RADIANCE_AR_MAX_KB_TP3=0
+# keeps the kernel from taking anything (RCCL-only baseline).
+if [ "$TP" = 3 ]; then AR_MAX_KB=${RADIANCE_AR_MAX_KB_TP3:-2048}; fi
 
 # ---------------------------------------------------------------- KV cache size
 # An explicit --kv-cache-memory OVERRIDES GPU_UTIL and skips vLLM's memory profiling entirely.
@@ -639,7 +709,7 @@ if [ "$KV_MEM" = "0" ]; then KV_MEM=""; KV_SRC=profiled; fi
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
 echo "[run] $RUNTIME $IMAGE | port $PORT | $SPEC_METHOD spec=$SPEC | model $CSNAP"
-echo "[run] gpus=$RAD_GPU_COUNT x $RAD_GPU_NAME ($RAD_GPU_MIB MiB) tp=$TP hip=$GPU_IDS sig=$RAD_GPU_SIG"
+echo "[run] gpus=$RAD_GPU_COUNT x $RAD_GPU_NAME ($RAD_GPU_MIB MiB) tp=$TP hip=$GPU_IDS sig=$RAD_GPU_SIG tp_pad=$TP_PAD"
 echo "[run] attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-none}($KV_SRC)"
 if [ "$KV_SRC" = profiled ] && [ "$GPU_UTIL" = "0.98" ]; then
   echo "[run] no KV pin measured for $RAD_GPU_SIG at seqs=${MAXSEQS:-8} chunk=$CHUNK -- vLLM will"
@@ -655,6 +725,14 @@ if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || tr
 
 # DRY_RUN=1 prints the command instead of running it -- for checking what a set of environment
 # overrides actually produces, and for lifting the invocation into a unit file.
+# No CPU pin: --cpuset-cpus needs a cpuset cgroup controller rootless podman does not get, a host
+# taskset is reset by crun, and pinning the container's threads to one CCD after launch measured
+# neutral (22.33 vs 22.24-22.27 ms/step ctx 0, 2026-09-04).
+# ROCm runtime knobs, passed through only when set. All measured NEUTRAL on gfx1201 / ROCm 7.14
+# (2026-09-04, ~/mxfp4_work/rocm-lat): dispatch 2.15 us, launch+sync 17.5 us, 2.1-2.3 us per
+# hipGraph node, identical with dev-kernarg, busy-poll signals, MWAITX off, direct dispatch off.
+# HIP_FORCE_DEV_KERNARG / HSA_ENABLE_INTERRUPT / ROC_ACTIVE_WAIT_TIMEOUT below are those knobs.
+# MXFP4_CUMODE=1 (-mcumode GEMM build): decode neutral (+0.4%), prefill -6% at 32k -- keep 0.
 exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
@@ -684,6 +762,10 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-1}" \
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
+  -e RADIANCE_TP_PAD="$TP_PAD" \
+  -e RADIANCE_TP_PAD_INTERMEDIATE="${RADIANCE_TP_PAD_INTERMEDIATE:-}" \
+  -e RADIANCE_TP_PAD_DRAFTER="${RADIANCE_TP_PAD_DRAFTER:-1}" \
+  -e RADIANCE_TP_PAD_STRICT="${RADIANCE_TP_PAD_STRICT:-1}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
   -e RADIANCE_GDN_NORM_QUANT="$GNQ" \
   -e RADIANCE_GDN_STRIDED_GATES="$SGATES" \
@@ -699,6 +781,11 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_AR_QNB="${RADIANCE_AR_QNB:-96}" \
   -e RADIANCE_AR_QNT="${RADIANCE_AR_QNT:-1024}" \
   ${PYTORCH_CUDA_ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"} \
+  ${HIP_FORCE_DEV_KERNARG:+-e HIP_FORCE_DEV_KERNARG="$HIP_FORCE_DEV_KERNARG"} \
+  ${HSA_ENABLE_INTERRUPT:+-e HSA_ENABLE_INTERRUPT="$HSA_ENABLE_INTERRUPT"} \
+  ${ROC_ACTIVE_WAIT_TIMEOUT:+-e ROC_ACTIVE_WAIT_TIMEOUT="$ROC_ACTIVE_WAIT_TIMEOUT"} \
+  -e MXFP4_CUMODE="${MXFP4_CUMODE:-0}" \
+  -e RADIANCE_STEP_TRACE="${RADIANCE_STEP_TRACE:-0}" \
   -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \
   -e RADIANCE_AR_OVERLAP_SLICES="${RADIANCE_AR_OVERLAP_SLICES:-4}" \
   -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" \
@@ -739,6 +826,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     SP=/opt/vllm/lib/python3.12/site-packages
     cd /patches
     python3 patch_quark_mxfp4.py
+    python3 patch_tp3_pad.py
     python3 patch_ar_maxbytes.py
     python3 patch_topk_triton_rows.py
     python3 patch_dflash_calib.py
@@ -751,7 +839,10 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     python3 patch_dflash_selector_topk.py
     python3 patch_gdn_merge_inproj.py
     python3 patch_dynwidth.py
+    python3 patch_async_dynwidth.py
+    python3 patch_step_trace.py
     python3 patch_ar_geometry.py
+    python3 patch_ar_3rank.py
     python3 patch_gdn_glue.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     python3 patch_qwen3_thinkoff.py \
@@ -761,9 +852,11 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
        radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py \
-       radiance_arnq.py "$SP"/
-    hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
-      radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
+       radiance_arnq.py radiance_tp3pad.py "$SP"/
+    # MXFP4_CUMODE=1 builds the GEMM TU in CU mode (waves of a workgroup confined to one CU of the
+    # WGP, LDS partitioned per CU) -- bit-identical output, an occupancy/LDS-placement A/B knob.
+    hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $([ "${MXFP4_CUMODE:-0}" = 1 ] && echo -mcumode) \
+      $(python3 -m pybind11 --includes) radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     # Optional patched libr4d. R4D_SO is the DIRECTORY of a libr4d checkout built from main --
     # it is bind-mounted at /r4d and its r4d.so replaces the one in the image. For an image
     # rebuild, the Dockerfile supports the same substitution through R4D_REPO / R4D_VERSION.

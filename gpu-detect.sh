@@ -19,11 +19,17 @@
 
 RAD_MIN_GPU_MIB=${MIN_GPU_MIB:-8192}
 
-# Tensor-parallel sizes this checkpoint supports. Qwen3.8-27B has num_attention_heads=24,
+# Tensor-parallel sizes this checkpoint supports NATIVELY. Qwen3.8-27B has num_attention_heads=24,
 # linear_num_key_heads=16 and linear_num_value_heads=48, and TP must divide all three. That
 # rules out 3, 6 and 12 even though they divide 24 -- the GDN linear-attention heads are what
-# reject them, which is exactly what TP3_PADDING_PLAN.md exists to fix. 16 is out because it
-# does not divide 24. Override only if you are serving a different checkpoint.
+# reject them. 16 is out because it does not divide 24. Override only if you are serving a
+# different checkpoint.
+#
+# TP=3 is served anyway, through zero-weight dummy heads (radiance_tp3pad.py, TP3_PADDING_PLAN.md):
+# serve-mxfp4.sh pads the geometry to 36/6/18/54 heads when TP=3 is asked for. It is NOT in the
+# auto-pick list yet -- a three-card host keeps serving on two until the padded configuration has
+# passed its hardware gate (Gate C in the plan); ask for it explicitly with TP=3. Promote it to
+# "8 4 3 2 1" once it has.
 RAD_TP_ALLOWED=${TP_ALLOWED:-"8 4 2 1"}
 
 # Marketing names for the parts this has actually been run on. Anything else falls back to
@@ -77,11 +83,22 @@ rad_detect_gpus() {
   RAD_GPU_COUNT=$#
 
   # Largest supported TP the candidates can fill. A 3-card host serves on 2 and leaves one
-  # idle: correct, not a bug, until the TP3 padding work lands.
+  # idle unless TP=3 is asked for explicitly (dummy-head padding; see RAD_TP_ALLOWED above).
+  # An explicit TP wins here as well as in the launcher, so the index list, the card figures
+  # and the hardware signature below all describe the cards that will actually be used --
+  # the KV pin lookup is keyed on that signature, and a pin measured at TP=2 must never be
+  # applied to a TP=3 serve. Too few cards for the asked TP is caught by the launcher's preflight.
   RAD_TP=1
-  for t in $RAD_TP_ALLOWED; do
-    if [ "$RAD_GPU_COUNT" -ge "$t" ]; then RAD_TP=$t; break; fi
-  done
+  if [ -n "${TP:-}" ]; then
+    case "$TP" in
+      ''|*[!0-9]*|0) echo "[gpu-detect] TP=$TP is not a positive integer" >&2; RAD_TP=1 ;;
+      *) RAD_TP=$TP ;;
+    esac
+  else
+    for t in $RAD_TP_ALLOWED; do
+      if [ "$RAD_GPU_COUNT" -ge "$t" ]; then RAD_TP=$t; break; fi
+    done
+  fi
 
   # Truncate to TP FIRST, then read the card figures back off only the cards that survived.
   # Deriving them during the scan instead reports a card the run will never touch: with the

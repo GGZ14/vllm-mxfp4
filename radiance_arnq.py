@@ -52,7 +52,11 @@ def _radiance_comm():
         try:
             from vllm.distributed.parallel_state import get_tp_group
             comm = getattr(get_tp_group().device_communicator, "radiance_comm", None)
+            # world_size == 2: the fused epilogue kernel is the 2-rank one; at TP=3 (dummy-head
+            # padding, radiance_tp3pad) the fallback arm below does plain AR + the standalone
+            # epilogue kernel, which is TP-agnostic. A 3-rank _nq port is phase 2 of the plan.
             ok = (comm is not None and not comm.disabled
+                  and getattr(comm, "world_size", 0) == 2
                   and hasattr(comm._ext, "ar_oneshot_2rank_exact_nq"))
             _COMM[0] = comm if ok else False
         except Exception:                           # noqa: BLE001
