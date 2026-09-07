@@ -1,7 +1,68 @@
 # TP3 support via zero-padded dummy heads
 
-Status: planned 2026-08-31, ahead of third-R9700 arrival. Nothing implemented yet.
+Status: planned 2026-08-31, ahead of third-R9700 arrival.
 Rev 2: added the phased 3-rank R4D all-reduce plan (supersedes the earlier "TP3 AR is RCCL-only" decision).
+Rev 3 (2026-09-06/07): **implemented and gated on the two-card box** -- see "Implementation status" at
+the end. Gate C (three real cards) and Gate M (the third card's link) remain.
+
+## Implementation status (2026-09-07)
+
+Shipped, all inert unless `RADIANCE_TP_PAD` is set (a `TP != 3` serve passes `RADIANCE_TP_PAD=0`):
+
+- `radiance_tp3pad.py` (config widening, streaming weight padder, vocab pad multiple), `patch_tp3_pad.py`
+  (three hooks: `ModelConfig.__post_init__`, `DefaultModelLoader.load_weights`,
+  `VocabParallelEmbedding.__init__`), `tp3pad_selftest.py` (torch-free header check of every rule
+  against both checkpoints; `--torch` pads one real tensor per rule inside the image).
+- `serve-mxfp4.sh`: `TP=3` is accepted (explicit only; `gpu-detect.sh` keeps `8 4 2 1` for auto-pick
+  until Gate C), sets `RADIANCE_TP_PAD=3`, forces `RADIANCE_MXFP4_WPERM=0` and `RADIANCE_FP8_STREAM=0`,
+  own cache dir `-tp${TP}pad`, `RADIANCE_AR_MAX_KB=2048` at TP=3, dies early on too few cards.
+- libr4d extras **rx6**: `r4d_ar_oneshot_3rank_exact.hip` + registry row + pybind + build unit
+  (`r4d.select("allreduce", world_size=3, exact=1)` -> `ar_oneshot_3rank_exact`; the 2-rank objects
+  are byte-identical to rx5). `patch_ar_3rank.py` makes `radiance_allreduce.py` ws-generic (peer
+  list, 2 receive regions x 2 slots, 3-rank launch arm, ws in (2, 3) install gate, no compressed
+  path at ws=3); `radiance_arnq.py` takes its TP-agnostic fallback arm at ws != 2. Untested on real
+  3-rank hardware: `~/mxfp4_work/tp3/ar3_smoke.py` (3 processes on 2 GPUs) and `p2p3.sh` (Gate M
+  microbench) are the phase-0 checks.
+
+Two things the plan did not foresee, both found by Gate A and fixed:
+
+1. **The MXFP4 decode GEMM needs per-rank K % 128, not K % 64.** It stages whole BK=128 slabs with no k
+   bound; the padded down_proj K (17472 at TP=1, 5824 at TP=3) made the last slab read the next row and
+   the serve emitted token 0 only, from the first token of any short prompt (M <= 64) while a long
+   prompt's first token (prefill kernel, BK=64) was right. Fix in `radiance_mxfp4_fp8.hip` `launch()`:
+   `K % 128 -> BK=64` (split 2 -> 4). Inert for stock shapes; measured cost nil (17472 on BK=64 66.6
+   ms/step vs 17664 on BK=128 66.3 at TP=1), so the default stays 17472.
+2. **The drafter's KV bytes per token must equal the target's.** 9 padded kv heads x 128 != 6 x 256:
+   the drafter's cache group got a different block size and vLLM's sliding-window prefix-cache
+   lookup asserted ("does not support fine-grained (partial) cache hits") on the first request.
+   And **GQA is part of the trained weights** (q head h reads kv head h // GQA): 36 q / 12 kv = GQA 3
+   remapped every real q head and the drafter accepted nothing (mean acceptance length 1.007 vs
+   3.5; the target stayed correct through rejection). The drafter is padded to **48 q / 12 kv**
+   (GQA 4 kept), which also shards at TP=2, so `RADIANCE_TP_PAD_DRAFTER=0` is an A/B lever.
+
+Gate results (GSM8K 500q greedy, conc 8, `qwen-fixed-v22.3.jinja`; arms differ ONLY by the padding --
+both sides `SPEC_METHOD=mtp GDN_MERGE=0 FP8S=0 WPERM=0`, TP=1 arms at MAXLEN 16384 / CHUNK 4096):
+
+| arm | geometry | accuracy | note |
+|---|---|---|---|
+| A_base | TP=1 stock | 97.40% (487) | 63.3 ms/step ctx 25, 64.3 @8k |
+| A_pad | TP=1 36/6/18/54/17472, vocab 248448 | **97.80% (489)** | 66.6 ms/step (+5%: heads +3%, MLP +2%); 4 vs 6 concurrent on one card's KV, hence the longer wall |
+| B_base | TP=2 stock | 97.80% (489) | 275.6 s |
+| B_pad | TP=2 36/6/18/54, MLP stock | **97.80% (489)** | 280.5 s; R4D bound at 18 q / 3 kv, 304/304 linears on our kernel, custom AR live |
+| A_base_dflash | TP=1 dflash SPEC=3 (fits one card) | 97.50% (195/200) | |
+| A_pad_dflash | + padded drafter **48/12**/17664 | **98.50% (197/200)** | 617 s vs 678; acc/draft 1.305 vs 1.239 @ctx 25 (single prompt); with 36/12 (GQA 3) the drafter accepted nothing |
+
+AR phase 0 (2026-09-07, two cards): `ar3_smoke.py` **PASS** -- 3 processes on 2 GPUs, 0 mismatches vs
+the canonical fp32 reference over 300 eager calls (5 sizes to 1 MiB) and 20 cudagraph replays on every
+rank, cross-rank outputs sha1-identical, replay 47-194 us at 80 KiB (two ranks share a card, so no perf
+claim). `p2p3.sh` on the x8/x8 pair: push 27.6-27.7 GB/s at 8-80 MiB (the known link), duplex efficiency
+0.98-1.06, flag RTT 1.7-2.9 us, no spin bailout -- the Gate M tool is validated; the three-way pattern
+runs only with three cards.
+
+Greedy 200-token completions: 6/8 (A) and 5/8 (B) byte-identical to the baseline; the rest diverge
+late (padded N/K move split-K and tile boundaries, same class as the WPERM/A-tiled drift).
+Coverage lines in every padded serve: `target coverage OK: 1148 tensors padded of 1703` (759 with the
+MLP stock), `drafter coverage OK: 70 of 117`.
 
 ## Context
 
@@ -34,15 +95,15 @@ Dummy heads appended at the **global end** of each head axis: contiguous shardin
 
 | Quantity | Stock | Padded | Per-rank TP3 |
 |---|---|---|---|
-| num_attention_heads | 32 | **36** | 12 (GQA stays 4) |
-| num_key_value_heads | 8 | **9** | 3 |
+| num_attention_heads | 32 | **48** (with 12 kv: GQA must stay 4, it is baked into which kv head each q head reads) | 16 (GQA stays 4) |
+| num_key_value_heads | 8 | **12** (not 9: KV bytes/token must equal the target's, 12x128 = 6x256, or the cache groups' block sizes differ and the sliding-window prefix-cache lookup asserts) | 4 |
 | intermediate_size | 17408 | **17664** (multiple of 384=3·128, whole scale-blocks per rank) | 5888 |
 
 `fc`/`attention_conv`/`mlp_conv`/`candidate_selector` are ReplicatedLinear — untouched. Note 9 KV heads ∤ 2 → padded drafter validates only at TP1 (Gate A); use `SPEC_METHOD=mtp` for TP3 bring-up.
 
 ### Per-rank MXFP4 kernel audit at TP3 (all functional; two soft notes)
 
-All layers pass K%64 (`radiance_mxfp4.py:572`). Notes: down_proj K=5824 → split-K auto-degrades to sk2 (perf note only); **in_proj_ba per-rank N=36 fails %16**, so (a) `RADIANCE_MXFP4_WPERM` must stay 0 when padding is active (WPERM raises at `:713`) — already the launcher default; (b) `radiance_gdnmerge` skips all 48 GDN merges at TP3 (`:126` gate) — functional, costs the known ~3-6.5% decode; optional phase-2 relaxes the gate for WPERM=0.
+All layers pass K%64 (`radiance_mxfp4.py:572`) -- but the DECODE kernel needs K%128 or the BK=64 override (see Implementation status). Notes: down_proj K=5824 → split-K auto-degrades to sk2 (perf note only); **in_proj_ba per-rank N=36 fails %16**, so (a) `RADIANCE_MXFP4_WPERM` must stay 0 when padding is active (WPERM raises at `:713`) — already the launcher default; (b) `radiance_gdnmerge` skips all 48 GDN merges at TP3 (`:126` gate) — functional, costs the known ~3-6.5% decode; optional phase-2 relaxes the gate for WPERM=0.
 
 ## Weight-padding design
 

@@ -1165,6 +1165,17 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
       dks = split_k_for(dec_nblk, M);
       bkx = 0;   // resolved below from decode_bk64, exactly as shipped
     }
+    // The decode kernel stages whole DBK-byte K slabs with no k bound (stage_a / stage_w read
+    // A + row*K + k0 + c across the slab), so K must be a multiple of the slab. Every stock shape
+    // is a multiple of 128 and never met this; the TP=3 dummy-head padding (radiance_tp3pad)
+    // makes down_proj K = 17472 / 5824 (TP=1 / TP=3): a multiple of 64 but not 128, and at
+    // BK=128 the last slab read the NEXT row's bytes -- a serve that emitted nothing but token 0
+    // (2026-09-06). Take the BK=64 instantiation for such a K; it exists for split 1 and 4 only,
+    // so the split-2 cell widens to 4. Inert when K % 128 == 0 (all stock shapes).
+    if (K % 128) {
+      bkx = 64;
+      if (dks == 2) dks = DEC_KS;
+    }
     // DKS==1 writes C directly and needs neither the partial buffer nor the block counter;
     // anything wider needs both. Sizing the guard by the CHOSEN ks (not the widest) also means a
     // shape that would have overflowed the scratch at DKS=4 can still take the kernel at DKS=1.
