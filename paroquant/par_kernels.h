@@ -94,6 +94,84 @@ __device__ __forceinline__ uint2_t ar_unpack8(unsigned int wv) {
                  __builtin_amdgcn_perm(bo, be, 0x07030602u)};
 }
 
+// ---------------------------------------------------------------- weight staging (both layouts)
+//
+// Two weight layouts, ONE sW tile. Row layout (WPERM=false) is the loader's [N, K/8] u32, eight
+// codes along K per word. Fragment order (WPERM=true) is the MXFP4 kernel's layout, ported
+// verbatim: one 32-lane uint32 slot per (n-tile, k-step); slot lane l of tile (nt, ks) holds row
+// nt*16 + (l & 15), k = ks*16 + (l >> 4)*8 .. +7. A wave's read is then 128 contiguous bytes
+// instead of sixteen rows K/2 bytes apart, which is what let the MXFP4 decode kernel take
+// nontemporal loads (NT: `global_load ... th:TH_LOAD_NT`, the slab is read exactly once per step
+// so keeping it out of L2/MALL protects A and the split-K partials). NT on the ROW layout is
+// 2-3.6x SLOWER on MXFP4 (a row's slab is half a line; the other half is only wanted by the next
+// slab and NT re-fetches it) -- the launcher never asks for it.
+//
+// Clamp, never predicate: N % 16 == 0 under WPERM (loader-asserted) so clamping to the last
+// WSLOTS-aligned row keeps the vector read aligned and every gc + q in bounds.
+template <bool NT, typename T>
+static __device__ __forceinline__ T pq_ld_w(const T *p) {
+  if constexpr (NT) return __builtin_nontemporal_load(p);
+  else return *p;
+}
+
+template <int ROWS, int LBK, int STR, int NTHREADS, bool WPERM, bool NT, int ABLATE = 0,
+          int WSLOT_OVR = 0>
+__device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
+                                           const unsigned int *__restrict__ W, int n0, int N,
+                                           int K, int k0, int tid) {
+  if constexpr (WPERM) {
+    constexpr int KSTEPS_T = LBK / 16, NTILES_T = ROWS / 16;
+    constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
+    constexpr int WSLOTS = WSLOT_OVR ? WSLOT_OVR : ((TOT_SLOTS >= NTHREADS * 4) ? 4 : 2);
+    static_assert(TOT_SLOTS % (NTHREADS * WSLOTS) == 0, "staging must be branch-free");
+    const int ksteps_g = K / 16, kstep0 = k0 / 16;
+#pragma unroll
+    for (int off = 0; off < TOT_SLOTS; off += NTHREADS * WSLOTS) {
+      const int sl = off + tid * WSLOTS;              // first of the group; WSLOTS-aligned
+      const int lane_ = sl & 31, rest = sl >> 5;
+      const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
+      const int r = ntl * 16 + (lane_ & 15), kloc = kst * 16 + (lane_ >> 4) * 8;
+      const int gn = n0 + r;
+      const int gc = gn < N - WSLOTS ? gn : N - WSLOTS;
+      const int lanec = (lane_ & 16) | (gc & 15);
+      const unsigned int *src = &W[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec];
+      unsigned int wq[WSLOTS];
+      if constexpr (WSLOTS == 4) {
+        const uint4_t v = pq_ld_w<NT>((const uint4_t *)src);
+        wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
+      } else {
+        const uint2_t v = pq_ld_w<NT>((const uint2_t *)src);
+        wq[0] = v[0]; wq[1] = v[1];
+      }
+#pragma unroll
+      for (int q = 0; q < WSLOTS; ++q) {
+        if constexpr (ABLATE & 1)
+          *(uint2_t *)(&sW[(r + q) * STR + kloc]) = uint2_t{wq[q], wq[q]};
+        else
+          *(uint2_t *)(&sW[(r + q) * STR + kloc]) = ar_unpack8(wq[q]);
+      }
+    }
+  } else {
+    constexpr int WPT = LBK / 16;                       // uint2 (16 codes) per row per slab
+    static_assert((ROWS * WPT) % NTHREADS == 0, "staging must be branch-free");
+    const int kw = K / 8;
+#pragma unroll
+    for (int off = 0; off < ROWS * WPT; off += NTHREADS) {
+      const int idx = off + tid;
+      const int r = idx / WPT, c = idx % WPT, gn = n0 + r;
+      const int gc = gn < N - 1 ? gn : N - 1;
+      const uint2_t wv = pq_ld_w<NT>((const uint2_t *)(W + (size_t)gc * kw + k0 / 8 + c * 2));
+      if constexpr (ABLATE & 1) {
+        *(uint2_t *)(&sW[r * STR + c * 16]) = uint2_t{wv[0], wv[0]};
+        *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
+      } else {
+        *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8(wv[0]);
+        *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8(wv[1]);
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------- e4m3 encode/decode (OCP)
 //
 // Software, not the v_cvt_pk_fp8 path, for two reasons: the builtin's availability/semantics on
@@ -252,6 +330,294 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant(
   }
 }
 
+// v2 of the prologue, same contract. The records of this lane's two pairs per layer live in
+// REGISTERS (16 x u64, loaded straight from global with the token's x and the channel scales in
+// the same latency window), so there is no record LDS fill, no __syncthreads, and a rotation
+// layer is 4 LDS reads + 4 writes instead of 10 reads + 4 writes. At decode this kernel is pure
+// latency chain (40 x P blocks on 64 CUs), so the two removed round trips are the win; at
+// prefill the LDS op count is the win. Arithmetic is identical (same fmaf on the same disjoint
+// pairs) -> bit-exact against v1, gated in par_harness.
+template <bool ROTOUT = false>
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
+    const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
+    const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ ASG,
+    float *__restrict__ RS, int M, int K, int krot) {
+  const int g = blockIdx.x, p = blockIdx.z;
+  const int G = K / PQ_GROUP;
+  const int m_lo = blockIdx.y * PQ_ROT_TCHUNK;
+  const int m_hi = min(M, m_lo + PQ_ROT_TCHUNK);
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
+  const int c0 = lane * 4;
+
+  // This lane's pairs: t = lane and lane + 32 of every layer. Layers past krot are clamped to
+  // the last real one and never applied (uniform branch below) -- clamp, never predicate.
+  const unsigned long long *__restrict__ Tb =
+      (const unsigned long long *)T + ((size_t)p * krot) * (K / 2) + (size_t)g * 64;
+  unsigned long long rec[PQ_KROT_MAX][2];
+#pragma unroll
+  for (int r = 0; r < PQ_KROT_MAX; ++r) {
+    const int rc = r < krot ? r : krot - 1;
+    rec[r][0] = Tb[(size_t)rc * (K / 2) + lane];
+    rec[r][1] = Tb[(size_t)rc * (K / 2) + lane + 32];
+  }
+  const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)g * PQ_GROUP + c0);
+  const float cs0 = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
+  const float cs1 = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
+  const float cs2 = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
+  const float cs3 = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
+
+  for (int m = m_lo + wave; m < m_hi; m += PQ_ROT_TPB) {
+    const uint2_t xv = *(const uint2_t *)(X + (size_t)m * K + (size_t)g * PQ_GROUP + c0);
+    float v0 = __uint_as_float(xv[0] << 16) * cs0, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * cs1;
+    float v2 = __uint_as_float(xv[1] << 16) * cs2, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * cs3;
+    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
+#pragma unroll
+        for (int t2 = 0; t2 < 2; ++t2) {
+          const unsigned long long rv = rec[r][t2];
+          const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+          const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+          const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+          const int i = ij & 0xFF, j = ij >> 8;
+          const float xi = s_x[wave][i], xj = s_x[wave][j];
+          s_x[wave][i] = fmaf(c, xi, sn * xj);
+          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
+    }
+
+    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1)
+      amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float inv = 1.f / scale;
+
+    if constexpr (ROTOUT) {
+      __bf16 *xr = (__bf16 *)A + ((size_t)p * M + m) * K + (size_t)g * PQ_GROUP + c0;
+      xr[0] = (__bf16)v0; xr[1] = (__bf16)v1; xr[2] = (__bf16)v2; xr[3] = (__bf16)v3;
+      if (lane == 0) ASG[((size_t)p * M + m) * G + g] = scale;
+      continue;
+    }
+
+    const unsigned char b0 = pq_e4m3_encode(v0 * inv), b1 = pq_e4m3_encode(v1 * inv);
+    const unsigned char b2 = pq_e4m3_encode(v2 * inv), b3 = pq_e4m3_encode(v3 * inv);
+    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1)
+      rs += __shfl_xor(rs, off, 32);
+    *(unsigned int *)(A + ((size_t)p * M + m) * K + (size_t)g * PQ_GROUP + c0) =
+        (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) |
+        ((unsigned int)b3 << 24);
+    if (lane == 0) {
+      ASG[((size_t)p * M + m) * G + g] = scale;
+      RS[((size_t)p * M + m) * G + g] = rs * scale;
+    }
+  }
+}
+
+// ---------------------------------------- fused residual-add + Gemma RMSNorm + rotate + quant
+//
+// The decode-band producer for every norm-fed ParoQuant linear (input_layernorm -> qkv /
+// in_proj_qkvz, post_attention_layernorm -> gate_up). Mirrors vLLM's ir.ops.fused_add_rms_norm
+// exactly as inductor traces it: v = y + res in fp32, residual out = bf16(v), variance = mean(v^2)
+// over the UNROUNDED v, hs = bf16((v * rsqrt(var + eps)) * (w + 1)); then the rotate_quant2 body
+// on hs. One workgroup per (row, 8-group chunk, partition): every workgroup re-reads the row for
+// the variance (20 KB per 10 KB of useful output -- nothing at decode M), only the (chunk 0,
+// partition 0) workgroup writes the residual, only partition-0 workgroups write hs. ROT=false is
+// the same kernel without the rotation (grid (M, 1, 1)): the prefill-size fallthrough, where the
+// linear rotates on its own tiled path from hs.
+//
+// The block reduction order differs from inductor's, so rsqrt can differ by an ulp and flip a
+// bf16 rounding of hs a few times per million elements -- same class as gdn_norm_quant; the
+// harness gates fused == (ROT=false kernel + pq_rotate_quant2) bit-exact and both against the
+// CPU reference at ppm.
+__device__ __forceinline__ void pq_load_group(const unsigned short *__restrict__ T,
+                                              const __half *__restrict__ CS, int p, int g, int K,
+                                              int krot, int lane,
+                                              unsigned long long (&rec)[PQ_KROT_MAX][2],
+                                              float (&cs)[4]) {
+  const unsigned long long *__restrict__ Tb =
+      (const unsigned long long *)T + ((size_t)p * krot) * (K / 2) + (size_t)g * 64;
+#pragma unroll
+  for (int r = 0; r < PQ_KROT_MAX; ++r) {
+    const int rc = r < krot ? r : krot - 1;
+    rec[r][0] = Tb[(size_t)rc * (K / 2) + lane];
+    rec[r][1] = Tb[(size_t)rc * (K / 2) + lane + 32];
+  }
+  const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)g * PQ_GROUP + lane * 4);
+  cs[0] = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
+  cs[1] = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
+  cs[2] = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
+  cs[3] = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
+}
+
+template <bool ROT>
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
+    const __bf16 *__restrict__ Y, const __bf16 *__restrict__ RES,
+    const __bf16 *__restrict__ Wn, float eps,
+    const unsigned short *__restrict__ T,     // [P, krot, K/2, 4]
+    const __half *__restrict__ CS,            // [P, K]
+    __bf16 *__restrict__ HS, __bf16 *__restrict__ RO,
+    unsigned char *__restrict__ A, float *__restrict__ ASG, float *__restrict__ RS,
+    int M, int K, int krot, int gpw) {
+  // gpw = groups per wave: 1 at single-stream M (latency-bound, one chain per wave), more at
+  // batched M where the per-workgroup row re-read is the cost (M=64 P=3: 960 workgroups x 20 KB).
+  const int m = blockIdx.x, chunk = blockIdx.y, p = blockIdx.z;
+  const int G = K / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int g0 = (chunk * gpw) * PQ_ROT_WAVES + wave;
+  // wave-uniform count of real groups this wave owns
+  int ng = 0;
+  for (int gi = 0; gi < gpw; ++gi) ng += (g0 + gi * PQ_ROT_WAVES < G) ? 1 : 0;
+  __shared__ float s_red[PQ_ROT_WAVES];
+  __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
+  const int c0 = lane * 4;
+
+  unsigned long long rec[PQ_KROT_MAX][2];
+  float cs[4] = {1.f, 1.f, 1.f, 1.f};
+  if constexpr (ROT) pq_load_group(T, CS, p, g0 < G ? g0 : G - 1, K, krot, lane, rec, cs);
+
+  // Row pass: v = y + res (fp32), sum of squares, residual out. The plain-norm path (prefill
+  // sizes, one block per row) keeps v in registers for the second pass so the row is read once,
+  // like inductor's fused norm; the ROT path re-reads only its own group.
+  const uint4_t *__restrict__ y4 = (const uint4_t *)(Y + (size_t)m * K);
+  const uint4_t *__restrict__ r4 = (const uint4_t *)(RES + (size_t)m * K);
+  uint4_t *__restrict__ o4 = (uint4_t *)(RO + (size_t)m * K);
+  const int KV = K >> 3;
+  constexpr int MAXG = 5;                     // 8704 / (256 * 8) rounds up to 5 (K <= 10240)
+  float sv[ROT ? 1 : MAXG][8];
+  float ssq = 0.f;
+  int nsv = 0;
+  for (int i = tid; i < KV; i += PQ_ROT_WAVES * 32, ++nsv) {
+    const uint4_t vy = y4[i], vr = r4[i];
+    uint4_t vo;
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+      const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+      const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+      ssq = fmaf(a0, a0, ssq);
+      ssq = fmaf(a1, a1, ssq);
+      if constexpr (!ROT) {
+        if (nsv < MAXG) { sv[nsv][2 * h] = a0; sv[nsv][2 * h + 1] = a1; }
+      }
+      const __bf16 b0 = (__bf16)a0, b1 = (__bf16)a1;
+      vo[h] = (unsigned int)__bfloat16_as_ushort(b0) | ((unsigned int)__bfloat16_as_ushort(b1) << 16);
+    }
+    if (chunk == 0 && p == 0) o4[i] = vo;
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) ssq += __shfl_xor(ssq, off, 32);
+  if (lane == 0) s_red[wave] = ssq;
+  __syncthreads();
+  float tot = 0.f;
+#pragma unroll
+  for (int w = 0; w < PQ_ROT_WAVES; ++w) tot += s_red[w];
+  const float inv = rsqrtf(tot / (float)K + eps);
+
+  if constexpr (!ROT) {
+    int gg = 0;
+    for (int i = tid; i < KV; i += PQ_ROT_WAVES * 32, ++gg) {
+      const uint4_t vw = ((const uint4_t *)Wn)[i];
+      uint4_t vo;
+      float a[8];
+      if (gg < MAXG) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) a[e] = sv[gg][e];
+      } else {                                    // K > 10240: re-read (never on this model)
+        const uint4_t vy = y4[i], vr = r4[i];
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+          a[2 * h] = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+          a[2 * h + 1] = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+        }
+      }
+#pragma unroll
+      for (int h = 0; h < 4; ++h) {
+        const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
+        const __bf16 n0 = (__bf16)((a[2 * h] * inv) * w0), n1 = (__bf16)((a[2 * h + 1] * inv) * w1);
+        vo[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
+      }
+      ((uint4_t *)(HS + (size_t)m * K))[i] = vo;
+    }
+    return;
+  }
+
+  for (int gi = 0; gi < ng; ++gi) {
+    const int g = g0 + gi * PQ_ROT_WAVES;
+    if (gi) pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
+    const int kb = g * PQ_GROUP + c0;
+    const uint2_t vy = *(const uint2_t *)(Y + (size_t)m * K + kb);
+    const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
+    const uint2_t vw = *(const uint2_t *)(Wn + kb);
+    float nv[4];
+    unsigned int hsw[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+      const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+      const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
+      const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
+      nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
+      hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
+    }
+    if (p == 0) *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
+
+    // rotate_quant2 body on the normalized values
+    float v0 = nv[0] * cs[0], v1 = nv[1] * cs[1], v2 = nv[2] * cs[2], v3 = nv[3] * cs[3];
+    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
+#pragma unroll
+        for (int t2 = 0; t2 < 2; ++t2) {
+          const unsigned long long rv = rec[r][t2];
+          const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+          const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+          const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+          const int i = ij & 0xFF, j = ij >> 8;
+          const float xi = s_x[wave][i], xj = s_x[wave][j];
+          s_x[wave][i] = fmaf(c, xi, sn * xj);
+          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
+    }
+    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float qi = 1.f / scale;
+    const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
+    const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
+    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+    *(unsigned int *)(A + ((size_t)p * M + m) * K + kb) =
+        (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+    if (lane == 0) {
+      ASG[((size_t)p * M + m) * G + g] = scale;
+      RS[((size_t)p * M + m) * G + g] = rs * scale;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");         // s_x reuse across groups
+  }
+}
+// Measured 2026-09-02 (--bench2 fuse): one chain per wave to M=40, two above; four never wins.
+static inline int pq_rot_gpw(int M) { return M <= 40 ? 1 : 2; }
+
 // Prefill pass C: one wave per (partition, token). Reduces the per-group scales to the token
 // scale As = max_g ASG (they are amax/448, so their max IS the token amax/448), encodes the
 // rotated row against it, and writes plain code-domain row-sums per group (the PTOK GEMM applies
@@ -304,7 +670,8 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant(
 //   * fold becomes  acc += asg[m] * (sc * t - zsc * rs[m]); the epilogue As multiply is gone
 //     (the activation scale is per group now, so it HAS to fold per slab).
 //   * A/ASG/RS are indexed through the block's partition (pb1/pb2 boundaries).
-template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0>
+template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0, bool WPERM = false,
+          bool NT = false>
 __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
@@ -374,20 +741,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
         *(uint4_t *)(&sA[r * DASTR + c]) = *(const uint4_t *)(A + (size_t)rc * K + k0 + c);
       }
     }
-#pragma unroll
-    for (int off = 0; off < BND * (DBK / 16); off += DNTHREADS) {
-      const int idx = off + tid;
-      const int r = idx / (DBK / 16), c = idx % (DBK / 16), gn = n0 + r;
-      const int gc = gn < N - 1 ? gn : N - 1;
-      const uint2_t wv = *(const uint2_t *)(W + (size_t)gc * kw + k0 / 8 + c * 2);
-      if constexpr (ABLATE & 1) {
-        *(uint2_t *)(&sW[r * DWSTR + c * 16]) = uint2_t{wv[0], wv[0]};
-        *(uint2_t *)(&sW[r * DWSTR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
-      } else {
-        *(uint2_t *)(&sW[r * DWSTR + c * 16]) = ar_unpack8(wv[0]);
-        *(uint2_t *)(&sW[r * DWSTR + c * 16 + 8]) = ar_unpack8(wv[1]);
-      }
-    }
+    pq_stage_w<BND, DBK, DWSTR, DNTHREADS, WPERM, NT, ABLATE>(sW, W, n0, N, K, k0, tid);
     __syncthreads();
 
     if constexpr (IMAJOR) {
@@ -529,7 +883,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
 // collapses to AutoRound's single FMA per slab; the zero-point correction stays one FMA per
 // element per group against PLAIN code row-sums, and As multiplies once in the epilogue. The
 // per-group variant (PTOK=false) remains for the decode-band fallthrough and the harness.
-template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false>
+template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false, bool WPERM = false>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
@@ -612,20 +966,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
       const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
       *(uint4_t *)(&sA[r * AR_ASTR + c]) = *(const uint4_t *)(Ab + (rc * K + c));
     }
-#pragma unroll
-    for (int off = 0; off < BNF_T * (AR_BK / 16); off += AR_NTHREADS) {
-      const int idx = off + tid;
-      const int r = idx / (AR_BK / 16), c = idx % (AR_BK / 16);
-      const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
-      const uint2_t wv = *(const uint2_t *)(Wb + (size_t)rc * kw + c * 2);
-      if constexpr (ABLATE & 1) {
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16]) = uint2_t{wv[0], wv[0]};
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
-      } else {
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16]) = ar_unpack8(wv[0]);
-        *(uint2_t *)(&sW[r * AR_ASTR + c * 16 + 8]) = ar_unpack8(wv[1]);
-      }
-    }
+    pq_stage_w<BNF_T, AR_BK, AR_ASTR, AR_NTHREADS, WPERM, false, ABLATE>(sW, W, n0, N, K, k0,
+                                                                          tid);
     __syncthreads();
 
     if constexpr (IMAJOR) {
@@ -762,4 +1104,644 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
           C[(size_t)m * N + ncol[j]] = (__bf16)o;
         }
       }
+}
+
+// ------------------------------------------------------------ A-tiled prefill path (per-token)
+//
+// The activation arrives in WMMA-FRAGMENT-TILED layout, the layout the MXFP4 A-tiled kernel
+// reads: each 16m x 16k e4m3 fragment is 256 contiguous bytes in lane order (lane l owns bytes
+// 8l..8l+7 = A[mt*16 + l%16][ks*16 + (l/16)*8 .. +7]); fragment (mt, ks) sits at
+// (mt*(K/16) + ks)*256 and a partition is Mt*16*K bytes (Mt = ceil(M/16); pad rows hold whatever
+// the producer left there -- they only reach accumulators the epilogue drops). One coalesced
+// global_load_b64 per fragment per wave lands straight in the af register the WMMA reads, so
+// the A tile, its LDS staging and both its LDS round trips are gone; only W goes through LDS
+// (8.7 KB at TN=2 / LBK=128), so three blocks share a CU instead of two. On MXFP4 this was
+// 12-16% off the folded kernel at M >= 1024, and the A tile is a LARGER share of this kernel
+// (the per-slab rescale keeps the tile in LDS for a temp accumulator round anyway).
+//
+// LBK=128 makes the slab the scale group: sc/zsc are loaded once, the temp accumulator runs
+// eight WMMA steps, and the fold (1 FMA/elem for the scale) plus the zero-point correction
+// (1 FMA/elem against the plain code row-sums) land once per 128 k -- half the fold VALU the
+// BK=64 PTOK kernel pays. The price is af[TM][8] = 64 VGPRs of fragments in flight; LBK=64 keeps
+// the old two-slab group structure (correction on the second slab) at 32. Both are built, the
+// launcher takes what the harness measured.
+//
+// WHOIST: read the slab's W fragments from LDS once per wave (wfa[NS][TN], 32 VGPRs at
+// LBK=128) instead of once per M-fragment (TM x the ds_reads). Measured either way.
+// Prefill pass C, tiled output. The first cut read each lane's 16 B from sixteen different rows
+// per k-step and measured 1.3-2x the row kernel (tier: passC bench). This one keeps the row
+// kernel's contiguous read (one wave sweeps one 256 B row segment per group), parks the encoded
+// 16 x 128 tile in LDS at a 136 B row stride (conflict-free for both the 4 B row writes and the
+// 8 B fragment reads), and writes each 256 B fragment with one wave store. Block = one m-tile
+// (16 rows) x 8 waves; wave w takes groups g = w, w+8, ... Codes/AS are identical to
+// pq_token_quant (same inv, same encode); RS is the same 32-lane tree per (row, group).
+#define PQ_TQ_STR 136
+// Group split for pq_token_quant_tiled: enough blocks to fill 64 CUs x ~4 blocks, capped at 4.
+static inline int pq_tq_zsplit(int M) {
+  const int Mt = (M + 15) / 16;
+  int z = 512 / (Mt > 0 ? Mt : 1);
+  return z < 1 ? 1 : (z > 4 ? 4 : z);
+}
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
+    const __bf16 *__restrict__ XR,          // [P, M, K] rotated values (pass A)
+    const float *__restrict__ ASG,          // [P, M, K/128] per-group scales (pass A)
+    unsigned char *__restrict__ AT,         // [P, Mt*16, K] e4m3 codes out, fragment-tiled
+    float *__restrict__ AS,                 // [P, M] per-token scale out
+    float *__restrict__ RS,                 // [P, M, K/128] code row-sums out
+    int M, int K) {
+  const int G = K / PQ_GROUP, ksteps = K / 16;
+  const int Mt = (M + 15) >> 4;
+  const int p = blockIdx.y, mt = blockIdx.x;
+  // gridDim.z splits the groups across blocks so a small M still fills the GPU (one block per
+  // m-tile is 128 blocks at M=2048); split z takes g = z*8 + wave, stepping by 8*gridDim.z.
+  const int zs = blockIdx.z, nz = gridDim.z;
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  __shared__ __align__(16) unsigned char s_t[PQ_ROT_WAVES][16 * PQ_TQ_STR];
+
+  // Token scales: lane l < 16 owns row mt*16 + l (clamped; pad rows recompute the last row and
+  // never write AS/RS). Broadcast per row below with a shuffle.
+  const int mrow = mt * 16 + (lane & 15);
+  const int mc = mrow < M ? mrow : M - 1;
+  float inv_l;
+  {
+    const float *asg_row = ASG + ((size_t)p * M + mc) * G;
+    float amx = 0.f;
+    int g4 = 0;
+    for (; g4 + 4 <= G; g4 += 4) {
+      const float4 v = *(const float4 *)(asg_row + g4);
+      amx = fmaxf(amx, fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w)));
+    }
+    for (; g4 < G; ++g4) amx = fmaxf(amx, asg_row[g4]);
+    const float scale = fmaxf(amx, 1e-10f);
+    inv_l = 1.f / scale;
+    if (zs == 0 && wave == 0 && lane < 16 && mrow < M) AS[(size_t)p * M + mrow] = scale;
+  }
+
+  unsigned char *tile = s_t[wave];
+  const int c0 = lane * 4;
+  unsigned char *at = AT + (size_t)p * Mt * 16 * K + (size_t)mt * ksteps * 256 + lane * 8;
+  for (int g = zs * PQ_ROT_WAVES + wave; g < G; g += PQ_ROT_WAVES * nz) {
+    // Phase 1: sixteen contiguous row reads, encode, park in LDS, row-sum per row.
+#pragma unroll 4
+    for (int r = 0; r < 16; ++r) {
+      const int m = mt * 16 + r, mr = m < M ? m : M - 1;
+      const float inv = __shfl(inv_l, r, 32);
+      const uint2_t xv = *(const uint2_t *)(XR + ((size_t)p * M + mr) * K + (size_t)g * PQ_GROUP + c0);
+      const float v0 = __uint_as_float(xv[0] << 16) * inv, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * inv;
+      const float v2 = __uint_as_float(xv[1] << 16) * inv, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * inv;
+      const unsigned char b0 = pq_e4m3_encode(v0), b1 = pq_e4m3_encode(v1);
+      const unsigned char b2 = pq_e4m3_encode(v2), b3 = pq_e4m3_encode(v3);
+      *(unsigned int *)(tile + r * PQ_TQ_STR + c0) =
+          (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+      if (lane == 0 && m < M) RS[((size_t)p * M + m) * G + g] = rs;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+    // Phase 2: eight fragment stores, 256 B contiguous each. Lane l reads row l&15, k-half l>>4.
+    const unsigned char *src = tile + (lane & 15) * PQ_TQ_STR + (lane >> 4) * 8;
+#pragma unroll
+    for (int st = 0; st < PQ_GROUP / 16; ++st) {
+      const uint2_t v = *(const uint2_t *)(src + st * 16);
+      *(uint2_t *)(at + (size_t)(g * (PQ_GROUP / 16) + st) * 256) = v;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");   // reads done before the next group's writes
+  }
+}
+
+// ABL (bench only): 1 = keep the temp accumulator but drop the scale/zero-point fold (acc += t);
+// 2 = accumulate straight into acc (no temp, no fold: the MXFP4-shaped inner loop). Prices what
+// the fp16 group scale costs on top of the WMMA stream.
+// ABL bit 4 (ZPE): the zero-point term leaves the main loop. It is the rank-G product
+// sum_g zsc[g][n] * rs[m][g]; with RSH = fp16 row-sums in WMMA fragment order ([P, Mt, Gp/16]
+// fragments of 16 rows x 16 groups, Gp = G rounded up to 16) and ZSH = fp16 zero-scales
+// [N, Gp] (k-contiguous), the epilogue does Gp/16 fp16 WMMAs per output tile -- under 1% of the
+// main stream -- and the loop keeps only the scale FMA (8 VALU per tile-group instead of 16,
+// which the ablation prices at ~10%). fp16 row-sums: |rs| <= 448*128 < 65504, 11-bit mantissa,
+// the correction's rounding lands ~1e-4 relative, under the bf16 output floor.
+template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0>
+__global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
+    const unsigned char *__restrict__ AT,   // [P, Mt*16, K] fragment-tiled e4m3
+    const unsigned int *__restrict__ W, const __half *__restrict__ SZ,
+    const float *__restrict__ AS,           // [P, M] per-token scale
+    const float *__restrict__ RS,           // [P, M, K/128] plain code row-sums
+    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2,
+    const __half *__restrict__ RSH = nullptr,   // ZPE: [P, Mt*Gp*16] fp16 row-sum fragments
+    const __half *__restrict__ ZSH = nullptr) { // ZPE: [N, Gp] fp16 zero-scales
+  static_assert(LBK == 64 || LBK == 128, "slab is one group or half a group");
+  constexpr int NS = LBK / 16;
+  constexpr int LWSTR = LBK + AR_PAD;
+  constexpr int BNF_T = AR_WN * TN * 16;
+  __shared__ unsigned char sW[BNF_T * LWSTR];
+  __shared__ float s_rs[AR_BMF];
+
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int wm = wave / AR_WN, wn = wave % AR_WN;
+  const int col = lane & 15, kb8 = (lane >> 4) * 8;
+  const int m0 = blockIdx.y * AR_BMF, n0 = blockIdx.x * BNF_T;
+  const int ksteps_g = K / 16;
+  const int Mt = (M + 15) >> 4;
+
+  // PARO: partition select.
+  const int prt = (n0 >= pb1 ? 1 : 0) + (n0 >= pb2 ? 1 : 0);
+  const int G = K / PQ_GROUP;
+  AT += (size_t)prt * Mt * 16 * K;
+  AS += (size_t)prt * M;
+  RS += (size_t)prt * M * G;
+
+  // Wave-uniform tile bases (SGPR) + one per-lane offset; tile-granular clamp, never predicate.
+  const unsigned char *abase[AR_TM];
+#pragma unroll
+  for (int i = 0; i < AR_TM; ++i) {
+    int mt = (m0 >> 4) + wm * AR_TM + i; mt = mt < Mt - 1 ? mt : Mt - 1;
+    abase[i] = AT + (size_t)mt * ksteps_g * 256;
+  }
+  const int aoff = lane * 8;
+
+  floatx8 acc[AR_TM][TN];
+#pragma unroll
+  for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+
+  int ncol[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) ncol[j] = n0 + wn * TN * 16 + j * 16 + col;
+
+  float sc[TN], zsc[TN];
+  for (int k0 = 0; k0 < K; k0 += LBK) {
+    const int ks0 = k0 / 16, g = k0 / PQ_GROUP;
+    // LBK=128: every slab is a whole group. LBK=64: the group's first slab loads the scales and
+    // stages the row-sums, the second applies the correction (both share sc/zsc/rs).
+    const bool first = (LBK == PQ_GROUP) || (((k0 / AR_BK) & 1) == 0);
+    const bool second = (LBK == PQ_GROUP) || !first;
+    // A fragments straight from global, issued before the W staging so they land under it.
+    int2_t af[AR_TM][NS];
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+      for (int st = 0; st < NS; ++st)
+        af[i][st] = *(const int2_t *)(abase[i] + ((ks0 + st) * 256 + aoff));
+    if (first) {
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        const __half2 szv =
+            *(const __half2 *)(SZ + (((size_t)g * N + (ncol[j] < N ? ncol[j] : N - 1)) * 2));
+        sc[j] = __half2float(szv.x);
+        zsc[j] = __half2float(szv.y);
+        // NB: the compiler feeds these f16 values straight into v_fma_mix_f32 for the fold (128
+        // per slab, no VOPD pairing). Pinning them as fp32 (asm "+v") gets 31 v_dual_fmac pairs
+        // and is 3.5-4% SLOWER on every shape (measured 2026-09-03) -- leave the mix form.
+      }
+      const int r = tid;
+      const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
+      s_rs[r] = RS[(size_t)rc * G + g];
+    }
+    pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR>(sW, W, n0, N, K, k0,
+                                                                          tid);
+    __syncthreads();
+
+    int2_t wfa[WHOIST ? NS : 1][TN];
+    if constexpr (WHOIST) {
+#pragma unroll
+      for (int st = 0; st < NS; ++st)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          const unsigned char *pw = &sW[(wn * TN * 16 + j * 16 + col) * LWSTR + st * 16 + kb8];
+          wfa[st][j][0] = *(const int *)pw; wfa[st][j][1] = *(const int *)(pw + 4);
+        }
+    }
+    if constexpr (ABL == 2) {
+#pragma unroll
+      for (int st = 0; st < NS; ++st) {
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+            acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wfa[st][j], acc[i][j]);
+      }
+      __syncthreads();
+      continue;
+    }
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i) {
+      floatx8 t[TN];
+#pragma unroll
+      for (int j = 0; j < TN; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) t[j][e] = 0.f;
+#pragma unroll
+      for (int st = 0; st < NS; ++st) {
+        if constexpr (WHOIST) {
+          __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wfa[st][j], t[j]);
+        } else {
+          int2_t wf[TN];
+#pragma unroll
+          for (int j = 0; j < TN; ++j) {
+            const unsigned char *pw = &sW[(wn * TN * 16 + j * 16 + col) * LWSTR + st * 16 + kb8];
+            wf[j][0] = *(const int *)pw; wf[j][1] = *(const int *)(pw + 4);
+          }
+          __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wf[j], t[j]);
+        }
+      }
+      const int mlb = wm * AR_TM * 16 + i * 16 + kb8;
+      if constexpr (ABL == 1) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][j][e] += t[j][e];
+        continue;
+      }
+      if (second && (ABL & 4) == 0) {
+        const float4 r4l = *(const float4 *)&s_rs[mlb], r4h = *(const float4 *)&s_rs[mlb + 4];
+        const float rv[8] = {r4l.x, r4l.y, r4l.z, r4l.w, r4h.x, r4h.y, r4h.z, r4h.w};
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e)
+            acc[i][j][e] = fmaf(sc[j], t[j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
+      } else {
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], t[j][e], acc[i][j][e]);
+      }
+    }
+    __syncthreads();
+  }
+
+  if constexpr ((ABL & 4) && !(ABL & 8)) {
+    // Zero-point correction: acc -= RSH[m, :] . ZSH[n, :] over Gp groups, fp16 WMMA. The
+    // block's 64 zero-scale rows (Gp halfs each) are staged into the dead W slab space with
+    // coalesced loads first: gathered straight from global they were 16 rows per wave-load,
+    // and with the weight stream owning L2 that cost ~20% on gate_up.
+    const int Gp = (G + 15) & ~15;
+    const int gsteps = Gp / 16;
+    typedef _Float16 halfx8 __attribute__((ext_vector_type(8)));
+    __half *sZ = (__half *)sW;                          // BNF_T * Gp halfs <= sW bytes for Gp <= 64
+    {
+      const int nz = BNF_T * Gp / 8;                    // 16-byte units
+      for (int u = tid; u < nz; u += AR_NTHREADS) {
+        const int r = u / (Gp / 8), c8 = u % (Gp / 8);
+        const int gn = n0 + r, gc = gn < N ? gn : N - 1;
+        *(uint4_t *)(sZ + (size_t)r * Gp + c8 * 8) = *(const uint4_t *)(ZSH + (size_t)gc * Gp + c8 * 8);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < AR_TM; ++i) {
+      int mt = (m0 >> 4) + wm * AR_TM + i; mt = mt < Mt - 1 ? mt : Mt - 1;
+      const __half *rbase = RSH + (size_t)prt * Mt * Gp * 16 + (size_t)mt * gsteps * 256;
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        floatx8 corr;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) corr[e] = 0.f;
+        const __half *zrow = sZ + (size_t)(wn * TN * 16 + j * 16 + col) * Gp + kb8;
+        for (int gs = 0; gs < gsteps; ++gs) {
+          const halfx8 ra = *(const halfx8 *)(rbase + (size_t)gs * 256 + lane * 8);
+          const halfx8 zb = *(const halfx8 *)(zrow + gs * 16);
+          corr = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ra, zb, corr);
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[i][j][e] -= corr[e];
+      }
+    }
+  }
+  // Epilogue: As once per row. Full-tile fast path (no per-element guards) when the tile is
+  // interior, else the guarded form.
+  {
+    const bool full = (m0 + wm * AR_TM * 16 + (AR_TM - 1) * 16 + kb8 + 7 < M) &&
+                      (ncol[TN - 1] < N);
+    if (full) {
+      __bf16 *__restrict__ Cb = C + (size_t)(m0 + wm * AR_TM * 16) * N;
+      const float *__restrict__ Asb = AS + m0 + wm * AR_TM * 16;
+#pragma unroll
+      for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int r = i * 16 + kb8 + e;
+            Cb[r * N + ncol[j]] = (__bf16)(acc[i][j][e] * Asb[r]);
+          }
+      return;
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < AR_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = m0 + wm * AR_TM * 16 + i * 16 + kb8 + e;
+        if (m < M && ncol[j] < N) C[(size_t)m * N + ncol[j]] = (__bf16)(acc[i][j][e] * AS[m]);
+      }
+}
+
+// ------------------------------- elementwise / per-head producers + rotate + quant (decode band)
+//
+// The three remaining prologue sites, each a producer whose output is exactly one 128-channel
+// group per wave (no row-wide reduction), fused with the rotate_quant2 body:
+//   MODE 0  SiLU-mul before down_proj:   v = bf16( bf16(silu(g)) * u ),  X = gate_up [M, 2N]
+//   MODE 1  attention gate before o_proj: v = bf16( x * bf16(sigmoid(z)) ), X [M, N], Y = gate
+//   MODE 2  GDN gated RMSNorm before out_proj (head = 128 = one group, norm_before_gate):
+//           v = bf16( ((x * rsqrt(mean(x^2)+eps)) * w) * silu(z) ),  X [M, N], Y = z (stride ys)
+// Rounding mirrors radiance_silu_mul_quant / radiance_gdn_norm_quant / eager sigmoid gating
+// (the ppm-level expf-vs-torch differences are the same class as those kernels). hs (bf16) is
+// always written -- the prefill-size fallthrough (ROT=false) and the tuple's hs both need it.
+// Grid (M, ceil(G / (8*gpw)), 1); single partition (all three consumers are P=1).
+template <int MODE, bool ROT>
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ew_rot(
+    const __bf16 *__restrict__ X, const __bf16 *__restrict__ Y, long ys,
+    const __bf16 *__restrict__ Wn, float eps,
+    const unsigned short *__restrict__ T, const __half *__restrict__ CS,
+    __bf16 *__restrict__ HS, unsigned char *__restrict__ A, float *__restrict__ ASG,
+    float *__restrict__ RS, int M, int N, int krot, int gpw) {
+  const int m = blockIdx.x, chunk = blockIdx.y;
+  const int G = N / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int g0 = (chunk * gpw) * PQ_ROT_WAVES + wave;
+  int ng = 0;
+  for (int gi = 0; gi < gpw; ++gi) ng += (g0 + gi * PQ_ROT_WAVES < G) ? 1 : 0;
+  __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
+  const int c0 = lane * 4;
+
+  unsigned long long rec[PQ_KROT_MAX][2];
+  float cs[4] = {1.f, 1.f, 1.f, 1.f};
+  if constexpr (ROT) pq_load_group(T, CS, 0, g0 < G ? g0 : G - 1, N, krot, lane, rec, cs);
+
+  for (int gi = 0; gi < ng; ++gi) {
+    const int g = g0 + gi * PQ_ROT_WAVES;
+    if constexpr (ROT) { if (gi) pq_load_group(T, CS, 0, g, N, krot, lane, rec, cs); }
+    const int kb = g * PQ_GROUP + c0;
+    float nv[4];
+    if constexpr (MODE == 0) {
+      const uint2_t vg = *(const uint2_t *)(X + (size_t)m * 2 * N + kb);
+      const uint2_t vu = *(const uint2_t *)(X + (size_t)m * 2 * N + N + kb);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float g0f = __uint_as_float(vg[h] << 16), g1f = __uint_as_float(vg[h] & 0xFFFF0000u);
+        const float u0 = __uint_as_float(vu[h] << 16), u1 = __uint_as_float(vu[h] & 0xFFFF0000u);
+        const float t0 = (float)(__bf16)(g0f / (1.f + expf(-g0f)));
+        const float t1 = (float)(__bf16)(g1f / (1.f + expf(-g1f)));
+        nv[2 * h] = (float)(__bf16)(t0 * u0);
+        nv[2 * h + 1] = (float)(__bf16)(t1 * u1);
+      }
+    } else if constexpr (MODE == 1) {
+      const uint2_t vx = *(const uint2_t *)(X + (size_t)m * N + kb);
+      const uint2_t vz = *(const uint2_t *)(Y + (size_t)m * ys + kb);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float x0 = __uint_as_float(vx[h] << 16), x1 = __uint_as_float(vx[h] & 0xFFFF0000u);
+        const float z0 = __uint_as_float(vz[h] << 16), z1 = __uint_as_float(vz[h] & 0xFFFF0000u);
+        const float s0 = (float)(__bf16)(1.f / (1.f + expf(-z0)));
+        const float s1 = (float)(__bf16)(1.f / (1.f + expf(-z1)));
+        nv[2 * h] = (float)(__bf16)(x0 * s0);
+        nv[2 * h + 1] = (float)(__bf16)(x1 * s1);
+      }
+    } else {
+      const uint2_t vx = *(const uint2_t *)(X + (size_t)m * N + kb);
+      const uint2_t vz = *(const uint2_t *)(Y + (size_t)m * ys + kb);
+      const uint2_t vw = *(const uint2_t *)(Wn + c0);
+      float xv[4] = {__uint_as_float(vx[0] << 16), __uint_as_float(vx[0] & 0xFFFF0000u),
+                     __uint_as_float(vx[1] << 16), __uint_as_float(vx[1] & 0xFFFF0000u)};
+      float ssq = 0.f;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) ssq = fmaf(xv[e], xv[e], ssq);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) ssq += __shfl_xor(ssq, off, 32);
+      const float inv = rsqrtf(ssq * (1.f / 128.f) + eps);
+      const float zv[4] = {__uint_as_float(vz[0] << 16), __uint_as_float(vz[0] & 0xFFFF0000u),
+                           __uint_as_float(vz[1] << 16), __uint_as_float(vz[1] & 0xFFFF0000u)};
+      const float wv[4] = {__uint_as_float(vw[0] << 16), __uint_as_float(vw[0] & 0xFFFF0000u),
+                           __uint_as_float(vw[1] << 16), __uint_as_float(vw[1] & 0xFFFF0000u)};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float sg = zv[e] / (1.f + expf(-zv[e]));
+        nv[e] = (float)(__bf16)(((xv[e] * inv) * wv[e]) * sg);
+      }
+    }
+    {
+      unsigned int h0 = (unsigned int)__bfloat16_as_ushort((__bf16)nv[0]) | ((unsigned int)__bfloat16_as_ushort((__bf16)nv[1]) << 16);
+      unsigned int h1 = (unsigned int)__bfloat16_as_ushort((__bf16)nv[2]) | ((unsigned int)__bfloat16_as_ushort((__bf16)nv[3]) << 16);
+      *(uint2_t *)(HS + (size_t)m * N + kb) = uint2_t{h0, h1};
+    }
+    if constexpr (!ROT) continue;
+
+    float v0 = nv[0] * cs[0], v1 = nv[1] * cs[1], v2 = nv[2] * cs[2], v3 = nv[3] * cs[3];
+    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
+#pragma unroll
+        for (int t2 = 0; t2 < 2; ++t2) {
+          const unsigned long long rv = rec[r][t2];
+          const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+          const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+          const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+          const int i = ij & 0xFF, j = ij >> 8;
+          const float xi = s_x[wave][i], xj = s_x[wave][j];
+          s_x[wave][i] = fmaf(c, xi, sn * xj);
+          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
+    }
+    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float qi = 1.f / scale;
+    const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
+    const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
+    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+    *(unsigned int *)(A + (size_t)m * N + kb) =
+        (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+    if (lane == 0) {
+      ASG[(size_t)m * G + g] = scale;
+      RS[(size_t)m * G + g] = rs * scale;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+  }
+}
+
+// ------------------------- two-rank one-shot all-reduce fused into add + RMSNorm + rotate + quant
+//
+// The r4d_ar_oneshot_2rank_exact protocol (radiance extras, libr4d) with pq_add_rms_rot's body
+// as the epilogue: a decoder layer's post-all-reduce chain (AR -> add -> norm -> rotate -> quant)
+// in one launch per site, the Paro analog of the MXFP4 fp8 stream's exact_nq kernel. Protocol,
+// copied: each rank PUSHES its input row into the peer's IPC scratch (double-buffered by seq &
+// 1), publishes a per-row flag with a system-scope release, spins on its own row's flag, then
+// reduces local input + peer data (now in local scratch) rounded to bf16 exactly as the plain
+// kernel does, so both ranks see the identical reduced row.
+//
+// ONE 512-thread workgroup per row, exactly like exact_nq, and for the same reason: a
+// workgroup must never spin on work that belongs to a workgroup of the SAME launch that may not
+// be resident yet. (A (row, chunk) grid deadlocked at capture time once the grid outgrew the
+// GPU.) With M <= 128 rows the grid is always fully resident on both ranks, each row's flag is
+// set by the peer's own row-workgroup before it waits, and the per-row seq counters see the
+// same launch history on both ranks (row m is in every launch with M > m). The 16 waves split
+// the groups (G=40: waves 0-7 take 3, 8-15 take 2) and loop the consumer's partitions.
+// This kernel family gets its OWN scratch/flags/counters, so slot parity alternates per launch.
+__device__ __forceinline__ void pq_store_sys_rel(unsigned int *p, unsigned int v) {
+  __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ unsigned int pq_load_sys_acq(const unsigned int *p) {
+  return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+#define PQ_AR_SPIN_MAX 4000000000ULL
+#define PQ_AR_WAVES 16
+
+__global__ __launch_bounds__(PQ_AR_WAVES * 32) void pq_ar_add_rms_rot(
+    const uint4_t *__restrict__ in4,        // my partial [M, K] bf16 as 16 B words
+    uint4_t *peer_base, const uint4_t *my_base, int slot_stride16,
+    unsigned int *peer_flags, unsigned int *my_flags, unsigned int *seq_ctrs,
+    const __bf16 *__restrict__ RES, const __bf16 *__restrict__ Wn, float eps,
+    const unsigned short *__restrict__ T, const __half *__restrict__ CS,
+    __bf16 *__restrict__ HS, __bf16 *__restrict__ RO,
+    unsigned char *__restrict__ A, float *__restrict__ ASG, float *__restrict__ RS,
+    int M, int K, int P, int krot, int drain, int acq) {
+  constexpr int NT = PQ_AR_WAVES * 32;
+  const int m = blockIdx.x;
+  const int G = K / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  __shared__ float s_red[PQ_AR_WAVES];
+  __shared__ float s_x[PQ_AR_WAVES][PQ_GROUP];
+  __shared__ unsigned int s_seq;
+  const int c0 = lane * 4;
+
+  const int K16 = K / 8;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[m], 1u) + 1u;
+  __syncthreads();
+  const unsigned int sq = s_seq;
+  const int slot = (int)(sq & 1u);
+  uint4_t *ps = peer_base + (size_t)slot * slot_stride16;
+  const uint4_t *ms = my_base + (size_t)slot * slot_stride16;
+  const int ws = m * K16, we = ws + K16;
+  for (int k = ws + tid; k < we; k += NT) ps[k] = in4[k];
+  if (drain == 1) __threadfence_system();
+  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __syncthreads();
+  if (tid == 0) {
+    if (drain == 2) __threadfence_system();
+    pq_store_sys_rel(&peer_flags[m], sq);
+    unsigned long long z = 0;
+    while (pq_load_sys_acq(&my_flags[m]) < sq) { if (++z > PQ_AR_SPIN_MAX) break; }
+  }
+  __syncthreads();
+  if (acq) __threadfence_system();
+
+  // reduce the row (bf16, like the plain kernel) + residual add + variance
+  const uint4_t *__restrict__ r4 = (const uint4_t *)(RES + (size_t)m * K);
+  uint4_t *__restrict__ o4 = (uint4_t *)(RO + (size_t)m * K);
+  float ssq = 0.f;
+  for (int i = tid; i < K16; i += NT) {
+    const uint4_t vy = in4[(size_t)m * K16 + i], vp = ms[(size_t)m * K16 + i], vr = r4[i];
+    uint4_t vo;
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+      const float y0 = (float)(__bf16)(__uint_as_float(vy[h] << 16) + __uint_as_float(vp[h] << 16));
+      const float y1 = (float)(__bf16)(__uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vp[h] & 0xFFFF0000u));
+      const float a0 = y0 + __uint_as_float(vr[h] << 16);
+      const float a1 = y1 + __uint_as_float(vr[h] & 0xFFFF0000u);
+      ssq = fmaf(a0, a0, ssq);
+      ssq = fmaf(a1, a1, ssq);
+      const __bf16 b0 = (__bf16)a0, b1 = (__bf16)a1;
+      vo[h] = (unsigned int)__bfloat16_as_ushort(b0) | ((unsigned int)__bfloat16_as_ushort(b1) << 16);
+    }
+    o4[i] = vo;
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) ssq += __shfl_xor(ssq, off, 32);
+  if (lane == 0) s_red[wave] = ssq;
+  __syncthreads();
+  float tot = 0.f;
+#pragma unroll
+  for (int w = 0; w < PQ_AR_WAVES; ++w) tot += s_red[w];
+  const float inv = rsqrtf(tot / (float)K + eps);
+
+  unsigned long long rec[PQ_KROT_MAX][2];
+  float cs[4];
+  for (int g = wave; g < G; g += PQ_AR_WAVES) {
+    const int kb = g * PQ_GROUP + c0;
+    const uint2_t vy = *(const uint2_t *)((const __bf16 *)in4 + (size_t)m * K + kb);
+    const uint2_t vp = *(const uint2_t *)((const __bf16 *)ms + (size_t)m * K + kb);
+    const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
+    const uint2_t vw = *(const uint2_t *)(Wn + kb);
+    float nv[4];
+    unsigned int hsw[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float y0 = (float)(__bf16)(__uint_as_float(vy[h] << 16) + __uint_as_float(vp[h] << 16));
+      const float y1 = (float)(__bf16)(__uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vp[h] & 0xFFFF0000u));
+      const float a0 = y0 + __uint_as_float(vr[h] << 16);
+      const float a1 = y1 + __uint_as_float(vr[h] & 0xFFFF0000u);
+      const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
+      const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
+      nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
+      hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
+    }
+    *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
+
+    for (int p = 0; p < P; ++p) {
+      pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
+      float v0 = nv[0] * cs[0], v1 = nv[1] * cs[1], v2 = nv[2] * cs[2], v3 = nv[3] * cs[3];
+      s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+      s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+      __asm__ volatile("s_waitcnt lgkmcnt(0)");
+#pragma unroll
+      for (int r = 0; r < PQ_KROT_MAX; ++r) {
+        if (r < krot) {
+#pragma unroll
+          for (int t2 = 0; t2 < 2; ++t2) {
+            const unsigned long long rv = rec[r][t2];
+            const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+            const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+            const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+            const int i = ij & 0xFF, j = ij >> 8;
+            const float xi = s_x[wave][i], xj = s_x[wave][j];
+            s_x[wave][i] = fmaf(c, xi, sn * xj);
+            s_x[wave][j] = fmaf(c, xj, -sn * xi);
+          }
+          __asm__ volatile("s_waitcnt lgkmcnt(0)");
+        }
+      }
+      v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+      v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+      float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+      const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+      const float qi = 1.f / scale;
+      const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
+      const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
+      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+      *(unsigned int *)(A + ((size_t)p * M + m) * K + kb) =
+          (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+      if (lane == 0) {
+        ASG[((size_t)p * M + m) * G + g] = scale;
+        RS[((size_t)p * M + m) * G + g] = rs * scale;
+      }
+      __asm__ volatile("s_waitcnt lgkmcnt(0)");
+    }
+  }
 }

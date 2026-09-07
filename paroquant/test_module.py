@@ -129,6 +129,64 @@ def run_case(name, prefixes):
         failures += not ok
         print(f"  {name:8s} M={M:<4d} N={N} K={K} P={len(parts)} rel={rel:.2e} "
               f"{'OK' if ok else 'FAIL'}")
+
+    # Rotation stream: fused add+rmsnorm+rotate+quant + tuple-fed linear vs vLLM's own
+    # GemmaRMSNorm followed by the bf16 linear. Residual must be exact; hs may differ by a bf16
+    # ulp a few times per million (reduction order); the outputs then agree to the same ppm.
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    norm = GemmaRMSNorm(K, eps=1e-6).to(DEV)
+    torch.manual_seed(7)
+    norm.weight.data = (torch.randn(K, device=DEV) * 0.1).to(torch.bfloat16)
+    for M in (1, 5, 17, 40, 64, 300):
+        torch.manual_seed(100 + M)
+        y = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+        res = (torch.randn(M, K, device=DEV) * 3).to(torch.bfloat16)
+        hs_ref, ro_ref = norm(y.clone(), res.clone())
+        out_ref = method.apply(layer, hs_ref).float()
+        hs, ro, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(y, res, norm.weight, 1e-6,
+                                                                layer.rec, layer.cs)
+        out = method.apply(layer, (hs, a, asg, rs)).float()
+        ro_bad = int((ro != ro_ref).sum())
+        hs_bad = int((hs != hs_ref).sum())
+        rel = float((out - out_ref).norm() / out_ref.norm().clamp_min(1e-30))
+        ok = ro_bad == 0 and hs_bad <= max(2, hs.numel() // 50000) and rel < 2e-3
+        failures += not ok
+        print(f"  {name:8s} M={M:<4d} stream: residual-diff={ro_bad} hs-diff={hs_bad}/{hs.numel()} "
+              f"out-rel={rel:.2e} {'OK' if ok else 'FAIL'}")
+    # Stream 2 producers: silu-mul (mode 0), attention gate (mode 1), GDN gated norm (mode 2)
+    # vs the torch references, on this layer's rotation (K must be a multiple of 128).
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+    for mode in ((0, 1, 2) if len(parts) == 1 else ()):   # stream-2 sites are single-partition
+        for M in (1, 5, 40, 64, 300):
+            torch.manual_seed(500 + 10 * mode + M)
+            if mode == 0:
+                gu = (torch.randn(M, 2 * K, device=DEV) * 2).to(torch.bfloat16)
+                hs_ref = SiluAndMul().forward_native(gu)
+                hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(0, gu, gu, layer.cs, 0.0, layer.rec, layer.cs)
+            elif mode == 1:
+                x = (torch.randn(M, K, device=DEV) * 2).to(torch.bfloat16)
+                gt = (torch.randn(M, K, device=DEV) * 2).to(torch.bfloat16)
+                hs_ref = x * torch.sigmoid(gt)
+                hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(1, x, gt, layer.cs, 0.0, layer.rec, layer.cs)
+            else:
+                x = (torch.randn(M, K, device=DEV) * 2).to(torch.bfloat16)
+                zt = (torch.randn(M, K, device=DEV) * 2).to(torch.bfloat16)
+                wn = (torch.randn(128, device=DEV) * 0.3 + 1).to(torch.bfloat16)
+                # vLLM applies the per-head norm on rows reshaped to the head width (128)
+                hs_ref = RMSNormGated.forward_static(x.reshape(-1, 128), zt.reshape(-1, 128), wn, 1e-6,
+                                                     torch.bfloat16, group_size=None,
+                                                     norm_before_gate=True, activation="swish"
+                                                     ).reshape(M, K)
+                hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(2, x, zt, wn, 1e-6, layer.rec, layer.cs)
+            out_ref = method.apply(layer, hs_ref).float()
+            out = method.apply(layer, (hs, a, asg, rs)).float()
+            hs_bad = int((hs != hs_ref).sum())
+            rel = float((out - out_ref).norm() / out_ref.norm().clamp_min(1e-30))
+            ok = hs_bad <= max(2, hs.numel() // 20000) and rel < 2e-3
+            failures += not ok
+            print(f"  {name:8s} M={M:<4d} stream2 mode={mode}: hs-diff={hs_bad}/{hs.numel()} "
+                  f"out-rel={rel:.2e} {'OK' if ok else 'FAIL'}")
     return failures
 
 

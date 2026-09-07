@@ -5,14 +5,15 @@ ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4 patches and custom k
 this card, plus RDNA4-tuned GEMM / attention / all-reduce paths and a dynamic MTP draft controller, so you
 don't have to build the stack yourself.
 
-> **Status: early dev, experimental.** Repo version `0.11.0`; the pinned image is
+> **Status: early dev, experimental.** Repo version `0.12.0`; the pinned image is
 > `stilldeadcode/vllm-radiance:0.9.3`. Everything here was built and measured on a few exact setups:
 > **Qwen3.8-27B-FP8** and **Qwen3.6-27B-FP8** (gated-delta-net hybrids, architecturally identical),
 > **Qwen3.6-35B-A3B-FP8** (fine-grained MoE, 256 experts / top-8),
 > **Gemma-4-31B-it-FP8** (block-fp8, sliding + global attention, vision), and
 > **Qwen3.8-27B-Quark-AWQ-MXFP4** (4-bit OCP micro-scaling), all with fp8 (or bf16/`auto`) KV cache on two
 > R9700 GPUs (tensor parallel). The MXFP4 launcher now detects the card count and configures
-> tensor-parallel size and KV cache for it, but other models, other weight formats, single or 3+ GPU
+> tensor-parallel size and KV cache for it (three cards via explicit `TP=3` dummy-head padding, validated
+> so far only at TP=1/2 on the two-card box), but other models, other weight formats, single or 4+ GPU
 > counts, and non-R9700 hardware remain **untested**. Expect rough edges and breaking changes. Not production hardened. Use at your own
 > risk.
 
@@ -192,10 +193,23 @@ more than it sounds: the development box reports **three** AMD render nodes -- t
 Granite Ridge iGPU -- and a naive count picks `--tensor-parallel-size 3`.
 
 **Tensor-parallel size.** The largest of `8 4 2 1` the usable cards can fill. `3`, `6` and `12` are
-excluded even though they divide `num_attention_heads=24`, because TP must also divide the GDN layers'
-`linear_num_key_heads=16` and `linear_num_value_heads=48`. (Fixing that is what
-[TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) is for.) A three-card host therefore serves on two and
-leaves one idle, and says so.
+not picked automatically even though they divide `num_attention_heads=24`, because TP must also divide
+the GDN layers' `linear_num_key_heads=16` and `linear_num_value_heads=48`. A three-card host therefore
+serves on two by default, leaves one idle, and says so.
+
+**`TP=3`** is served anyway, explicitly, through zero-weight dummy heads
+([TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md)): `radiance_tp3pad.py` widens the config to 36 q / 6 kv /
+18 GDN-key / 54 GDN-value heads, MLP 17472 and vocab 248448 and pads the checkpoint tensors at load
+with heads whose weights are exactly zero, so contiguous sharding puts every dummy on rank 2 and the
+per-rank geometry (12 q / 2 kv, GQA 6) keeps the R4D attention kernels. Nothing is rewritten on disk.
+`TP=3 ./serve-mxfp4.sh` sets `RADIANCE_TP_PAD=3` for you, gives the serve its own cache dir
+(`-tp3pad`), and switches off two production defaults the padded widths cannot serve
+(`RADIANCE_MXFP4_WPERM`, `RADIANCE_FP8_STREAM`; ~3-6% decode until the GDN merge gate is relaxed).
+All-reduces at TP=3 ride RCCL until the 3-rank R4D kernel (`ar_oneshot_3rank_exact`, libr4d extras
+rx6) has been measured on three cards. It is not in the auto-pick list until it has passed that
+hardware gate; every `TP != 3` serve passes `RADIANCE_TP_PAD=0` and is byte-identical to before.
+`./tp3pad_selftest.py` checks every padding rule against the checkpoints' safetensors headers
+without a GPU (`--torch` also pads one real tensor per rule inside the image).
 
 **KV cache size.** An explicit `--kv-cache-memory` beats letting vLLM profile, because profiling is
 deliberately conservative: it subtracts the profile run's *transient* activation peak plus the
@@ -233,8 +247,9 @@ measured at.
 
 | | | |
 |---|---|---|
-| `TP` | auto | tensor-parallel size |
+| `TP` | auto | tensor-parallel size. `TP=3` serves three cards through dummy-head padding (explicit only; see above) |
 | `GPUS` | auto | HIP indices to serve on, e.g. `GPUS=0,1`. Overrides the VRAM floor |
+| `RADIANCE_TP_PAD` | `3` at TP=3, else `0` | the padding itself. `3` at TP=1/2 runs the validation gates; `_INTERMEDIATE=17408` keeps the MLP stock (TP=2 gate), `_DRAFTER=0` leaves the DFlash2 drafter unpadded (48 q / 12 kv padded, GQA kept at 4; an A/B lever), `_STRICT=0` demotes a weight-coverage mismatch to a warning |
 | `MIN_GPU_MIB` | `8192` | VRAM floor for "usable". Lower it to admit a small card, raise it to skip one |
 | `KV_MEM` | `auto` | `auto` = measured pin if one exists, else profile. `<bytes>` = pin explicitly. `0` = force profiling |
 
@@ -274,7 +289,7 @@ running it.
 | `CHUNK` | `8192` | prefill chunk. `RADIANCE_AR_MAX_KB` is derived from it, so raising it cannot silently drop prefill onto RCCL |
 | `GPU_UTIL` | `0.98` | the ceiling on this box. Use `0.75` for perplexity work: `prompt_logprobs` allocates a 1-1.7 GiB transient vLLM does not reserve for |
 | `KV_MEM` | `auto` | KV cache size. `auto` looks up a pin measured for your hardware and batch shape and falls back to vLLM's profiling if there is none; `<bytes>` pins explicitly; `0` forces profiling. Consulted only at `GPU_UTIL=0.98`, since a pinned KV is exactly what the `prompt_logprobs` transient eats. Worth 892,799 -> 943,581 tokens on the R9700 pair. See [Hardware auto-detection](#hardware-auto-detection) |
-| `TP` / `GPUS` | auto | tensor-parallel size and the HIP indices to serve on. Detected from the cards present |
+| `TP` / `GPUS` | auto | tensor-parallel size and the HIP indices to serve on. Detected from the cards present; `TP=3` is explicit (dummy-head padding, see [Hardware auto-detection](#hardware-auto-detection)) |
 | `ASYNC` | `0` | async scheduling. vLLM refuses it together with `disable_padded_drafter_batch`, so the two are one switch; the unpad lever is ~+50% single-stream under mtp |
 | `EXTRA` | empty | extra `vllm serve` flags (or just pass them as arguments) |
 

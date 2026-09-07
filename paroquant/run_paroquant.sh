@@ -31,6 +31,25 @@ NAME=${NAME:-vllmparo}
 SERVED_NAMES=${SERVED_NAMES:-Qwen3.8-PARO}
 SPEC=${SPEC:-5}      # dflash re-sweep 2026-08: 5 beats 7 by 8-13% aggregate on this stack
 GPU_UTIL=${GPU_UTIL:-0.92}
+# GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
+# also zeroes the cudagraph pad rows. The AutoRound int4 serve (same bf16-input linear contract)
+# has run it since 08-30; the merge hook it needs is installed with the merge itself left OFF
+# (in_proj_a/b are fp16 here, there is nothing to merge). Compile cache keyed on the flag.
+GDN_FUSED=${RADIANCE_GDN_FUSED_UPDATE:-1}
+R4D_KEY=${R4D_KEY:-b9e42ab-rx5}
+# Rotation stream: fused add+rmsnorm+rotate+quant producers for the norm-fed linears (decode
+# band); patches the decoder-layer forward, so the compile cache is keyed (-rs).
+ROT_STREAM=${RADIANCE_PQ_ROT_STREAM:-1}
+# Stream 2: silu-mul -> down, GDN gated norm -> out_proj, attention gate -> o_proj producers
+# fused with rotate+quant (default off until the serve gate lands; also patches the graph).
+ROT_STREAM2=${RADIANCE_PQ_ROT_STREAM2:-1}
+# Stream 3: the two-rank all-reduce fused into the norm+rotate producers (default off until gated).
+ROT_STREAM3=${RADIANCE_PQ_ROT_STREAM3:-0}
+CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && CACHE_SUF="$CACHE_SUF-rs"
+[ "$ROT_STREAM2" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs2"
+[ "$ROT_STREAM3" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs3"
+CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
+mkdir -p "$CACHE"
 
 MODEL=/models/Qwen3.8-27B-PARO
 [ -d "$HOME/models/Qwen3.8-27B-PARO" ] || { echo "model missing" >&2; exit 1; }
@@ -65,7 +84,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB=86016 \
   -e RADIANCE_PRESHUFFLE=1 -e RADIANCE_FUSE_RMS_QUANT=1 \
   -e R4D_ATTN_FP8=3 \
-  -e RADIANCE_GDN_FUSED_UPDATE=0 \
+  -e RADIANCE_GDN_FUSED_UPDATE="$GDN_FUSED" -e RADIANCE_GDN_MERGE_INPROJ=0 \
+  -e RADIANCE_GDN_FUSED_MAX_ITEMS="${RADIANCE_GDN_FUSED_MAX_ITEMS:-32}" \
   -e RADIANCE_DYNAMIC_WIDTH=1 -e RADIANCE_DYNW_ALPHA=0.35 -e RADIANCE_DYNW_MARGIN=2 \
   -e RADIANCE_DYNW_MIN=2 -e RADIANCE_DYNW_MIN_BATCH=3 \
   -e RADIANCE_AR_QNB=96 -e RADIANCE_AR_QNT=1024 -e RADIANCE_AR_OVERLAP=0 \
@@ -74,6 +94,13 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_PQ_CHECKALL="$CHECKALL" \
   -e RADIANCE_PQ_CHECK_MAX_M=${PQ_CHECK_MAX_M:-128} \
   -e RADIANCE_PQ_DECODE_MAX_M=${PQ_DECODE_MAX_M:-64} \
+  -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_DECODE_NT="${RADIANCE_PQ_DECODE_NT:-1}" \
+  -e RADIANCE_PQ_ATILED="${RADIANCE_PQ_ATILED:-1}" -e RADIANCE_PQ_AT_LBK="${RADIANCE_PQ_AT_LBK:-128}" \
+  -e RADIANCE_PQ_AT_HOIST="${RADIANCE_PQ_AT_HOIST:-1}" -e RADIANCE_PQ_PTOK="${RADIANCE_PQ_PTOK:-1}" \
+  -e RADIANCE_PQ_ROT_STREAM="$ROT_STREAM" -e RADIANCE_PQ_ROT_STREAM2="$ROT_STREAM2" \
+  -e RADIANCE_PQ_ROT_STREAM3="$ROT_STREAM3" -e RADIANCE_PQ_AR_CHECK="${RADIANCE_PQ_AR_CHECK:-0}" \
+  -e RADIANCE_PQ_AR_FALLBACK="${RADIANCE_PQ_AR_FALLBACK:-0}" \
+  -e RADIANCE_PQ_ROT_V2="${RADIANCE_PQ_ROT_V2:-1}" \
   -e RADIANCE_FAST_DRAFT=1 -e RADIANCE_DRAFT_TAU=0.20 -e RADIANCE_DRAFT_RERANK=80 \
   -e RADIANCE_VERIFY_HEAD=1 -e RADIANCE_VERIFY_HEAD_MAX_M=32 \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS=1 -e RADIANCE_SKINNY_GEMM=1 \
@@ -84,11 +111,11 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e TRITON_CACHE_AUTOTUNING=1 \
   -v /home/brian/.cache/huggingface:/root/.cache/huggingface \
   -v /home/brian/models:/models \
-  -v /home/brian/.radiance-cache-paro-093:/cache \
+  -v "$CACHE":/cache \
   -v /home/brian/deadcode-vllm:/patches:z \
   -v /home/brian/mxfp4_work/paro:/paro:z \
-  -v /home/brian/.cache/radiance-libr4d/b9e42ab-rx4:/r4d:z \
-  -e R4D_SO=/home/brian/.cache/radiance-libr4d/b9e42ab-rx4 \
+  -v /home/brian/.cache/radiance-libr4d/$R4D_KEY:/r4d:z \
+  -e R4D_SO=/home/brian/.cache/radiance-libr4d/$R4D_KEY \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
     set -e
     SP=/opt/vllm/lib/python3.12/site-packages
@@ -106,11 +133,13 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_dflash_selector_topk.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
+    python3 patch_gdn_merge_inproj.py
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
-       radiance_verifyhead.py radiance_aroverlap.py radiance_topk.py radiance_arnq.py "$SP"/
+    cp radiance_mxfp4.py radiance_gdn.py radiance_gdnmerge.py radiance_rmsquant.py \
+       radiance_drafthead.py radiance_verifyhead.py radiance_aroverlap.py radiance_topk.py \
+       radiance_arnq.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_mxfp4_fp8.hip -o "$SP"/radiance_mxfp4_fp8.so
     if [ -n "${R4D_SO:-}" ] && [ -f /r4d/r4d.so ]; then
