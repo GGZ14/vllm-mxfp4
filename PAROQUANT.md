@@ -324,7 +324,7 @@ partition against an fp32 dequant. Serve with the same launcher:
 
 | | |
 |---|---|
-| in-serve `CHECKALL`, real checkpoint | rel = 0.00000 on 16384:5120 (P=2, both parts), 5120:6144, 34816:5120 (P=2, both), 5120:17408 |
+| in-serve `CHECKALL`, real checkpoint | *pending, real inputs* -- the earlier "rel = 0.00000 on every shape" was vacuous: it fired on vLLM's profile run, whose zero activations make both sides zero. The checker now labels those calls `zero-input`; a wrapper bug (double un-permute under WPERM) that reported rel 1.6-9 on real inputs is fixed |
 | loader vs fp32 reference | rel 0.011-0.012 at M = 1 / 5 / 40 / 64 (decode), 200 (prefill), 600 / 2048 (A-tiled) -- the e4m3 activation floor |
 | GSM8K 500q, one-shot hybrid, pseudo (W4A16 upper bound) | 96.96% (479/494) |
 | GSM8K 500q, **fine-tuned** (stage 2 on z-lab rotations), pseudo | **97.20%** (486/500), 0 errors -- AMD MXFP4 97.8, int4 PARO 97.4-98.0; n=500 sigma ~0.76 pt |
