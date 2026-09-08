@@ -13,7 +13,7 @@ OUT=${OUT:-$HOME/ab_prefill_tp1.txt}
 # Preflight: refuse to start into an occupied card. A prod unit auto-started on reboot once and
 # held both GPUs; the run then OOM'd 20 minutes in with a misleading error. Fail here instead.
 vram_used_mib() { podman run --rm --privileged --device /dev/kfd --device /dev/dri --group-add keep-groups \
-  --entrypoint rocm-smi stilldeadcode/vllm-radiance:0.9.3 --showmeminfo vram 2>/dev/null | awk -v g="GPU[$1]" '$0 ~ g && /Used/ {print int($NF/1048576)}'; }
+  --entrypoint rocm-smi stilldeadcode/vllm-radiance:0.9.3 --showmeminfo vram 2>/dev/null | awk -v g="GPU[$1]" 'index($0, g) && /Used/ {print int($NF/1048576)}'; }
 used=$(vram_used_mib "$GPU"); if [ "${used:-0}" -gt 4000 ]; then echo "GPU $GPU has ${used} MiB in use -- not benching into an occupied card" >&2; exit 1; fi
 
 bench() {  # tag
