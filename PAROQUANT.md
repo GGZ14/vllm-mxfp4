@@ -318,7 +318,9 @@ exponent, fragment order). The prologue's tiled writer and the MXFP4 GEMM's tile
 same fragment layout -- `[m-tile][k-step][half][row 16][8 B]` -- so the A-tiled prefill path is
 taken above `RADIANCE_MXFP4_A_TILED_MIN_M` with no relayout. `RADIANCE_PQM_CHECKALL` gates each
 partition against an fp32 dequant. Serve with the same launcher:
-`MODEL_DIR=Qwen3.8-27B-PARO-MXFP4 RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0`.
+`MODEL_DIR=Qwen3.8-27B-PARO-MXFP4-ft RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0`. As prod: the
+systemd unit `paroquant/qwen_vllm_paro_mxfp4.service` (its own container name and compile-cache dir;
+`vllm-switch paromx`), with the int4 unit left intact so `vllm-switch paro` is the rollback.
 
 **Gated so far (2026-09-08):**
 
