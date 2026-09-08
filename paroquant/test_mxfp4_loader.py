@@ -24,13 +24,28 @@ from safetensors import safe_open
 sys.path.insert(0, "/patches/paroquant")
 import radiance_paroquant_mxfp4 as M   # noqa: E402  (registers the op + config)
 
-CKPT = "/models/Qwen3.8-27B-PARO-MXFP4"
+import os
+CKPT = os.environ.get("PQM_CKPT", "/models/Qwen3.8-27B-PARO-MXFP4")
 GRID = torch.tensor([0.0, .5, 1., 1.5, 2., 3., 4., 6.])
 E4M3_MAX = 448.0
 
 
+def _weight_map():
+    """tensor name -> file, for sharded (index.json) or single-file checkpoints alike."""
+    import glob, os
+    idx = f"{CKPT}/model.safetensors.index.json"
+    if os.path.exists(idx):
+        return json.load(open(idx))["weight_map"]
+    wm = {}
+    for fn in glob.glob(f"{CKPT}/*.safetensors"):
+        with safe_open(fn, framework="pt") as f:
+            for k in f.keys():
+                wm[k] = os.path.basename(fn)
+    return wm
+
+
 def load_module(name):
-    idx = json.load(open(f"{CKPT}/model.safetensors.index.json"))["weight_map"]
+    idx = _weight_map()
     out = {}
     for leaf in ("weight", "weight_scale", "theta", "pairs", "channel_scales"):
         with safe_open(f"{CKPT}/{idx[f'{name}.{leaf}']}", framework="pt") as f:
