@@ -96,7 +96,7 @@ def main():
     assert layer.rec.shape[0] == 2, "in_proj_qkv and in_proj_z must NOT dedup"
 
     bounds = [0, sizes[0], N]
-    for Mrows in (1, 5, 40, 64, 200):
+    for Mrows in (1, 5, 40, 64, 200, 600, 2048):
         x = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
         y = method.apply(layer, x).float()
         # reference
@@ -108,7 +108,8 @@ def main():
             w = dequant_w(m["weight"].to(dev), m["weight_scale"].to(dev))
             ref[:, bounds[p]:bounds[p + 1]] = xq @ w.T
         rel = ((y - ref).norm() / ref.norm()).item()
-        band = "decode" if Mrows <= M._mx.DECODE_MAX_M else "prefill"
+        band = ("decode" if Mrows <= M._mx.DECODE_MAX_M else
+                "A-tiled" if M._mx.A_TILED_MIN_M and Mrows >= M._mx.A_TILED_MIN_M else "prefill")
         print(f"  M={Mrows:4d} {band:7s} rel={rel:.4f}")
         assert rel < 4e-2, f"M={Mrows}: rel {rel} too large -- layout or scale mismatch"
     print("PASS: paroquant_mxfp4 linear matches fp32 reference at every band")

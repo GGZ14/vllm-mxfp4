@@ -18,9 +18,13 @@ The row-sum the int4 prologue also emits is simply unused. Rotations are per pro
 merged linear carries P differently-rotated activation copies and the GEMM runs P times on the
 matching N-slices (P <= 3, boundaries on multiples of 128, identical adjacent rotations deduped).
 
-v1 limits, deliberate: no rotation-stream fusion (RADIANCE_PQ_ROT_STREAM must be 0 -- those
-producers hand the int4 GEMM's tuple), and no A-tiled prefill (the two kernels' tile layouts are
-not the same object; row-major A is used). Both are follow-ups once CHECKALL and GSM8K pass.
+A-tiled prefill: the int4 prologue's tiled writer (pq_token_quant_tiled) and the MXFP4 GEMM's
+tiled reader use the SAME fragment layout -- [m-tile][k-step][half][row 16][8 B], m-tile-major --
+so above RADIANCE_MXFP4_A_TILED_MIN_M the prologue writes tiled A straight into the MXFP4 kernel's
+a_tiled register and the GEMM takes its -12..-16% path with no relayout.
+
+v1 limit, deliberate: no rotation-stream fusion (RADIANCE_PQ_ROT_STREAM must be 0 -- those
+producers hand the int4 GEMM's per-group tuple). That is the remaining decode-side gap.
 """
 import os
 import re
@@ -89,28 +93,42 @@ def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
     rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
     _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
                              asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
-    # pass C: per-token e4m3 codes + per-token dequant scale (the MXFP4 kernel's x contract)
-    a_codes = torch.empty((P, M, K), device=x2.device, dtype=torch.uint8)
+    # pass C: per-token e4m3 codes + per-token dequant scale (the MXFP4 kernel's x contract).
+    # Tiled above the MXFP4 kernel's A-tiled threshold: 16-row-padded fragment layout, identical
+    # for both kernels, registered so mxfp4_linear_pq dispatches its tiled GEMM.
+    tiled = bool(_mx.A_TILED_MIN_M) and M >= _mx.A_TILED_MIN_M
+    Mt = (M + 15) // 16
+    a_codes = torch.empty((P, Mt * 16 * K) if tiled else (P, M, K), device=x2.device,
+                          dtype=torch.uint8)
     as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
     _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(), as_tok.data_ptr(),
-                            rs.data_ptr(), M, K, P, stream, 0)
+                            rs.data_ptr(), M, K, P, stream, 1 if tiled else 0)
 
     out = torch.empty((M, N), device=x2.device, dtype=torch.bfloat16)
     for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
         w_p = weight[n0:n1]                                              # rows: contiguous
         ws_p = ws_cat[G32 * n0: G32 * n1].view(G32, n1 - n0)             # pre-split at load
-        y = torch.ops.radiance.mxfp4_linear_pq(a_codes[p], as_tok[p], w_p, ws_p, wref[n0:n1])
+        if tiled:
+            # an [M, K] view over the padded tiled storage: the kernel reads by data_ptr and its
+            # own tiled addressing; the shape only carries M (see mxfp4_linear_pq)
+            x_p = a_codes[p].narrow(0, 0, M * K).view(M, K)
+            _mx.a_tiled_register(x_p, M, K)
+        else:
+            x_p = a_codes[p]
+        y = torch.ops.radiance.mxfp4_linear_pq(x_p, as_tok[p], w_p, ws_p, wref[n0:n1])
         out[:, n0:n1] = y
         if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
                 and (N, K, M, p) not in _checked:
             _checked.add((N, K, M, p))
             w_ref = _mx.unpermute_w(w_p, n1 - n0, K) if _mx.WPERM else w_p
-            ref = _mx._exact_ref(a_codes[p].view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
+            x_rm = _pq.untile_a(a_codes, P, M, K)[p] if tiled else a_codes[p]
+            ref = _mx._exact_ref(x_rm.view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
                                  w_ref, ws_p, n1 - n0, K)
             num = (y.float() - ref.float()).pow(2).sum().sqrt()
             den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
             sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} "
-                             f"part={p} rel={float(num / den):.5f}\n")
+                             f"part={p} path={'tiled' if tiled else 'rowmajor'} "
+                             f"rel={float(num / den):.5f}\n")
     return out
 
 
