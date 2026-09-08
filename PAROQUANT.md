@@ -326,7 +326,8 @@ partition against an fp32 dequant. Serve with the same launcher:
 |---|---|
 | in-serve `CHECKALL`, real checkpoint | rel = 0.00000 on 16384:5120 (P=2, both parts), 5120:6144, 34816:5120 (P=2, both), 5120:17408 |
 | loader vs fp32 reference | rel 0.011-0.012 at M = 1 / 5 / 40 / 64 (decode), 200 (prefill), 600 / 2048 (A-tiled) -- the e4m3 activation floor |
-| GSM8K 500q, one-shot hybrid, pseudo (W4A16 upper bound) | **96.96%** (479/494) vs AMD MXFP4 97.8, int4 PARO 97.4-98.0 |
+| GSM8K 500q, one-shot hybrid, pseudo (W4A16 upper bound) | 96.96% (479/494) |
+| GSM8K 500q, **fine-tuned** (stage 2 on z-lab rotations), pseudo | **97.20%** (486/500), 0 errors -- AMD MXFP4 97.8, int4 PARO 97.4-98.0; n=500 sigma ~0.76 pt |
 | weight-space error vs bf16, one-shot | +4-9% over z-lab's fine-tuned int4 (e.g. L0 down_proj 0.127 vs 0.118) -- what the fine-tune targets |
 
 **Speed, kernel path isolated** (one R9700, TP=1, eager -- same launcher and mode for both
@@ -346,7 +347,13 @@ attention and everything else in a prefill step. The eager decode edge is *despi
 two-launch prologue and no fused streams; prod decode (compiled graphs, drafter, TP=2) is
 where the rotation-stream gap still has to be closed.
 
-**Open:** the fine-tuned checkpoint's GSM8K, on both the pseudo path and the served W4A8 path. **Known gap:** the fused rotation-stream producers still emit
+**Fine-tune** (`STAGE=finetune`: weights + e8m0 bias under the MXFP4 grid, rotations frozen at
+z-lab's, 256 samples x 2 epochs): mean -4.4% layer-output error per layer (-84% at layer 0, -1.7 to
+-9% at depth). The optimizer keeps the whole fp16 model CPU-resident; on 60 GiB that thrashed, so
+each finished block's storage is now released as the loop passes it (memory only). 64 layers in
+~5 min each once that landed.
+
+**Open:** the fine-tuned checkpoint's GSM8K on the served W4A8 path (the deployed number). **Known gap:** the fused rotation-stream producers still emit
 the int4 GEMM's per-group tuple, so v1 runs rotate -> token-quant as two launches per linear and
 its decode trails int4 PARO's 226 t/s until they are adapted to the per-token tuple.
 
