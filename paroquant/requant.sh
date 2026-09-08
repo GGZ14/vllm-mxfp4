@@ -67,7 +67,13 @@ EPOCHS=${EPOCHS:-"2 2"}
 ROT_LR=${ROT_LR:-0.05}
 WEIGHT_LR=${WEIGHT_LR:-1e-5}
 QUANT_LR=${QUANT_LR:-1e-6}
-STAGE=${STAGE:-all}              # all | optimize | pseudo | convert
+STAGE=${STAGE:-all}              # all | optimize | finetune | pseudo | convert
+# finetune: rotations + channel scales come from a TRAINED checkpoint and are frozen; only the
+# weights and the per-block exponent bias are optimized under the MXFP4 grid. This is the
+# path that matters on this box -- see build_hybrid.py for why from-scratch rotations are dead.
+INIT_ROTATIONS=${INIT_ROTATIONS:-Qwen3.8-27B-PARO/model.safetensors}   # under $MODELS
+FT_EPOCHS=${FT_EPOCHS:-2}
+FT_RESULTS=${FT_RESULTS:-$HOME/paroquant-out-ft}    # NOT the from-scratch dir: resume would reuse dead layers
 PSEUDO_OUT=${PSEUDO_OUT:-Qwen3.8-27B-PARO-MXFP4-pseudo}
 
 [ -d "$MODELS/$BASE" ] || { echo "base model missing at $MODELS/$BASE" >&2; exit 1; }
@@ -93,12 +99,29 @@ run() {
     -e PARO_QUANT_FORMAT="$FORMAT" \
     -e PARO_MXFP4_SCALE_RULE="$SCALE_RULE" \
     -e PARO_POW2_SCALES="$POW2" \
+    -e PARO_INIT_ROTATIONS="${PARO_INIT_ROTATIONS:-}" \
     -e HF_HUB_OFFLINE="${HF_OFFLINE:-0}" -e HF_HOME=/root/.cache/huggingface \
     -v "$SRC":/src:z -v "$MODELS":/models -v "$RESULTS":/out:z \
     -v "$CACHE":/root/.cache/paroquant:z \
     -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
     -w /src --entrypoint python3 "$IMAGE" "$@"
 }
+
+if [ "$STAGE" = finetune ]; then
+  [ -f "$MODELS/$INIT_ROTATIONS" ] || { echo "trained rotations missing at $MODELS/$INIT_ROTATIONS" >&2; exit 1; }
+  mkdir -p "$FT_RESULTS"; RESULTS="$FT_RESULTS"
+  echo "=== finetune (format=$FORMAT rule=$SCALE_RULE train_size=$TRAIN_SIZE epochs=$FT_EPOCHS, rotations frozen from $INIT_ROTATIONS) ==="
+  PARO_INIT_ROTATIONS="/models/$INIT_ROTATIONS" run -m paroquant.cli.optimize \
+    --model "/models/$BASE" \
+    --params "weight:$WEIGHT_LR,quantizer:$QUANT_LR" \
+    --epochs "$FT_EPOCHS" \
+    --group-size 128 --n-bit 4 --num-rotations 8 \
+    --skipped-modules "linear_attn.in_proj_a" "linear_attn.in_proj_b" \
+    --datasets wikitext2 c4 redpajama --val-dataset pileval \
+    --train-size "$TRAIN_SIZE" --validation-size 64 --batch-size "$BATCH_SIZE" \
+    --gradient-accumulation-steps 1 --seqlen "$SEQLEN" --cache-shards "$CACHE_SHARDS" \
+    --output-dir /out --resume --seed 0
+fi
 
 if [ "$STAGE" = all ] || [ "$STAGE" = optimize ]; then
   echo "=== optimize (format=$FORMAT rule=$SCALE_RULE train_size=$TRAIN_SIZE epochs=$EPOCHS rot_lr=$ROT_LR) ==="
