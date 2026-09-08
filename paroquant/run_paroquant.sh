@@ -78,11 +78,16 @@ CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && 
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
-MODEL=/models/Qwen3.8-27B-PARO
-[ -d "$MODELS/Qwen3.8-27B-PARO" ] || { echo "model missing at $MODELS/Qwen3.8-27B-PARO; run setup-paroquant.sh" >&2; exit 1; }
+# MODEL_DIR names a directory under $MODELS. Overridable so the same launcher (same patches,
+# same patched libr4d, same template) can serve a pseudo-quantized checkpoint for an accuracy
+# gate -- keeping every variable but the weights fixed.
+MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
+MODEL=/models/$MODEL_DIR
+[ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
+MAXLEN_EVAL=${MAXLEN_EVAL:-32768}
 
 if [ "$MODE" = eval ]; then
-  EXTRA_ARGS=(--enforce-eager --max-model-len 32768 --max-num-seqs 8
+  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN_EVAL" --max-num-seqs 8
               --max-num-batched-tokens 8192)
   # Per-rank quantized shapes: qkv, o, gate_up, down, in_proj(+merge), out_proj
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
