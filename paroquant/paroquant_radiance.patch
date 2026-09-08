@@ -1,5 +1,5 @@
 diff --git a/paroquant/cli/convert.py b/paroquant/cli/convert.py
-index 8055cec..0bd8255 100644
+index 8055cec..f9edbbc 100644
 --- a/paroquant/cli/convert.py
 +++ b/paroquant/cli/convert.py
 @@ -15,6 +15,8 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
@@ -41,7 +41,39 @@ index 8055cec..0bd8255 100644
  def _to_awq_buffers(
      quantized: torch.Tensor,
      scales_2d: torch.Tensor,
-@@ -247,7 +272,38 @@ def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tens
+@@ -236,6 +261,31 @@ def _convert_pseudo(model: torch.nn.Module, result_dir: Path) -> int:
+     return count
+ 
+ 
++class _MXFP4BufferHolder(torch.nn.Module):
++    """Holds MXFP4 buffers so save_pretrained writes them under the module's own names.
++
++    Deliberately not RotateQuantizedLinear: that class registers AWQ buffers (qweight/qzeros/
++    scales) and imports autoawq's GEMM at module import, neither of which applies to MXFP4. It
++    also means a load_state_dict(..., strict=False) would silently DROP every MXFP4 buffer and
++    leave the AWQ ones zeroed, writing a checkpoint of zeros.
++    """
++
++    def __init__(self, in_features: int, out_features: int, bias: bool, krot: int):
++        super().__init__()
++        self.in_features, self.out_features = in_features, out_features
++        self.register_buffer("weight", torch.zeros(out_features, in_features // 2,
++                                                   dtype=torch.uint8))
++        self.register_buffer("weight_scale", torch.zeros(out_features, in_features // 32,
++                                                         dtype=torch.uint8))
++        self.register_buffer("theta", torch.zeros(krot, in_features // 2, dtype=torch.float16))
++        self.register_buffer("pairs", torch.zeros(krot, in_features, dtype=torch.int16))
++        self.register_buffer("channel_scales", torch.ones(1, in_features, dtype=torch.float16))
++        if bias:
++            self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float16))
++        else:
++            self.bias = None
++
++
+ @torch.no_grad()
+ def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tensor], int, int, int]:
+     weight = state_dict["weight"].to(device=device, dtype=torch.float32)
+@@ -247,7 +297,38 @@ def _quantize_layer(state_dict: dict, device: str) -> tuple[dict[str, torch.Tens
      theta = _stack_if_numbered(state_dict, "angles_grouped").to(device=device, dtype=torch.float32)
  
      channel_scales_opt = state_dict["channel_scales"].to(device=device, dtype=torch.float32)
@@ -80,7 +112,54 @@ index 8055cec..0bd8255 100644
      zp_flat = state_dict["quantizer.zero_point_float"].to(device=device, dtype=torch.float32).reshape(-1, 1)
      quantized, scales_2d, zeros_2d = _quantize_rotated_weight(
          weight=weight,
-@@ -455,7 +511,11 @@ def _convert_real(
+@@ -410,7 +491,9 @@ def _convert_real(
+     model: torch.nn.Module,
+     result_dir: Path,
+ ) -> tuple[int, dict[str, Any] | None, dict[str, torch.Tensor]]:
+-    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
++    if quant_format() != "mxfp4":
++        # imports autoawq's GEMM at module scope; irrelevant (and absent) for MXFP4
++        from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
+ 
+     blocks = _get_blocks(model)
+     count = 0
+@@ -426,15 +509,26 @@ def _convert_real(
+             sd = torch.load(pt_file, map_location="cpu", weights_only=False)
+             buffers, bits, group_size, krot = _quantize_layer(sd, device="cuda")
+ 
+-            rl = RotateQuantizedLinear(
+-                module.in_features,
+-                module.out_features,
+-                bias=module.bias is not None,
+-                group_size=group_size,
+-                bits=bits,
+-                krot=krot,
+-            )
+-            rl.load_state_dict(buffers, strict=False)
++            if quant_format() == "mxfp4":
++                rl = _MXFP4BufferHolder(
++                    module.in_features,
++                    module.out_features,
++                    bias=module.bias is not None,
++                    krot=krot,
++                )
++                # strict: every buffer we emitted must land somewhere, or the checkpoint is
++                # silently written as zeros.
++                rl.load_state_dict(buffers, strict=True)
++            else:
++                rl = RotateQuantizedLinear(
++                    module.in_features,
++                    module.out_features,
++                    bias=module.bias is not None,
++                    group_size=group_size,
++                    bits=bits,
++                    krot=krot,
++                )
++                rl.load_state_dict(buffers, strict=False)
+             set_module_by_name(layer, name, rl)
+             count += 1
+ 
+@@ -455,7 +549,11 @@ def _convert_real(
          torch.cuda.empty_cache()
  
      quant_config = {
@@ -93,7 +172,7 @@ index 8055cec..0bd8255 100644
          "bits": bits,
          "group_size": group_size,
          "krot": krot,
-@@ -481,7 +541,10 @@ def main() -> None:
+@@ -481,7 +579,10 @@ def main() -> None:
          raise FileNotFoundError(f"Result directory not found: {result_dir}")
  
      source_dir = _resolve_source_dir(args.model)
