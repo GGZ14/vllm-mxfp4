@@ -120,15 +120,19 @@ def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
         if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
                 and (N, K, M, p) not in _checked:
             _checked.add((N, K, M, p))
-            w_ref = _mx.unpermute_w(w_p, n1 - n0, K) if _mx.WPERM else w_p
+            # _exact_ref un-permutes the fragment-order weight ITSELF under WPERM; passing an
+            # already un-permuted copy double-applied the inverse and reported the kernel as wrong
+            # at rel 1.6-9 while the served model was answering correctly.
             x_rm = _pq.untile_a(a_codes, P, M, K)[p] if tiled else a_codes[p]
             ref = _mx._exact_ref(x_rm.view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
-                                 w_ref, ws_p, n1 - n0, K)
+                                 w_p, ws_p, n1 - n0, K)
             num = (y.float() - ref.float()).pow(2).sum().sqrt()
-            den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
+            den = ref.float().pow(2).sum().sqrt()
+            # vLLM's profile run feeds zero activations: both sides are 0 and rel prints 0.00000,
+            # which proves nothing. Say so instead of looking like a pass.
+            verdict = "zero-input" if float(den) < 1e-20 else f"rel={float(num / den.clamp_min(1e-30)):.5f}"
             sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} "
-                             f"part={p} path={'tiled' if tiled else 'rowmajor'} "
-                             f"rel={float(num / den):.5f}\n")
+                             f"part={p} path={'tiled' if tiled else 'rowmajor'} {verdict}\n")
     return out
 
 

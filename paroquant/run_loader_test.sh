@@ -12,6 +12,7 @@ exec podman run --rm --privileged --ipc=host --network=host \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_ROT_V2=1 \
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
+  -e PQM_CKPT="${PQM_CKPT:-}" -e PQM_MS="${PQM_MS:-}" -e PQM_MODULES="${PQM_MODULES:-}" -e PQM_TP="${PQM_TP:-1}" \
   -v "$REPO":/patches:z -v "$MODELS":/models \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
     set -e

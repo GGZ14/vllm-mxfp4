@@ -25,7 +25,8 @@ sys.path.insert(0, "/patches/paroquant")
 import radiance_paroquant_mxfp4 as M   # noqa: E402  (registers the op + config)
 
 import os
-CKPT = os.environ.get("PQM_CKPT", "/models/Qwen3.8-27B-PARO-MXFP4")
+CKPT = os.environ.get("PQM_CKPT") or "/models/Qwen3.8-27B-PARO-MXFP4"
+TP = int(os.environ.get("PQM_TP", "1") or 1)
 GRID = torch.tensor([0.0, .5, 1., 1.5, 2., 3., 4., 6.])
 E4M3_MAX = 448.0
 
@@ -83,9 +84,14 @@ def main():
     torch.manual_seed(0)
     dev = "cuda"
     # A GDN layer's in_proj_qkv + in_proj_z: two DISTINCT rotations merged (P=2), like vLLM does.
-    names = ["model.language_model.layers.0.linear_attn.in_proj_qkv",
-             "model.language_model.layers.0.linear_attn.in_proj_z"]
+    mods_env = os.environ.get("PQM_MODULES") or "linear_attn.in_proj_qkv,linear_attn.in_proj_z"
+    names = [f"model.language_model.layers.0.{m}" for m in mods_env.split(",")]
     mods = [load_module(n) for n in names]
+    if TP > 1:   # emulate rank 0 of a column-parallel layer: first N/TP rows of each module
+        for m in mods:
+            rows = m["weight"].shape[0] // TP
+            m["weight"] = m["weight"][:rows].contiguous(); m["weight_scale"] = m["weight_scale"][:rows].contiguous()
+    print(f"checkpoint {CKPT} | modules {mods_env} | TP-emulation {TP}")
     K = mods[0]["weight"].shape[1] * 2
     sizes = [m["weight"].shape[0] for m in mods]
     N = sum(sizes)
@@ -108,10 +114,10 @@ def main():
     method.process_weights_after_loading(layer)
     print(f"prepared: P={layer.rec.shape[0]} pb1={layer.pq_pb1} pb2={layer.pq_pb2} "
           f"weight={tuple(layer.weight.shape)} ws_cat={layer.ws_cat.numel()} wref={tuple(layer.wref.shape)}")
-    assert layer.rec.shape[0] == 2, "in_proj_qkv and in_proj_z must NOT dedup"
+    assert layer.rec.shape[0] == len(mods), "distinct rotations must NOT dedup"
 
     bounds = [0, sizes[0], N]
-    for Mrows in (1, 5, 40, 64, 200, 600, 2048):
+    for Mrows in [int(x) for x in (os.environ.get("PQM_MS") or "1,5,40,64,200,600,2048").split(",")]:
         x = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
         y = method.apply(layer, x).float()
         # reference
