@@ -14,6 +14,14 @@ set -euo pipefail
 
 MODELS=${MODELS:-$HOME/models}
 PSEUDO=${PSEUDO:-Qwen3.8-27B-PARO-MXFP4-pseudo}
+# REAL=1: the directory is a real paroquant_mxfp4 checkpoint, served through the W4A8 kernel path
+# (the deployed accuracy, not the W4A16 upper bound the pseudo model gives). The v1 loader takes
+# no rotation-stream tuple, so the streams are forced off, and CHECKALL gates every partition.
+REAL=${REAL:-0}
+if [ "$REAL" = 1 ]; then
+  export RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 RADIANCE_PQ_ROT_STREAM3=0
+  export RADIANCE_PQM_CHECKALL=${RADIANCE_PQM_CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120"}
+fi
 N=${N:-500}
 TAG=${TAG:-mxfp4-paro-pseudo}
 MAXLEN=${MAXLEN:-4096}          # GSM8K is short; the fp16 pseudo model is 55.6 GiB, so leave
@@ -26,7 +34,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 
 echo "=== serving $PSEUDO (fp16 pseudo-quantized) ==="
 MODE=eval MODEL_DIR="$PSEUDO" MAXLEN_EVAL="$MAXLEN" GPU_UTIL="$GPU_UTIL" \
-  SERVED_NAMES=gate NAME=vllmgate PORT="$PORT" CHECKALL= \
+  SERVED_NAMES=gate NAME=vllmgate PORT="$PORT" CHECKALL="${RADIANCE_PQM_CHECKALL:-}" \
   "$REPO/paroquant/run_paroquant.sh" > "$LOG" 2>&1 &
 
 echo "waiting for the server (log: $LOG)"
