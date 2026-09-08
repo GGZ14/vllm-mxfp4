@@ -1,0 +1,302 @@
+"""ParoQuant rotations on MXFP4 weights (e2m1 + e8m0/32), W4A8 through the radiance MXFP4 kernel.
+
+Checkpoint (quant_method="paroquant_mxfp4", built by paroquant/build_hybrid.py): per projection the
+Quark MXFP4 buffers -- weight [N, K/2] uint8 (two e2m1 per byte, even index in the low nibble) and
+weight_scale [N, K/32] uint8 (e8m0, value 2^(E-127)) -- PLUS z-lab's trained rotation: pairs
+[krot, K] int16 (group-local Givens pairs), theta [krot, K/2] fp16, channel_scales [1, K] fp16
+stored pre-inverted (multiply activations by it).
+
+Why this exists: the prefill GEMM's inner-loop cost is linear in VALU per tile-group, and the int4
+path pays two FMAs there (fp16 group scale, asymmetric zero point). MXFP4 has neither -- the e8m0
+scale folds at weight staging and e2m1 has no zero point -- so the loop is the 0-VALU one already
+used for AMD's MXFP4 release. Same 4.25 bits/weight, so decode is unchanged; this is prefill.
+
+Serving path = the int4 module's per-token prologue composed with the MXFP4 GEMM:
+    rotate+scale (pq_rotate_quant, mode 1 -> bf16)  ->  per-token e4m3 (pq_token_quant)
+    ->  mxfp4_linear_pq(x_fp8, x_scale, W, Ws, wref)   once per distinct rotation (partition)
+The row-sum the int4 prologue also emits is simply unused. Rotations are per projection, so a
+merged linear carries P differently-rotated activation copies and the GEMM runs P times on the
+matching N-slices (P <= 3, boundaries on multiples of 128, identical adjacent rotations deduped).
+
+v1 limits, deliberate: no rotation-stream fusion (RADIANCE_PQ_ROT_STREAM must be 0 -- those
+producers hand the int4 GEMM's tuple), and no A-tiled prefill (the two kernels' tile layouts are
+not the same object; row-major A is used). Both are follow-ups once CHECKALL and GSM8K pass.
+"""
+import os
+import re
+import sys
+
+import torch
+
+from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.parameter import GroupQuantScaleParameter, ModelWeightParameter
+
+import radiance_mxfp4 as _mx                      # the MXFP4 GEMM, its layout helpers, its gates
+import radiance_paroquant as _pq                  # rotation records, TP-aware rotation loaders
+import radiance_paroquant_kernel as _pqk          # the rotation / token-quant prologue kernels
+
+GROUP, KROT_MAX, MXBLOCK = _pq.GROUP, _pq.KROT_MAX, 32
+
+# In-serve numerics gate, same contract as the int4 module's: "N:K,N:K" compares each partition's
+# GEMM against an fp32 dequant of the same codes for calls at or below CHECK_MAX_M rows. Needs
+# --enforce-eager. This is what catches the e8m0 fold flushing small codes on a checkpoint whose
+# exponent spread differs from AMD's.
+_ca = os.environ.get("RADIANCE_PQM_CHECKALL", "").strip()
+CHECK_ALL = ({tuple(int(v) for v in p.split(":")) for p in _ca.split(",") if p} if _ca else None)
+CHECK_MAX_M = int(os.environ.get("RADIANCE_PQM_CHECK_MAX_M", "128"))
+_checked: set = set()
+
+
+def _ensure_mxfp4_decode_scratch(device) -> None:
+    """The MXFP4 decode kernel's split-K slab, allocated at weight-load time.
+
+    Mirrors what the MXFP4 kernel class does on its first layer: it cannot be lazy, because with a
+    warm compile cache the first GEMM runs under CUDA-graph capture, where hipMalloc is illegal.
+    Our layers never pass through that class, so we do it here, guarded by the same flag."""
+    if _mx._decode_scratch_ready[0] or _mx.DECODE_MAX_M <= 0:
+        return
+    _mx._decode_scratch_ready[0] = True
+    _mx._decode_scratch[0] = torch.empty(4 * max(64, _mx.DECODE_MAX_M) * 32768,
+                                         dtype=torch.float32, device=device)
+    _mx._decode_scratch[1] = torch.zeros(32768 // 128 + 8, dtype=torch.int32, device=device)
+    _mx._ext.set_decode_scratch(_mx._decode_scratch[0].data_ptr(),
+                                _mx._decode_scratch[0].numel() * 4,
+                                _mx._decode_scratch[1].data_ptr())
+    sys.stderr.write(f"[radiance.paroquant_mxfp4] MXFP4 decode kernel ON (M<={_mx.DECODE_MAX_M}), "
+                     f"{_mx._decode_scratch[0].numel() * 4 >> 20} MiB split-K scratch\n")
+
+
+def _partitions(N: int, pb1: int, pb2: int):
+    bounds = [0, min(pb1, N), min(pb2, N), N]
+    return [(bounds[i], bounds[i + 1]) for i in range(3) if bounds[i + 1] > bounds[i]]
+
+
+def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
+    """Whole dispatch, opaque to dynamo (a data-dependent M branch in apply() would split the
+    compiled graph at every linear)."""
+    N, K = weight.shape[0], weight.shape[1] * 2
+    P, krot = rec.shape[0], rec.shape[1]
+    G, G32 = K // GROUP, K // MXBLOCK
+    M = x2.shape[0]
+    _pq._ensure_scratch(x2.device)
+    stream = torch.cuda.current_stream().cuda_stream
+
+    # pass A: channel-scale + rotate (all P partitions in one launch), bf16 out
+    xr = torch.empty((P, M, K), device=x2.device, dtype=torch.bfloat16)
+    asg = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+    rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+    _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
+                             asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
+    # pass C: per-token e4m3 codes + per-token dequant scale (the MXFP4 kernel's x contract)
+    a_codes = torch.empty((P, M, K), device=x2.device, dtype=torch.uint8)
+    as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
+    _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(), as_tok.data_ptr(),
+                            rs.data_ptr(), M, K, P, stream, 0)
+
+    out = torch.empty((M, N), device=x2.device, dtype=torch.bfloat16)
+    for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
+        w_p = weight[n0:n1]                                              # rows: contiguous
+        ws_p = ws_cat[G32 * n0: G32 * n1].view(G32, n1 - n0)             # pre-split at load
+        y = torch.ops.radiance.mxfp4_linear_pq(a_codes[p], as_tok[p], w_p, ws_p, wref[n0:n1])
+        out[:, n0:n1] = y
+        if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
+                and (N, K, M, p) not in _checked:
+            _checked.add((N, K, M, p))
+            w_ref = _mx.unpermute_w(w_p, n1 - n0, K) if _mx.WPERM else w_p
+            ref = _mx._exact_ref(a_codes[p].view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
+                                 w_ref, ws_p, n1 - n0, K)
+            num = (y.float() - ref.float()).pow(2).sum().sqrt()
+            den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
+            sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} "
+                             f"part={p} rel={float(num / den):.5f}\n")
+    return out
+
+
+@torch.library.custom_op("radiance::paroquant_mxfp4_linear", mutates_args=())
+def paroquant_mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, ws_cat: torch.Tensor,
+                           wref: torch.Tensor, rec: torch.Tensor, cs: torch.Tensor,
+                           pb1: int, pb2: int) -> torch.Tensor:
+    K = weight.shape[1] * 2
+    out = _linear_impl(x.reshape(-1, K), weight, ws_cat, wref, rec, cs, pb1, pb2)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+@paroquant_mxfp4_linear.register_fake
+def _(x, weight, ws_cat, wref, rec, cs, pb1, pb2):
+    return torch.empty((*x.shape[:-1], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
+
+
+@register_quantization_config("paroquant_mxfp4")
+class ParoQuantMXFP4Config(QuantizationConfig):
+    """MXFP4 weights + pairwise rotations, W4A8 through the radiance MXFP4 kernel."""
+
+    def __init__(self, bits: int, group_size: int, krot: int, fp16_patterns: list[str]):
+        super().__init__()
+        if bits != 4:
+            raise ValueError(f"paroquant_mxfp4 is 4-bit by definition, got {bits}")
+        if group_size != GROUP:
+            raise ValueError(f"rotation group must be {GROUP}, got {group_size}")
+        if not (1 <= krot <= KROT_MAX):
+            raise ValueError(f"krot={krot} outside the prologue's supported 1..{KROT_MAX}")
+        self.bits, self.group_size, self.krot = bits, group_size, krot
+        self.fp16_patterns = fp16_patterns
+        self._fp16_re = [re.compile(p) for p in fp16_patterns]
+
+    def __repr__(self):
+        return f"ParoQuantMXFP4Config(krot={self.krot}, unquantized_patterns={len(self.fp16_patterns)})"
+
+    @classmethod
+    def get_name(cls):
+        return "paroquant_mxfp4"
+
+    @classmethod
+    def get_supported_act_dtypes(cls):
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 0
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return ["config.json"]
+
+    @classmethod
+    def from_config(cls, config: dict) -> "ParoQuantMXFP4Config":
+        bits = cls.get_from_keys_or(config, ["bits"], 4)
+        group_size = cls.get_from_keys_or(config, ["group_size"], GROUP)
+        krot = cls.get_from_keys_or(config, ["krot"], 8)
+        pats = [r".*visual.*", r".*in_proj_a.*", r".*in_proj_b.*"]
+        extra = os.environ.get("RADIANCE_PQ_SKIP", "").strip()
+        pats += [p for p in extra.split(",") if p]
+        return cls(bits, group_size, krot, pats)
+
+    def get_quant_method(self, layer, prefix: str):
+        if not isinstance(layer, LinearBase):
+            return None
+        for rx in self._fp16_re:
+            if rx.fullmatch(prefix) or rx.search(prefix):
+                return UnquantizedLinearMethod()
+        return ParoQuantMXFP4LinearMethod(self)
+
+
+class ParoQuantMXFP4LinearMethod(LinearMethodBase):
+
+    def __init__(self, quant_config: ParoQuantMXFP4Config):
+        self.quant_config = quant_config
+
+    def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
+                       input_size, output_size, params_dtype, **extra_weight_attrs):
+        del input_size, output_size, params_dtype
+        out_part = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        krot = self.quant_config.krot
+        n_parts = len(output_partition_sizes)
+        K = input_size_per_partition
+
+        if K % GROUP:
+            raise ValueError(f"K per partition ({K}) is not a multiple of the rotation group "
+                             f"({GROUP}); a TP shard would straddle a group.")
+        for b in output_partition_sizes[:-1]:
+            if b % 128:
+                raise ValueError(f"partition boundary {b} not a multiple of the 128 n-block")
+
+        # Quark MXFP4 layout, as on disk. Row-parallel narrowing along input_dim uses the param's
+        # own size (K/2 bytes, K/32 exponents), which is exactly the packed shard.
+        weight = ModelWeightParameter(
+            data=torch.empty(out_part, K // 2, dtype=torch.uint8),
+            input_dim=1, output_dim=0, weight_loader=weight_loader)
+        weight_scale = GroupQuantScaleParameter(
+            data=torch.empty(out_part, K // MXBLOCK, dtype=torch.uint8),
+            input_dim=1, output_dim=0, weight_loader=weight_loader)
+        layer.register_parameter("weight", weight)
+        layer.register_parameter("weight_scale", weight_scale)
+
+        # Rotation params and their TP-aware loader are the int4 module's, unchanged.
+        for name, shape, dtype in [
+            ("theta", (n_parts, krot, K // 2), torch.float16),
+            ("pairs", (n_parts, krot, K), torch.int16),
+            ("channel_scales", (n_parts, K), torch.float16),
+        ]:
+            init = torch.ones if name == "channel_scales" else torch.zeros
+            p = torch.nn.Parameter(init(shape, dtype=dtype), requires_grad=False)
+            p.weight_loader = _pq._rotation_weight_loader
+            layer.register_parameter(name, p)
+        layer.pq_output_partition_sizes = list(output_partition_sizes)
+
+    def process_weights_after_loading(self, layer) -> None:
+        device = layer.weight.device
+        N, K = layer.weight.shape[0], layer.weight.shape[1] * 2
+        krot = self.quant_config.krot
+        _ensure_mxfp4_decode_scratch(device)
+
+        # ---- rotations: dedup identical adjacent partitions, build kernel records (as int4) ----
+        sizes_all = layer.pq_output_partition_sizes
+        keep, run_sizes = [0], [sizes_all[0]]
+        for i in range(1, len(sizes_all)):
+            same = (torch.equal(layer.theta.data[i], layer.theta.data[keep[-1]])
+                    and torch.equal(layer.pairs.data[i], layer.pairs.data[keep[-1]])
+                    and torch.equal(layer.channel_scales.data[i],
+                                    layer.channel_scales.data[keep[-1]]))
+            if same:
+                run_sizes[-1] += sizes_all[i]
+            else:
+                keep.append(i)
+                run_sizes.append(sizes_all[i])
+        if len(keep) > 3:
+            raise ValueError(f"at most 3 distinct rotations per linear, got {len(keep)}")
+        for b in run_sizes[:-1]:
+            if b % 128:
+                raise ValueError(f"distinct-rotation boundary {b} not a multiple of 128")
+        pairs = layer.pairs.data[keep].to(torch.int64)
+        if int(pairs.min()) < 0 or int(pairs.max()) >= GROUP:
+            raise ValueError("pair indices not local to the 128 group")
+        theta = layer.theta.data[keep].to(torch.float32)
+        P = pairs.shape[0]
+        ij = pairs[..., 0::2] | (pairs[..., 1::2] << 8)
+        rec = torch.zeros((P, krot, K // 2, 4), dtype=torch.int16, device=device)
+        rec[..., 0] = ij.to(torch.int16)
+        rec[..., 1] = torch.cos(theta).to(torch.float16).view(torch.int16)
+        rec[..., 2] = torch.sin(theta).to(torch.float16).view(torch.int16)
+        cs = layer.channel_scales.data[keep].contiguous()
+        layer.pq_pb1 = run_sizes[0] if len(run_sizes) > 1 else (1 << 30)
+        layer.pq_pb2 = run_sizes[0] + run_sizes[1] if len(run_sizes) > 2 else (1 << 30)
+
+        # ---- MXFP4 weight, prepared exactly as the MXFP4 kernel class prepares AMD's ----
+        ws_t = layer.weight_scale.data.T.contiguous()                    # [K/32, N]
+        wref = _mx.make_row_ref(ws_t)                                    # [N] e8m0 row max
+        # Per-partition contiguous scale slabs, concatenated: the GEMM runs once per distinct
+        # rotation on an N-slice, and a column slice of [K/32, N] is not contiguous.
+        parts = _partitions(N, layer.pq_pb1, layer.pq_pb2)
+        ws_cat = torch.cat([ws_t[:, n0:n1].contiguous().reshape(-1) for n0, n1 in parts])
+        w = layer.weight.data
+        if _mx.WPERM:
+            if N % 16 or K % 16:
+                raise RuntimeError(f"RADIANCE_MXFP4_WPERM needs N,K divisible by 16, got {N},{K}")
+            w = _mx.permute_w(w, N, K)       # 16-row tiles never straddle a 128-aligned boundary
+
+        del layer.weight, layer.weight_scale, layer.theta, layer.pairs, layer.channel_scales
+        layer.weight = torch.nn.Parameter(w.contiguous(), requires_grad=False)
+        layer.ws_cat = torch.nn.Parameter(ws_cat.contiguous(), requires_grad=False)
+        layer.wref = torch.nn.Parameter(wref, requires_grad=False)
+        layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
+        layer.cs = torch.nn.Parameter(cs, requires_grad=False)
+
+    def apply(self, layer, x, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if isinstance(x, tuple):
+            raise RuntimeError("paroquant_mxfp4 v1 does not take the rotation-stream tuple; "
+                               "serve with RADIANCE_PQ_ROT_STREAM=0")
+        out = torch.ops.radiance.paroquant_mxfp4_linear(x, layer.weight, layer.ws_cat, layer.wref,
+                                                        layer.rec, layer.cs, layer.pq_pb1,
+                                                        layer.pq_pb2)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
+if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
+    sys.stderr.write("[radiance.paroquant_mxfp4] registered (e2m1+e8m0/32 weights, z-lab rotations, "
+                     f"per-token W4A8 -> MXFP4 GEMM; WPERM={'on' if _mx.WPERM else 'off'}, "
+                     f"decode band M<={_mx.DECODE_MAX_M})\n")

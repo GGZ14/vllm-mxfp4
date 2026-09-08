@@ -182,7 +182,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     cd /paro
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so
-    cp radiance_paroquant.py "$SP"/
+    cp radiance_paroquant.py radiance_paroquant_mxfp4.py "$SP"/
     # NB: appended to the STDLIB sitecustomize, not written to site-packages -- Ubuntu ships
     # /usr/lib/python3.12/sitecustomize.py and it shadows any site-packages one, so a file
     # dropped there is silently never imported. Each podman run starts from the pristine image,
@@ -190,6 +190,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     printf "%s\n" \
       "try:" \
       "    import radiance_paroquant  # registers the paroquant quantization config" \
+      "    import radiance_paroquant_mxfp4  # and the MXFP4-weights variant (paroquant_mxfp4)" \
       "except Exception as e:" \
       "    import sys" \
       "    sys.stderr.write(\"[radiance.paroquant] registration failed: %r\\n\" % (e,))" \

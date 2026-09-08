@@ -87,7 +87,9 @@ for out, wmap in ((OUT_PSEUDO, pseudo_map), (OUT_REAL, real_map)):
         if fn.suffix in (".json", ".jinja", ".txt") and fn.name != "model.safetensors.index.json":
             shutil.copy(fn, out / fn.name)
 cfg = json.load(open(PARO / "config.json"))
-cfg_p = dict(cfg); cfg_p.pop("quantization_config", None); cfg_p["torch_dtype"] = "float16"
+# No torch_dtype override: the R4D attention backend is bf16-only, and z-lab's config (no
+# top-level dtype, text_config bf16) is what the proven serve runs. fp16 weights cast on load.
+cfg_p = dict(cfg); cfg_p.pop("quantization_config", None); cfg_p.pop("torch_dtype", None)
 json.dump(cfg_p, open(OUT_PSEUDO / "config.json", "w"), indent=2)
 cfg_r = dict(cfg); cfg_r["quantization_config"] = {"quant_method": "paroquant_mxfp4", "format": "mxfp4",
     "bits": 4, "group_size": GS, "mxfp4_block": 32, "krot": int(cfg["quantization_config"]["krot"]),
