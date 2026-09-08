@@ -89,6 +89,9 @@ MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
 MODEL=/models/$MODEL_DIR
 [ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
 MAXLEN_EVAL=${MAXLEN_EVAL:-32768}
+# TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
+TP=${TP:-2}
+GPUS=${GPUS:-0,1}
 
 if [ "$MODE" = eval ]; then
   EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN_EVAL" --max-num-seqs 8
@@ -109,7 +112,7 @@ fi
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
-  -e ROCR_VISIBLE_DEVICES=0,1 -e HIP_VISIBLE_DEVICES=0,1 \
+  -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$GPUS" \
   -e HF_HUB_OFFLINE=1 \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
@@ -210,7 +213,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   --served-model-name $SERVED_NAMES \
   --host 0.0.0.0 --port "$PORT" \
   --kv-cache-dtype fp8 \
-  --tensor-parallel-size 2 \
+  --tensor-parallel-size "$TP" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --attention-backend R4D \
   --no-async-scheduling \
