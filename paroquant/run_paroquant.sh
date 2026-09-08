@@ -20,7 +20,19 @@
 #
 # Port 8080 is prod's port and both need both GPUs: stop production first
 #   systemctl --user stop qwen_vllm_38        restore with: vllm-switch 38
+#
+# 2026-09-03 default sampling temperature 1.0 -> 0.7 (--override-generation-config), fleet-wide
+#   across every vllm-switch target. DEFAULT only -- a client-supplied temperature still wins.
+#   Rollback: sed -i 's/"temperature":0.7/"temperature":1.0/' run_paroquant.sh && systemctl --user restart qwen_vllm_paro
+#
 set -euo pipefail
+
+# Paths are derived, not hardcoded: this script is the one the systemd unit runs, so it has to
+# work from a clone anywhere. PATCHES defaults to the repo root (this file lives in paroquant/).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PATCHES_DIR="$(realpath -m "${PATCHES:-$SCRIPT_DIR/..}")"
+MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
+HF_CACHE="$(realpath -m "${HF_CACHE:-$HOME/.cache/huggingface}")"
 
 MODE=${MODE:-eval}
 PORT=${PORT:-8080}
@@ -36,7 +48,22 @@ GPU_UTIL=${GPU_UTIL:-0.92}
 # has run it since 08-30; the merge hook it needs is installed with the merge itself left OFF
 # (in_proj_a/b are fp16 here, there is nothing to merge). Compile cache keyed on the flag.
 GDN_FUSED=${RADIANCE_GDN_FUSED_UPDATE:-1}
+# Pinned to the build the shipped PARO numbers were measured on. serve-mxfp4.sh now derives
+# b9e42ab-rx6 from r4d_radiance_extras.patch (rx6 adds the 3-rank all-reduce for TP=3); rx5 is not
+# reproducible from the current patch, so a fresh box has to use rx6 and re-gate GSM8K for this
+# stack. Override with R4D_KEY=.
 R4D_KEY=${R4D_KEY:-b9e42ab-rx5}
+R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
+# The image's own libr4d predates the gated-delta-net overflow fix and NaNs this model, and the
+# in-container copy is guarded by [ -f /r4d/r4d.so ] -- a missing build there is a silent fallback
+# to the NaN kernel, not an error. Check it on the host, where it can still be a message.
+[ -f "$R4D_CACHE/$R4D_KEY/r4d.so" ] || {
+  echo "libr4d $R4D_KEY not built at $R4D_CACHE/$R4D_KEY/r4d.so" >&2
+  echo "  serving without it falls back to the image's libr4d, which NaNs this model." >&2
+  echo "  Build the current one:  ./setup-paroquant.sh   (produces b9e42ab-rx6)" >&2
+  echo "  then either R4D_KEY=b9e42ab-rx6 $0 ... or re-gate and change the default here." >&2
+  exit 1
+}
 # Rotation stream: fused add+rmsnorm+rotate+quant producers for the norm-fed linears (decode
 # band); patches the decoder-layer forward, so the compile cache is keyed (-rs).
 ROT_STREAM=${RADIANCE_PQ_ROT_STREAM:-1}
@@ -52,7 +79,7 @@ CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
 MODEL=/models/Qwen3.8-27B-PARO
-[ -d "$HOME/models/Qwen3.8-27B-PARO" ] || { echo "model missing" >&2; exit 1; }
+[ -d "$MODELS/Qwen3.8-27B-PARO" ] || { echo "model missing at $MODELS/Qwen3.8-27B-PARO; run setup-paroquant.sh" >&2; exit 1; }
 
 if [ "$MODE" = eval ]; then
   EXTRA_ARGS=(--enforce-eager --max-model-len 32768 --max-num-seqs 8
@@ -109,13 +136,13 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
   -e TRITON_CACHE_DIR=/cache/triton -e AITER_ROOT_DIR=/cache/aiter \
   -e TRITON_CACHE_AUTOTUNING=1 \
-  -v /home/brian/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/brian/models:/models \
+  -v "$HF_CACHE":/root/.cache/huggingface \
+  -v "$MODELS":/models \
   -v "$CACHE":/cache \
-  -v /home/brian/deadcode-vllm:/patches:z \
-  -v /home/brian/mxfp4_work/paro:/paro:z \
-  -v /home/brian/.cache/radiance-libr4d/$R4D_KEY:/r4d:z \
-  -e R4D_SO=/home/brian/.cache/radiance-libr4d/$R4D_KEY \
+  -v "$PATCHES_DIR":/patches:z \
+  -v "$SCRIPT_DIR":/paro:z \
+  -v "$R4D_CACHE/$R4D_KEY":/r4d:z \
+  -e R4D_SO="$R4D_CACHE/$R4D_KEY" \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
     set -e
     SP=/opt/vllm/lib/python3.12/site-packages

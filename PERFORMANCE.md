@@ -11,6 +11,7 @@ None of this is needed to run the server.
 
 - [Where the speed came from](#where-the-speed-came-from)
 - [Two results worth carrying forward](#two-results-worth-carrying-forward)
+- [ParoQuant against MXFP4](#paroquant-against-mxfp4)
 - [Provenance: the 0.5.8 -> 0.7.4 baseline](#provenance-the-058---074-baseline)
 - [The gated-delta-net NaN (fixed upstream)](#the-gated-delta-net-nan-fixed-upstream)
 
@@ -48,6 +49,52 @@ throughput (conc-8 562 vs 544). Dynamic verify width mostly dissolves the trade-
 microbench on an idle, VRAM-squeezed GPU and shipped as a regression: at the real prefill shape
 (M=8192) it measures 828 us against the original 726, **14% worse**, because its +40 VGPRs/thread
 costs occupancy exactly when 8192 workgroups compete. (`eafcac9`, reverted in `5950b38`)
+
+## ParoQuant against MXFP4
+
+The second int4 format this stack serves, measured on the same box against MXFP4 production. The
+path itself — format, kernels, knobs — is documented in [PAROQUANT.md](PAROQUANT.md); this is what
+it is worth.
+
+| | MXFP4 prod | ParoQuant | |
+|---|---|---|---|
+| GSM8K 500q | 97.8% | **97.4-98.0%** | per-token vs per-group activation scales; inside binomial noise |
+| decode @ ctx25 | 22.3 ms/step | 24.19 ms/step | -7% |
+| combined decode | 186.0 t/s | **226.2 t/s** | +22% |
+| conc 1/2/4/8/16 | — | 168 / 276 / 399 / **512** / 518 | |
+| prefill @ 2k/8k/16k/32k/64k | — | 3782 / 3700 / 3725 / 3621 / 3450 t/s | -8.8% at 8k when it shipped, parity from ~64k |
+| KV cache profile | — | 622k tokens | |
+
+Weight-side traffic is 4.25 bits/weight in both formats (ParoQuant's asymmetric zero point rides in
+the same 4-byte load as the scale), which is why they land so close at the memory-bound end. The
+gap that remained was launch count, not arithmetic: at ship time the rotation was 192 separate
+launches per decode step, ~2 ms of a 26 ms step.
+
+Where the ParoQuant speed came from, each measured against the build before it:
+
+| Change | Measured | Gate |
+|---|---|---|
+| A-tiled prefill GEMM + fragment-order decode + prologue v2 | prefill 3220/3144/3148/3139/2984 -> **3789/3723/3668/3630/3427 t/s** (+15-18%); 24.27 ms/step (was 25.74, -5.7%) | GSM8K 500q 97.60%; harness bit-exact incl. the bf16 scratch rounding |
+| Rotation stream 1 — residual add + RMSNorm + rotate + quant as one producer kernel | 24.27 -> **24.03 ms/step**; combined decode 186.0 t/s (= MXFP4 prod); KV profile 432k -> 479k tokens | GSM8K 500q **98.00%**; 96 rotation launches per step removed |
+| Rotation stream 2 — silu-mul, gated norm, attention gate producers | 24.53 -> **24.19 ms/step** (-1.4%); combined **226.2 t/s**; conc-8 500 -> 512; KV profile 479k -> **622k tokens** | Harness 24/24 bit-exact vs the unfused chain; GSM8K 97.40% |
+
+The KV profile moving 432k -> 479k -> 622k tokens across the two stream landings is worth noting on
+its own: fusing producers removed intermediates from the compiled graph, and the capacity came back
+as cache.
+
+**Rejected: rotation stream 3**, the two-rank all-reduce fused into the norm+rotate producer. It is
+*correct* — bit-exact single-rank loopback, an in-serve all-reduce check passing on every call on
+both ranks, GSM8K 97.40, identical sanity completions — and still slower: 25.10 vs 24.19 ms/step,
+202 vs 226 t/s combined. With one workgroup per row the rotation chains serialize on a single CU
+and the push uses M CUs instead of r4d's 24 blocks, costing +7 us per site. Two earlier designs
+deadlocked outright, in both cases because a spin-wait on peer flags outgrew residency or changed
+its slice mapping with M. The MXFP4 `exact_nq` all-reduce wins with the same structure only because
+its epilogue has no rotation to serialize.
+
+One methodology note carried over from the MXFP4 work and re-earned here: **judge layout A/Bs with
+short benches.** Under the fixed 210 W per-card cap a long run and a short run of the same build do
+not measure the same machine, and a GSM8K comparison run against the wrong chat template moves the
+score by two points regardless of the kernel — the 97-98% band needs `qwen-fixed-v22.3.jinja`.
 
 ## Provenance: the 0.5.8 -> 0.7.4 baseline
 

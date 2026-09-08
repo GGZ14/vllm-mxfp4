@@ -22,6 +22,7 @@ git clone https://codeberg.org/ggz14/radiance-vllm-mxfp4 && cd radiance-vllm-mxf
 - [Setup](#setup)
 - [Checkpoints](#checkpoints)
 - [Running the server](#running-the-server)
+- [ParoQuant (int4 W4A8)](#paroquant-int4-w4a8)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Performance](#performance)
@@ -40,7 +41,7 @@ Repo version `0.12.0`; pinned image `stilldeadcode/vllm-radiance:0.9.3`.
 | | |
 |---|---|
 | **Tested hardware** | 2 x Radeon AI PRO R9700 (gfx1201), tensor parallel |
-| **Tested models** | Qwen3.8-27B-FP8, Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8, Gemma-4-31B-it-FP8, Qwen3.8-27B-Quark-AWQ-MXFP4 |
+| **Tested models** | Qwen3.8-27B-FP8, Qwen3.6-27B-FP8, Qwen3.6-35B-A3B-FP8, Gemma-4-31B-it-FP8, Qwen3.8-27B-Quark-AWQ-MXFP4, Qwen3.8-27B-PARO |
 | **Tested KV dtypes** | fp8, bf16, `auto` |
 | **Detected, not assumed** | GPU count, tensor-parallel size, KV cache size |
 | **Untested** | other models, other weight formats, 1 or 4+ GPUs, non-R9700 hardware, TP=3 on a real three-card box |
@@ -257,6 +258,35 @@ All of its tunables are `${VAR:-default}`, so override them from the shell or a 
 editing it. With podman, `podman compose` takes the same file. The per-model notes (35B-A3B's
 `--max-num-batched-tokens >= 2240`, Gemma-4-31B's template and drafter) are in
 [DOCKERHUB.md](DOCKERHUB.md#tested-so-far).
+
+## ParoQuant (int4 W4A8)
+
+MXFP4 is not the only int4 format this stack serves. **ParoQuant** checkpoints
+(`z-lab/Qwen3.8-27B-PARO`: int4 group-128 asymmetric, plus learned pairwise Givens rotations and
+channel scaling on the activations) run on a W4A8 path built for gfx1201 — hand-written HIP
+rotation and GEMM kernels, registered as a real vLLM quantization method through the public plugin
+hook.
+
+The reference ParoQuant implementation is CUDA-only and W4A16. This one is independent: the
+rotation is a kernel, not a PyTorch fallback, and the asymmetric zero point is folded into the GEMM
+epilogue as a row-sum correction rather than dequantized into the matmul. Weight-side traffic works
+out at 4.25 bits/weight, the same as MXFP4.
+
+```bash
+./setup-paroquant.sh                      # host check, image, checkpoint, drafter, kernels
+MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+```
+
+It shares the image, the DFlash2-FP8 drafter and libr4d with the MXFP4 setup, so running both costs
+one download of each. Both stacks want both cards and port 8080, so only one serves at a time
+(`vllm-switch paro` where the systemd units are installed).
+
+Measured against MXFP4 production on 2 x R9700: GSM8K 500q **97.4-98.0%** (MXFP4 97.8), combined
+decode **226 t/s** (MXFP4 186), conc-8 512 t/s, 24.19 ms/step, in-serve numerics gate rel = 0.00000
+on every gated shape on both TP ranks (<= 4e-5 at wider M).
+
+The format, the kernels, the knob reference and the rejected experiments are in
+[PAROQUANT.md](PAROQUANT.md).
 
 ## Configuration
 
@@ -615,6 +645,18 @@ and hipcc must still link a HIP shared object, since AITER JITs at runtime.
 | `run_mxfp4_074.sh` | Compatibility shim: the launcher's old name, forwards to `serve-mxfp4.sh` |
 | `run_mxfp4_minm.sh` | The 0.5.8 launch, frozen. The only way to reproduce the baseline the numbers here are measured against |
 
+### ParoQuant entry points
+
+| File | What it is |
+|---|---|
+| `setup-paroquant.sh` | One-time setup: host check, image, PARO checkpoint, drafter, kernels. Idempotent |
+| `paroquant/run_paroquant.sh` | The launcher. `MODE=eval` gates numerics, `MODE=prod` serves |
+| `paroquant/radiance_paroquant.py` | The `paroquant` quant method: checkpoint loading, layout, dispatch |
+| `paroquant/radiance_paroquant.hip` | Kernel module. Compiled in-container at launch |
+| `paroquant/par_kernels.h` | The rotation and W4A8 GEMM device code |
+| `paroquant/par_harness.hip` | Standalone gates for the kernels, no server needed (`run.sh`, `run2.sh`) |
+| `paroquant/RESULTS.md` | The change-by-change engineering log |
+
 ### Where the HIP kernels live
 
 The HIP kernels are not in this repo. They live in
@@ -637,6 +679,7 @@ specific to this fork rather than general to gfx1201, so the image build compile
 | Document | What's in it |
 |---|---|
 | [DOCKERHUB.md](DOCKERHUB.md) | The image description, the complete environment-variable / knob reference, and stack versions |
+| [PAROQUANT.md](PAROQUANT.md) | The ParoQuant W4A8 path: format, rotation kernel, GEMM, knobs, and the experiments that were rejected |
 | [PERFORMANCE.md](PERFORMANCE.md) | The change-by-change optimization ledger, the 0.5.8 -> 0.7.4 provenance A/B, and the gated-delta-net NaN write-up |
 | [MXFP4-NOTES.md](MXFP4-NOTES.md) | Design notes, measurements and traps behind `serve-mxfp4.sh` |
 | [TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) | The TP=3 dummy-head padding design and its validation gates |
