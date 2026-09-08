@@ -58,7 +58,15 @@ TRAIN_SIZE=${TRAIN_SIZE:-512}
 BATCH_SIZE=${BATCH_SIZE:-4}      # logits are batch x 2048 x 248064 x 2 B = 1 GiB per sample
 CACHE_SHARDS=${CACHE_SHARDS:-16} # only one shard is resident on GPU at a time
 SEQLEN=${SEQLEN:-2048}
-EPOCHS=${EPOCHS:-"5 5"}
+EPOCHS=${EPOCHS:-"2 2"}
+# Stage-1 (channel_scales + rotation angles) learning rate. Upstream's 27B recipe uses 0.05, but
+# measured on this stack the rotation stage stops contributing past ~layer 10 and lands at
+# EXACTLY 0.0% on several layers -- it diverges on the first epoch and best_sd keeps the starting
+# point. Each layer is optimized independently against its own captured inputs/outputs, so there
+# is no cross-layer consistency requirement and this may be tuned freely.
+ROT_LR=${ROT_LR:-0.05}
+WEIGHT_LR=${WEIGHT_LR:-1e-5}
+QUANT_LR=${QUANT_LR:-1e-6}
 STAGE=${STAGE:-all}              # all | optimize | pseudo | convert
 PSEUDO_OUT=${PSEUDO_OUT:-Qwen3.8-27B-PARO-MXFP4-pseudo}
 
@@ -93,11 +101,11 @@ run() {
 }
 
 if [ "$STAGE" = all ] || [ "$STAGE" = optimize ]; then
-  echo "=== optimize (format=$FORMAT rule=$SCALE_RULE pow2=$POW2 train_size=$TRAIN_SIZE) ==="
+  echo "=== optimize (format=$FORMAT rule=$SCALE_RULE train_size=$TRAIN_SIZE epochs=$EPOCHS rot_lr=$ROT_LR) ==="
   # shellcheck disable=SC2086
   run -m paroquant.cli.optimize \
     --model "/models/$BASE" \
-    --params "channel_scales:0.05,angles:0.05" "weight:1e-5,quantizer:1e-6" \
+    --params "channel_scales:$ROT_LR,angles:$ROT_LR" "weight:$WEIGHT_LR,quantizer:$QUANT_LR" \
     --epochs $EPOCHS \
     --group-size 128 \
     --n-bit 4 \
