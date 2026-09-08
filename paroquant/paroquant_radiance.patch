@@ -1,5 +1,5 @@
 diff --git a/paroquant/cli/convert.py b/paroquant/cli/convert.py
-index 8055cec..281d4a2 100644
+index 8055cec..0bd8255 100644
 --- a/paroquant/cli/convert.py
 +++ b/paroquant/cli/convert.py
 @@ -15,6 +15,8 @@ from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
@@ -93,6 +93,18 @@ index 8055cec..281d4a2 100644
          "bits": bits,
          "group_size": group_size,
          "krot": krot,
+@@ -481,7 +541,10 @@ def main() -> None:
+         raise FileNotFoundError(f"Result directory not found: {result_dir}")
+ 
+     source_dir = _resolve_source_dir(args.model)
+-    model = _load_model(str(source_dir), device_map="cpu" if args.mode == "real" else "cuda")
++    # Both modes keep the model on CPU. _convert_pseudo already moves each block to GPU and back
++    # itself, so device_map="cuda" only forces the whole fp16 model resident up front -- 55.6 GiB
++    # for a 27B, which does not fit a 32 GiB card.
++    model = _load_model(str(source_dir), device_map="cpu")
+ 
+     quant_config: dict[str, Any] | None = None
+     save_state_dict: dict[str, torch.Tensor] | None = None
 diff --git a/paroquant/cli/optimize.py b/paroquant/cli/optimize.py
 index 9469078..36c1679 100644
 --- a/paroquant/cli/optimize.py
