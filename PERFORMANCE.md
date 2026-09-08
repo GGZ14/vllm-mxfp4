@@ -76,6 +76,7 @@ Where the ParoQuant speed came from, each measured against the build before it:
 |---|---|---|
 | A-tiled prefill GEMM + fragment-order decode + prologue v2 | prefill 3220/3144/3148/3139/2984 -> **3789/3723/3668/3630/3427 t/s** (+15-18%); 24.27 ms/step (was 25.74, -5.7%) | GSM8K 500q 97.60%; harness bit-exact incl. the bf16 scratch rounding |
 | Rotation stream 1 — residual add + RMSNorm + rotate + quant as one producer kernel | 24.27 -> **24.03 ms/step**; combined decode 186.0 t/s (= MXFP4 prod); KV profile 432k -> 479k tokens | GSM8K 500q **98.00%**; 96 rotation launches per step removed |
+| MXFP4 weights + z-lab rotations (`paroquant_mxfp4`, 2026-09-08) | GEMM inner loop 16 VALU -> **0** (180-188 -> 225 TF/s class); A-tiled prefill enabled (layouts identical); decode unchanged (4.25 bits/weight both) | CHECKALL rel 0.00000 on all four gated shapes, every partition; loader at the e4m3 floor (0.011-0.012) at every band; one-shot pseudo GSM8K 96.96% (W4A16 bound), fine-tune in progress |
 | Rotation stream 2 — silu-mul, gated norm, attention gate producers | 24.53 -> **24.19 ms/step** (-1.4%); combined **226.2 t/s**; conc-8 500 -> 512; KV profile 479k -> **622k tokens** | Harness 24/24 bit-exact vs the unfused chain; GSM8K 97.40% |
 
 The KV profile moving 432k -> 479k -> 622k tokens across the two stream landings is worth noting on

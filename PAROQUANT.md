@@ -24,6 +24,7 @@ It serves `z-lab/Qwen3.8-27B-PARO` at **GSM8K 97.4-98.0%** (MXFP4 97.8) with **c
 - [Configuration](#configuration)
 - [Traps](#traps)
 - [Results](#results)
+- [MXFP4 weights: the zero-VALU loop](#mxfp4-weights-the-zero-valu-loop)
 
 ## Setup and running
 
@@ -276,6 +277,69 @@ one workgroup per row the rotation chains serialize on one CU and the push uses 
 r4d's 24 blocks. Restoring the parallelism means either a spin-wait deadlock or a two-launch split,
 which gives back the launch saving that was the point. The MXFP4 equivalent wins with the same
 structure only because its epilogue has no rotation.
+
+## MXFP4 weights: the zero-VALU loop
+
+The int4 GEMM's prefill cost is linear in VALU per tile-group: 16 ops (the fp16 group scale FMA
+and the zero-point FMA) run at 180-188 TF/s, 8 at 200, **0 at 225** -- MXFP4's loop. So the second
+ParoQuant format keeps the learned rotations and changes only the weight grid to OCP MXFP4:
+e2m1 elements, one e8m0 (power-of-two) scale per 32 along K. The e8m0 scale folds at weight
+staging, e2m1 has no zero point, and the inner loop is fp8 x fp8 WMMA with nothing else in it --
+the same W4A8 path AMD's MXFP4 release runs on. Weight traffic is unchanged at 4.25 bits/weight
+(4 + 8/32 vs 4 + 32/128), so decode is untouched; this is a prefill format.
+
+**Checkpoint** (`quant_method: paroquant_mxfp4`, `paroquant/build_hybrid.py`): per projection the
+Quark MXFP4 buffers -- `weight [N, K/2]` u8 (two e2m1 per byte, even index in the low nibble),
+`weight_scale [N, K/32]` u8 -- plus z-lab's `pairs`/`theta`/`channel_scales`. 18 GB, the same as
+the int4 checkpoint and as AMD's MXFP4. The packing, scale bias and on-disk layouts match what
+`radiance_mxfp4.py` already decodes, byte for byte.
+
+**Where the rotations come from, and why not from scratch.** ParoQuant's optimizer initializes
+rotations at identity. With the calibration this box can afford (256 samples x 2 epochs; 60 GiB
+of RAM holding a 55.6 GiB fp16 model, so 512 samples thrash), the rotation stage stops helping
+past layer ~10 and leaves angles at *exactly zero* on many layers -- layer 28 came out 100% zero
+against z-lab's 3.1 rad mean. That run was MXFP4 plus weight fine-tuning behind a prologue that
+rotates by nothing. The hybrid instead takes the bf16 base weights, applies z-lab's trained
+rotations through the same kernel the optimizer uses (their dequantized int4 reproduces
+`rotate(W_bf16 * cs)` to within int4 noise: 0.104 vs 0.1025 expected, inverse rotation 1.41), and
+quantizes to MXFP4 -- 400 modules in 91 s. A rotation that tames per-group outliers for int4 does
+the same for e2m1. `STAGE=finetune` then optimizes only the weights and the per-block e8m0 bias
+under the MXFP4 grid with those rotations frozen: layer 0 went 1.92e-5 -> 3.02e-6 (-84%).
+
+**Shared exponent.** AMD's release uses the OCP `floor(log2(amax)) - 2` rule, which clips the
+block maximum (their per-block maxima are only 4.0 and 6.0, never 3.0). A never-clip rule
+measured *worse* on real weights (+1.9% RMSE, every tensor sampled), so `ocp` is the default and
+a comparison against AMD's checkpoint isolates the rotations.
+
+**Serving** (`paroquant/radiance_paroquant_mxfp4.py`): the int4 module's per-token prologue
+(`pq_rotate_quant` -> `pq_token_quant`) composed with `mxfp4_linear_pq`, once per distinct rotation
+on its N-slice; weight prep mirrors the MXFP4 kernel class (scale transpose, per-row reference
+exponent, fragment order). The prologue's tiled writer and the MXFP4 GEMM's tiled reader use the
+same fragment layout -- `[m-tile][k-step][half][row 16][8 B]` -- so the A-tiled prefill path is
+taken above `RADIANCE_MXFP4_A_TILED_MIN_M` with no relayout. `RADIANCE_PQM_CHECKALL` gates each
+partition against an fp32 dequant. Serve with the same launcher:
+`MODEL_DIR=Qwen3.8-27B-PARO-MXFP4 RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0`.
+
+**Gated so far (2026-09-08):**
+
+| | |
+|---|---|
+| in-serve `CHECKALL`, real checkpoint | rel = 0.00000 on 16384:5120 (P=2, both parts), 5120:6144, 34816:5120 (P=2, both), 5120:17408 |
+| loader vs fp32 reference | rel 0.011-0.012 at M = 1 / 5 / 40 / 64 (decode), 200 (prefill), 600 / 2048 (A-tiled) -- the e4m3 activation floor |
+| GSM8K 500q, one-shot hybrid, pseudo (W4A16 upper bound) | **96.96%** (479/494) vs AMD MXFP4 97.8, int4 PARO 97.4-98.0 |
+| weight-space error vs bf16, one-shot | +4-9% over z-lab's fine-tuned int4 (e.g. L0 down_proj 0.127 vs 0.118) -- what the fine-tune targets |
+
+**Open:** the fine-tuned checkpoint's GSM8K, on both the pseudo path and the served W4A8 path; a
+speed comparison against int4 PARO. **Known gap:** the fused rotation-stream producers still emit
+the int4 GEMM's per-group tuple, so v1 runs rotate -> token-quant as two launches per linear and
+its decode trails int4 PARO's 226 t/s until they are adapted to the per-token tuple.
+
+**Traps, so nobody re-hits them:** the pseudo config must not carry `torch_dtype: float16` (R4D
+attention is bf16-only); `GPUS=<one card>` needs `HIP_VISIBLE_DEVICES` to index into the
+ROCR-filtered set; the `RADIANCE_MXFP4_*` kernel knobs must reach the container or the GEMM runs
+with fragment order off and the decode band disabled; two gate scripts must never share a port
+(one stopped the server under the other's last six requests -- the "errors" in that run); the
+`RotateQuantizedLinear` + `strict=False` export path silently writes zeros for MXFP4 buffers.
 
 The full change-by-change log, including the prefill ablation ledger and the SPEC re-sweep, is in
 [paroquant/RESULTS.md](paroquant/RESULTS.md).
