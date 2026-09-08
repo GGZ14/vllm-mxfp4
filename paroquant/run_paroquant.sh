@@ -92,6 +92,10 @@ MAXLEN_EVAL=${MAXLEN_EVAL:-32768}
 # TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
 TP=${TP:-2}
 GPUS=${GPUS:-0,1}
+# Optional cgroup memory cap for the container (e.g. MEM_LIMIT=14g). Lets a gate boot run beside
+# a job that owns most of the host's RAM: the server OOMs itself instead of starving the job.
+MEM_LIMIT=${MEM_LIMIT:-}
+MEM_ARGS=(); [ -n "$MEM_LIMIT" ] && MEM_ARGS=(--memory "$MEM_LIMIT")
 
 if [ "$MODE" = eval ]; then
   EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN_EVAL" --max-num-seqs 8
@@ -109,7 +113,7 @@ else
     "{\"method\":\"dflash\",\"model\":\"/models/Qwen3.8-27B-DFlash2-FP8\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true,\"draft_sample_method\":\"greedy\"}")
 fi
 
-exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
+exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
   -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$GPUS" \
