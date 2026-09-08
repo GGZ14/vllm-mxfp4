@@ -327,7 +327,8 @@ partition against an fp32 dequant. Serve with the same launcher:
 | in-serve `CHECKALL`, fine-tuned checkpoint, TP=2, **real inputs** | **rel 0.0012-0.0021** on every shape and partition (gate_up P=2, in_proj_qkvz P=2, qkv P=3, down, o/out_proj; 110 calls each) = the bf16 output-rounding floor. Profile-run calls (zero activations) are labeled `zero-input`; an earlier all-zero "pass" was those, and a wrapper bug (double un-permute under WPERM) had reported rel 1.6-9 on real inputs |
 | loader vs fp32 reference | rel 0.011-0.012 at M = 1 / 5 / 40 / 64 (decode), 200 (prefill), 600 / 2048 (A-tiled) -- the e4m3 activation floor |
 | GSM8K 500q, one-shot hybrid, pseudo (W4A16 upper bound) | 96.96% (479/494) |
-| GSM8K 500q, **fine-tuned** (stage 2 on z-lab rotations), pseudo | **97.20%** (486/500), 0 errors -- AMD MXFP4 97.8, int4 PARO 97.4-98.0; n=500 sigma ~0.76 pt |
+| GSM8K 500q, **fine-tuned**, pseudo (W4A16 bound) | 97.20% (486/500), 0 errors |
+| GSM8K 500q, **fine-tuned, SERVED W4A8 path** (TP=2, this loader) | **97.60%** (488/500), 0 errors, 1 truncated -- int4 PARO 97.60 (09-02, same template), AMD MXFP4 97.8; n=500 sigma ~0.76 pt. 17.8 min vs 23 for the fp16 pseudo serve |
 | weight-space error vs bf16, one-shot | +4-9% over z-lab's fine-tuned int4 (e.g. L0 down_proj 0.127 vs 0.118) -- what the fine-tune targets |
 
 **Speed, kernel path isolated** (one R9700, TP=1, eager -- same launcher and mode for both
@@ -353,7 +354,11 @@ z-lab's, 256 samples x 2 epochs): mean -4.4% layer-output error per layer (-84% 
 each finished block's storage is now released as the loop passes it (memory only). 64 layers in
 ~5 min each once that landed.
 
-**Open:** the fine-tuned checkpoint's GSM8K on the served W4A8 path (the deployed number). **Known gap:** the fused rotation-stream producers still emit
+**Result:** accuracy parity with int4 PARO and AMD MXFP4 on the served path, +6-10% prefill over int4
+PARO on the kernel path, in-serve numerics at the bf16 floor. **Open:** prod decode -- v1 runs
+rotate -> token-quant as two launches and has no fused rotation streams, so compiled-graph decode
+trails int4 PARO until the producers emit the per-token tuple (the agreed next item), then a SPEC
+re-sweep. **Known gap:** the fused rotation-stream producers still emit
 the int4 GEMM's per-group tuple, so v1 runs rotate -> token-quant as two launches per linear and
 its decode trails int4 PARO's 226 t/s until they are adapted to the per-token tuple.
 

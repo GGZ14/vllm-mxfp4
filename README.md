@@ -289,7 +289,7 @@ A second ParoQuant format keeps the learned rotations on **MXFP4 weights** (e2m1
 which puts the GEMM on the zero-VALU fp8-WMMA loop AMD's MXFP4 runs on -- `quant_method:
 paroquant_mxfp4`, built by `paroquant/build_hybrid.py` from the bf16 base and z-lab's rotations,
 served by `paroquant/radiance_paroquant_mxfp4.py`. In-serve CHECKALL with real inputs holds rel 0.0012-0.0021 (bf16 rounding) on
-every shape and partition at TP=2; the served-path accuracy gate is in progress. See
+every shape and partition at TP=2; served-path GSM8K 500q **97.60%** (int4 PARO 97.60, AMD MXFP4 97.8). See
 [PAROQUANT.md](PAROQUANT.md#mxfp4-weights-the-zero-valu-loop).
 
 The format, the kernels, the knob reference and the rejected experiments are in
