@@ -62,4 +62,4 @@ serve_and_bench() {  # tag model_dir extra-env...
 
 serve_and_bench int4-paro  Qwen3.8-27B-PARO
 serve_and_bench mxfp4-paro Qwen3.8-27B-PARO-MXFP4 RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 RADIANCE_PQ_ROT_STREAM3=0
-echo; echo "=== summary ($(date +%H:%M)) ==="; cat "$OUT"
+echo; echo "=== summary written to $OUT ($(date +%H:%M)) ==="

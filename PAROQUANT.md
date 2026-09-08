@@ -329,8 +329,24 @@ partition against an fp32 dequant. Serve with the same launcher:
 | GSM8K 500q, one-shot hybrid, pseudo (W4A16 upper bound) | **96.96%** (479/494) vs AMD MXFP4 97.8, int4 PARO 97.4-98.0 |
 | weight-space error vs bf16, one-shot | +4-9% over z-lab's fine-tuned int4 (e.g. L0 down_proj 0.127 vs 0.118) -- what the fine-tune targets |
 
-**Open:** the fine-tuned checkpoint's GSM8K, on both the pseudo path and the served W4A8 path; a
-speed comparison against int4 PARO. **Known gap:** the fused rotation-stream producers still emit
+**Speed, kernel path isolated** (one R9700, TP=1, eager -- same launcher and mode for both
+arms, both on their A-tiled prefill paths; eager numbers are far below prod's TP=2 compiled
+serve, the *ratio* is the point):
+
+| prefill tokens | int4 PARO | MXFP4-PARO | |
+|---|---|---|---|
+| 2k | 2217 tok/s | **2434** | +9.8% |
+| 8k | 2223 | **2411** | +8.5% |
+| 16k | 2186 | **2334** | +6.8% |
+| 30k | 2095 | **2224** | +6.2% |
+| decode, 8k ctx (eager, single stream, indicative only) | 14.8 tok/s | **18.8** | +27% |
+
+The prefill gain is the zero-VALU loop's +25% on the GEMM diluted by the unchanged prologue,
+attention and everything else in a prefill step. The eager decode edge is *despite* v1's
+two-launch prologue and no fused streams; prod decode (compiled graphs, drafter, TP=2) is
+where the rotation-stream gap still has to be closed.
+
+**Open:** the fine-tuned checkpoint's GSM8K, on both the pseudo path and the served W4A8 path. **Known gap:** the fused rotation-stream producers still emit
 the int4 GEMM's per-group tuple, so v1 runs rotate -> token-quant as two launches per linear and
 its decode trails int4 PARO's 226 t/s until they are adapted to the per-token tuple.
 
