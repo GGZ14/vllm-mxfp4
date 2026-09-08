@@ -90,8 +90,10 @@ mkdir -p "$RESULTS" "$CACHE"
 # held both GPUs; the run then OOM'd 20 minutes in with a misleading error. Fail here instead.
 vram_used_mib() { podman run --rm --privileged --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --entrypoint rocm-smi "$IMAGE" --showmeminfo vram 2>/dev/null | awk -v g="GPU[$1]" 'index($0, g) && /Used/ {print int($NF/1048576)}'; }
-used=$(vram_used_mib 0); if [ "${used:-0}" -gt 4000 ] && [ "${FORCE:-0}" != 1 ]; then
-  echo "GPU 0 already has ${used} MiB in use (another server? check podman ps / systemctl --user); FORCE=1 to override" >&2; exit 1; fi
+# A container that was just stopped keeps its VRAM for up to ~30 s; wait that out before deciding.
+for _try in 1 2 3 4 5 6; do used=$(vram_used_mib 0); [ "${used:-0}" -le 4000 ] && break; sleep 10; done
+if [ "${used:-0}" -gt 4000 ] && [ "${FORCE:-0}" != 1 ]; then
+  echo "GPU 0 still has ${used} MiB in use after 60 s (another server? check podman ps / systemctl --user); FORCE=1 to override" >&2; exit 1; fi
 
 run() {
   # --privileged and --ipc=host are load-bearing: without them a side HIP container faults on
