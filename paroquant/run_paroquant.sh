@@ -16,6 +16,9 @@
 # MXFP4 checkpoint (quant_method paroquant_mxfp4, from paroquant/build_hybrid.py): same launcher,
 #   MODEL_DIR=Qwen3.8-27B-PARO-MXFP4 RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 -- the v1
 #   loader takes no rotation-stream tuple. MODE=eval then gates RADIANCE_PQM_CHECKALL per partition.
+#   The RADIANCE_MXFP4_* kernel knobs (fragment-order weights, NT decode loads, decode band) are
+#   passed at MXFP4 prod's values; they are inert for the int4 checkpoint (no quark layers load)
+#   and load-bearing for MXFP4-PARO's speed.
 #
 # MODE=eval  (default): --enforce-eager, CHECKALL numerics gate on the four model shapes,
 #                       no speculative decoding, 32K ctx. For correctness gating only.
@@ -134,6 +137,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_AR_QNB=96 -e RADIANCE_AR_QNT=1024 -e RADIANCE_AR_OVERLAP=0 \
   -e RADIANCE_DFLASH_SELECTOR_TOPK= \
   -e RADIANCE_PAROQUANT=1 \
+  -e RADIANCE_MXFP4_W4A8="${RADIANCE_MXFP4_W4A8:-1}" -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
+  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-1}" -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
+  -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
   -e RADIANCE_PQ_CHECKALL="$CHECKALL" \
   -e RADIANCE_PQM_CHECKALL="${RADIANCE_PQM_CHECKALL:-$CHECKALL}" \
   -e RADIANCE_PQM_CHECK_MAX_M="${RADIANCE_PQM_CHECK_MAX_M:-128}" \
