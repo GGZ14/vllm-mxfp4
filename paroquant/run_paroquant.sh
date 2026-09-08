@@ -13,6 +13,10 @@
 #     18563072000 could OOM. First boots run util 0.92; pin after measuring.
 #   - MXFP4-only env knobs are left at prod values but are INERT here (no quark layers load).
 #
+# MXFP4 checkpoint (quant_method paroquant_mxfp4, from paroquant/build_hybrid.py): same launcher,
+#   MODEL_DIR=Qwen3.8-27B-PARO-MXFP4 RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 -- the v1
+#   loader takes no rotation-stream tuple. MODE=eval then gates RADIANCE_PQM_CHECKALL per partition.
+#
 # MODE=eval  (default): --enforce-eager, CHECKALL numerics gate on the four model shapes,
 #                       no speculative decoding, 32K ctx. For correctness gating only.
 # MODE=prod           : full config -- DFlash2 FP8 drafter (SPEC tokens configurable), 262K ctx,
@@ -124,6 +128,8 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_DFLASH_SELECTOR_TOPK= \
   -e RADIANCE_PAROQUANT=1 \
   -e RADIANCE_PQ_CHECKALL="$CHECKALL" \
+  -e RADIANCE_PQM_CHECKALL="${RADIANCE_PQM_CHECKALL:-$CHECKALL}" \
+  -e RADIANCE_PQM_CHECK_MAX_M="${RADIANCE_PQM_CHECK_MAX_M:-128}" \
   -e RADIANCE_PQ_CHECK_MAX_M=${PQ_CHECK_MAX_M:-128} \
   -e RADIANCE_PQ_DECODE_MAX_M=${PQ_DECODE_MAX_M:-64} \
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_DECODE_NT="${RADIANCE_PQ_DECODE_NT:-1}" \
