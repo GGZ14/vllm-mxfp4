@@ -95,6 +95,10 @@ MAXLEN_EVAL=${MAXLEN_EVAL:-32768}
 # TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
 TP=${TP:-2}
 GPUS=${GPUS:-0,1}
+# ROCR_VISIBLE_DEVICES selects the physical cards; HIP_VISIBLE_DEVICES then indexes INTO that
+# filtered list. Passing the same list to both works for "0,1" only by coincidence and breaks a
+# single-card run (GPUS=1 -> HIP asks for index 1 of a one-element list -> "No CUDA GPUs").
+HIP_IDX=$(seq -s, 0 $(( $(tr -cd , <<<"$GPUS" | wc -c) )))
 # Optional cgroup memory cap for the container (e.g. MEM_LIMIT=14g). Lets a gate boot run beside
 # a job that owns most of the host's RAM: the server OOMs itself instead of starving the job.
 MEM_LIMIT=${MEM_LIMIT:-}
@@ -119,7 +123,7 @@ fi
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
-  -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$GPUS" \
+  -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$HIP_IDX" \
   -e HF_HUB_OFFLINE=1 \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
