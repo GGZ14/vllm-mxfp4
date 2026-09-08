@@ -185,7 +185,7 @@ index 8055cec..f9edbbc 100644
      quant_config: dict[str, Any] | None = None
      save_state_dict: dict[str, torch.Tensor] | None = None
 diff --git a/paroquant/cli/optimize.py b/paroquant/cli/optimize.py
-index 9469078..93cf0b1 100644
+index 9469078..126370e 100644
 --- a/paroquant/cli/optimize.py
 +++ b/paroquant/cli/optimize.py
 @@ -1,6 +1,7 @@
@@ -204,10 +204,35 @@ index 9469078..93cf0b1 100644
      move_embed,
      load_tokenizer,
      get_blocks,
-@@ -102,6 +104,44 @@ def setup_wandb(args: Config) -> wandb.Run | None:
+@@ -102,6 +104,69 @@ def setup_wandb(args: Config) -> wandb.Run | None:
      return wandb_run
  
  
++
++
++def _release_module_memory(module: nn.Module) -> None:
++    """Drop a module's parameter/buffer storage once the optimizer will never touch it again.
++
++    The layer-wise loop only moves forward -- a finished block's outputs are cached and the
++    block itself is never revisited -- yet the whole fp16 model stays CPU-resident for the run.
++    On a 60 GiB box holding a 55.6 GiB model that means permanent swapping and, past ~18 layers,
++    thrashing. Freeing each finished block (~0.9 GiB) as we go, plus the embeddings / lm_head /
++    vision tower after capture, brings the footprint under RAM. Memory only: the saved .pt files
++    are what convert reads, so results are unaffected.
++    """
++    with torch.no_grad():
++        for p_ in module.parameters(recurse=True):
++            p_.data = torch.empty(0, dtype=p_.dtype)
++        for name, b in list(module.named_buffers(recurse=True)):
++            if b is not None:
++                owner = module
++                *path, leaf = name.split(".")
++                for part in path:
++                    owner = getattr(owner, part)
++                setattr(owner, leaf, torch.empty(0, dtype=b.dtype))
++    import gc
++    gc.collect()
++
 +
 +def _trained_rotations_index(path: str | None) -> dict[tuple[int, str], str] | None:
 +    """(layer_idx, module_name) -> key prefix in a trained ParoQuant checkpoint, or None.
@@ -249,7 +274,7 @@ index 9469078..93cf0b1 100644
  def main():
      args = simple_parsing.parse(Config, add_option_string_dash_variants=simple_parsing.DashVariant.DASH)
      print(args)
-@@ -132,6 +172,9 @@ def main():
+@@ -132,6 +197,9 @@ def main():
      with open(output_dir / "args.json", "w") as f:
          json.dump(vars(args), f, indent=2)
  
@@ -259,7 +284,7 @@ index 9469078..93cf0b1 100644
      # Load model.
      model = load_model(args.model, device_map="cpu", dtype=torch.float16).half()
      move_embed(model, device)
-@@ -161,7 +204,7 @@ def main():
+@@ -161,7 +229,7 @@ def main():
  
      # Capture per-batch positional args and layer kwargs.
      logger.info("Capturing layer positional args and kwargs...")
@@ -268,7 +293,22 @@ index 9469078..93cf0b1 100644
      (
          og_layer_input_batches,
          kwargs_list,
-@@ -366,13 +409,22 @@ def main():
+@@ -193,6 +261,14 @@ def main():
+ 
+     del samples
+     empty_cache()
++    # Everything outside the decoder blocks was only needed for capture.
++    _inner = getattr(model, "model", model)
++    for _name in ("embed_tokens", "rotary_emb", "norm", "visual"):
++        _m = getattr(_inner, _name, None)
++        if isinstance(_m, nn.Module):
++            _release_module_memory(_m)
++    if isinstance(getattr(model, "lm_head", None), nn.Module):
++        _release_module_memory(model.lm_head)
+ 
+     @torch.no_grad()
+     def forward_layer_batch(
+@@ -366,13 +442,22 @@ def main():
              old_module.to(device)
              if isinstance(old_module, nn.Linear):
                  weight = old_module.weight.float()
@@ -298,6 +338,22 @@ index 9469078..93cf0b1 100644
  
                  new_module = PseudoQuantizedLinear(
                      old_module,
+@@ -541,6 +626,7 @@ def main():
+ 
+         if all_files_exist:
+             layer.cpu()
++            _release_module_memory(layer)
+             continue
+ 
+         # Save the optimized result
+@@ -552,6 +638,7 @@ def main():
+             )
+ 
+         layer.cpu()
++        _release_module_memory(layer)
+ 
+     if wandb_run is not None:
+         wandb_run.finish()
 diff --git a/paroquant/kernels/cuda/__init__.py b/paroquant/kernels/cuda/__init__.py
 index b2eca39..dd23dee 100644
 --- a/paroquant/kernels/cuda/__init__.py
