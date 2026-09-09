@@ -94,28 +94,36 @@ def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
     _pq._ensure_scratch(x2.device)
     stream = torch.cuda.current_stream().cuda_stream
 
-    tiled = bool(_mx.A_TILED_MIN_M) and M >= _mx.A_TILED_MIN_M
-    if pre is not None and not tiled:
+    tiled = _tiled(M)
+    if pre is not None:
         # rotation stream: the producer (pqm_add_rms_rot / pqm_ew_rot) already rotated + token-
-        # quantized this linear's input; x2 (hs) is only consulted above the tiled threshold
+        # quantized this linear's input, in the tiled layout when M is in the A-tiled band (the
+        # producer takes the same _tiled(M) decision); x2 (hs) is not read
         a_codes, as_tok = pre
         if a_codes.shape[0] != P:
             raise RuntimeError(f"paroquant_mxfp4: pre-quantized tuple has {a_codes.shape[0]} "
                                f"partition(s), layer has {P} -- a producer was hooked to the wrong linear")
         as_tok = as_tok.contiguous()
+        if tiled and a_codes.shape[1] != ((M + 15) // 16) * 16 * K:
+            raise RuntimeError("paroquant_mxfp4: stream tuple is not in the tiled layout the consumer expects")
     elif tiled:
         as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
-        # prefill: pass A (rotate, bf16 out) then pass C writing the fragment-tiled layout the
-        # MXFP4 A-tiled GEMM reads (identical for both kernels), registered for dispatch below
-        xr = torch.empty((P, M, K), device=x2.device, dtype=torch.bfloat16)
-        asg = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
-        rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
-        _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
-                                 asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
         Mt = (M + 15) // 16
         a_codes = torch.empty((P, Mt * 16 * K), device=x2.device, dtype=torch.uint8)
-        _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
-                                as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream, 1)
+        if FUSED_TOKQ:
+            # prefill: the fused kernel writes the fragment-tiled layout the A-tiled GEMM reads
+            # directly (par_harness tokqt: byte-exact vs pass A + tiled pass C, 1.3-1.4x faster)
+            _pqk.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
+                                        a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot, stream, 1)
+        else:
+            # pass A (rotate, bf16 out) then tiled pass C -- the A/B path
+            xr = torch.empty((P, M, K), device=x2.device, dtype=torch.bfloat16)
+            asg = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+            rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+            _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
+                                     asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
+            _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
+                                    as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream, 1)
     else:
         as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
         # decode band and row-major prefill: ONE launch does channel-scale + rotate + token amax
@@ -156,7 +164,7 @@ def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
                 verdict = "zero-input" if float(den) < 1e-20 else f"rel={float(num / den.clamp_min(1e-30)):.5f}"
                 sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} part={p} "
                                  f"path={'tiled' if tiled else 'rowmajor'}+single"
-                                 f"{'+pre' if pre is not None and not tiled else ''} {verdict}\n")
+                                 f"{'+pre' if pre is not None else ''} {verdict}\n")
         return out
     ys = []
     for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
@@ -187,7 +195,7 @@ def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
             verdict = "zero-input" if float(den) < 1e-20 else f"rel={float(num / den.clamp_min(1e-30)):.5f}"
             sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} "
                              f"part={p} path={'tiled' if tiled else 'rowmajor'}"
-                             f"{'+pre' if pre is not None and not tiled else ''} {verdict}\n")
+                             f"{'+pre' if pre is not None else ''} {verdict}\n")
     # one output tensor per linear: the single-partition case IS the GEMM output (no copy), merged
     # linears pay one cat instead of P slice copies
     return ys[0] if len(ys) == 1 else torch.cat(ys, dim=1)
@@ -223,10 +231,10 @@ def _(hs, a, as_tok, weight, ws_t, wref, rec, cs, pb1, pb2):
     return torch.empty((*hs.shape[:-1], weight.shape[0]), device=hs.device, dtype=torch.bfloat16)
 
 
-def _stream_fused(M: int) -> bool:
-    """The per-token producers quantize for the row-major GEMM; above the A-tiled threshold the
-    consumer needs the fragment-tiled layout and recomputes from hs instead."""
-    return not (bool(_mx.A_TILED_MIN_M) and M >= _mx.A_TILED_MIN_M)
+def _tiled(M: int) -> bool:
+    """Producer and consumer take the SAME layout decision from M: fragment-tiled A in the A-tiled
+    GEMM band, row-major below it."""
+    return bool(_mx.A_TILED_MIN_M) and M >= _mx.A_TILED_MIN_M
 
 
 @torch.library.custom_op("radiance::pqm_add_rms_rot", mutates_args=())
@@ -234,8 +242,8 @@ def pqm_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tenso
                     rec: torch.Tensor, cs: torch.Tensor
                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Residual add + Gemma RMSNorm + rotate + per-TOKEN e4m3 quant for the MXFP4 consumer ->
-    (hs, residual_out, A [P, M, K], AS [P, M]). Above the tiled threshold the plain norm kernel
-    runs and A/AS are allocated but untouched (the consumer recomputes from hs)."""
+    (hs, residual_out, A, AS [P, M]). A is [P, M, K] row-major below the A-tiled band and the
+    fragment-tiled [P, Mt*16*K] slab in it; the consumer takes the same decision from M."""
     y2 = y.reshape(-1, y.shape[-1])
     M, K = y2.shape
     P = rec.shape[0]
@@ -246,21 +254,13 @@ def pqm_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tenso
         y2 = y2.contiguous()
     hs = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
     ro = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
-    a = torch.empty((P, M, K), device=y.device, dtype=torch.uint8)
+    tiled = _tiled(M)
+    a = torch.empty((P, ((M + 15) // 16) * 16 * K) if tiled else (P, M, K), device=y.device, dtype=torch.uint8)
     as_tok = torch.empty((P, M), device=y.device, dtype=torch.float32)
-    stream = torch.cuda.current_stream().cuda_stream
-    if _stream_fused(M):
-        _pqk.launch_add_rms_rot_tok(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
-                                    rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
-                                    a.data_ptr(), as_tok.data_ptr(), M, K, P, rec.shape[1], stream)
-    else:
-        G = K // GROUP
-        asg = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
-        rs = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
-        _pqk.launch_add_rms_rot(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+    _pqk.launch_add_rms_rot_tok(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                                 rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
-                                a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
-                                0, stream)
+                                a.data_ptr(), as_tok.data_ptr(), M, K, P, rec.shape[1],
+                                torch.cuda.current_stream().cuda_stream, 1 if tiled else 0)
     return hs.view(y.shape), ro.view(residual.shape), a, as_tok
 
 
@@ -271,7 +271,7 @@ def _(y, residual, weight, eps, rec, cs):
     P = rec.shape[0]
     return (torch.empty(y.shape, device=y.device, dtype=torch.bfloat16),
             torch.empty(residual.shape, device=y.device, dtype=torch.bfloat16),
-            torch.empty((P, M, K), device=y.device, dtype=torch.uint8),
+            torch.empty((P, ((M + 15) // 16) * 16 * K) if _tiled(M) else (P, M, K), device=y.device, dtype=torch.uint8),
             torch.empty((P, M), device=y.device, dtype=torch.float32))
 
 
@@ -294,20 +294,13 @@ def pqm_ew_rot(mode: int, x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, eps
             y2 = y2.contiguous()
         ys = y2.stride(0)
     hs = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
-    a = torch.empty((1, M, N), device=x.device, dtype=torch.uint8)
+    tiled = _tiled(M)
+    a = torch.empty((1, ((M + 15) // 16) * 16 * N) if tiled else (1, M, N), device=x.device, dtype=torch.uint8)
     as_tok = torch.empty((1, M), device=x.device, dtype=torch.float32)
-    stream = torch.cuda.current_stream().cuda_stream
-    if _stream_fused(M):
-        _pqk.launch_ew_rot_tok(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
-                               rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
-                               as_tok.data_ptr(), M, N, rec.shape[1], stream)
-    else:
-        G = N // GROUP
-        asg = torch.empty((1, M, G), device=x.device, dtype=torch.float32)
-        rs = torch.empty((1, M, G), device=x.device, dtype=torch.float32)
-        _pqk.launch_ew_rot(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
+    _pqk.launch_ew_rot_tok(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
                            rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
-                           asg.data_ptr(), rs.data_ptr(), M, N, rec.shape[1], 0, stream)
+                           as_tok.data_ptr(), M, N, rec.shape[1],
+                           torch.cuda.current_stream().cuda_stream, 1 if tiled else 0)
     return hs, a, as_tok
 
 
@@ -317,7 +310,7 @@ def _(mode, x, y, w, eps, rec, cs):
     M = x.numel() // Kx
     N = Kx // 2 if mode == 0 else Kx
     return (torch.empty((M, N), device=x.device, dtype=torch.bfloat16),
-            torch.empty((1, M, N), device=x.device, dtype=torch.uint8),
+            torch.empty((1, ((M + 15) // 16) * 16 * N) if _tiled(M) else (1, M, N), device=x.device, dtype=torch.uint8),
             torch.empty((1, M), device=x.device, dtype=torch.float32))
 
 

@@ -170,8 +170,7 @@ def main():
         y_pre = method.apply(layer, (hs, a, as_tok))
         y_plain = method.apply(layer, hs)
         same = torch.equal(y_pre, y_plain)
-        fused = M._stream_fused(Mrows)
-        print(f"  norm site M={Mrows:4d} {'fused' if fused else 'plain (tiled band)'}: pre == plain {same}  hs rel {hs_rel:.2e}")
+        print(f"  norm site M={Mrows:4d} {'tiled' if M._tiled(Mrows) else 'row-major'}: pre == plain {same}  hs rel {hs_rel:.2e}")
         assert same, f"M={Mrows}: stream tuple output differs from the plain path"
     # elementwise sites: a single-partition consumer (out_proj-like) -- reuse partition 0 of this
     # layer as the consumer with P=1 by building a P=1 layer from the first module

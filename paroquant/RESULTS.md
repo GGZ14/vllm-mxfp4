@@ -401,3 +401,34 @@ step time and acceptance match int4 PARO, whose sweep chose 7.
 **Lesson:** measure prod decode step time BEFORE shipping a loader; prefill A/B + GSM8K said "ship"
 while decode was 46% slower. And under a hipGraph the CPU is hidden but every kernel is not: a
 2-3 us node x 400-500 extra nodes per step is the entire gap.
+
+## 2026-09-08 (late): fused TILED prologue for prefill; chain interleaving measured neutral
+
+**Fused tiled prologue (shipped).** Above the A-tiled threshold the MXFP4-PARO linear ran pass A
+(rotate -> bf16 row, 460 us per partition at M=8192 K=5120) + tiled pass C (re-read the row, token
+scale, encode into the fragment-tiled slab, 250 us). Rotating twice to avoid the round trip would
+lose (pass A is compute/LDS-bound, not memory-bound: 168 MB moved in 460 us = 365 GB/s). Instead
+`pq_rotate_tokquant<W, TILED>` keeps one workgroup per row, parks the rotated row in LDS, and writes
+the fragment-tiled layout directly: each lane's four codes are one aligned 4 B piece of an 8 B
+fragment chunk (`pq_tiled_off`), so a wave store scatters 32 x 4 B over 16 fragment lines that the 15
+neighbouring rows' workgroups fill in -- L2 write-combining absorbs it. `--bench2 tokqt` (24 shapes,
+K=5120/8704, M=64..8192, P=1..3): AT and AS byte-exact vs pass A + `pq_token_quant_tiled`;
+**1.3-1.4x faster** at prefill M (M=8192 K=5120 P=2: 1687 -> 1279 us; K=8704 P=2: 3001 -> 2280 us).
+The stream producers got the same TILED variant, so in the A-tiled band they hand the consumer the
+tiled tuple directly and the linear runs zero prologue launches; producer and consumer take the same
+`_tiled(M)` decision. Waves-per-row rule gained a K term (K>=8192 wants 16 above M=64).
+**Prod (TP=2, compiled, SPEC=7, 8192 chunk): BetterBench prefill sweep 4770/4827/4649/4495/4273 PP t/s @2k/8k/16k/32k/64k**
+-- +9%/+8%/+5%/+5%/+5% over the single-launch build (4376/4449/4423/4291/4068) and +26%/+30%/+25%/+24%/+24% over int4 PARO
+(3782/3700/3725/3621/3450). Decode unchanged: 24.53 / 26.43 / 26.97 ms/step @ctx25/8k/32k. KV 850k.
+
+**Two-chain interleaving (NOT shipped, kept dark as template `IL`).** Hypothesis: the per-token
+producers trail int4's (7.9 vs 5.4 us norm, 9.7 vs ~6 down-proj at M=8) because each wave runs its
+rotation chains serially; issuing two groups' LDS read/fma/write pairs per layer before one waitcnt
+should hide half the LDS latency. Built for all three per-token kernels (`pq_tok_rotate_park2`),
+byte-identical to the one-chain kernels at every W (tokstream `il=0`). Measured: at the wave counts
+the launcher uses it is neutral -- norm w32 7.89 -> 7.93 us, ew N=3072 w32 5.63 -> 5.62, ew N=8704
+w32 9.68 -> 9.65; only the unused w8 configs gain (norm 10.5 -> 10.1, ew N=8704 17.0 -> 15.4), and
+at M>=40 it loses 5-20%. So the remaining producer cost at W=32 is not chain latency; it is the
+phase structure the per-token scale forces (row pass -> barrier -> chains -> barrier -> LDS re-read
++ encode) against the int4 producer's single register-resident pass. ~2-2.5 us x 256 sites =
+~0.5 ms/step; parked.

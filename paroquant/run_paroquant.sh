@@ -50,6 +50,7 @@ NAME=${NAME:-vllmparo}
 # with the prod ids so clients like the Pi (model id Qwen3.6) work unchanged.
 SERVED_NAMES=${SERVED_NAMES:-Qwen3.8-PARO}
 SPEC=${SPEC:-5}      # dflash re-sweep 2026-08: 5 beats 7 by 8-13% aggregate on this stack
+CHUNK=${CHUNK:-8192} # prod prefill chunk (--max-num-batched-tokens); sweep knob
 GPU_UTIL=${GPU_UTIL:-0.92}
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
 # also zeroes the cudagraph pad rows. The AutoRound int4 serve (same bf16-input linear contract)
@@ -112,7 +113,7 @@ if [ "$MODE" = eval ]; then
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
   SPEC_ARGS=()
 else
-  EXTRA_ARGS=(--max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 8192
+  EXTRA_ARGS=(--max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "${CHUNK:-8192}"
               --enable-prefix-caching
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
