@@ -348,3 +348,56 @@ the pattern (initialise all flags in a pre-pass) is worth remembering.
 and fallback (`RADIANCE_PQ_AR_FALLBACK`) remain in the tree, dark.
 
 **Served config after today:** SPEC=7, stream 1 + 2 on, stream 3 off, cache `-fu-rs-rs2`.
+
+## 2026-09-08: MXFP4-PARO prod decode -- the launch-count regression and its three fixes
+
+First prod boot of `paroquant_mxfp4` (compiled, dflash SPEC=7, TP=2): **35.40 ms/step** @ctx25,
+80 tok/s single stream, BetterBench combined 126.3 t/s -- vs int4 PARO 24.19 / 105-114 / 226.2.
+Ruled out first: acceptance (acc/draft 1.85 vs int4's 1.57-1.78 on the same bench_decode_ctx) and
+the GEMM (`bench_linear_tp2.py`, real TP=2 shapes, M=8: int4 linears 12.56 ms/step, MXFP4 two-pass
+prologue 18.96, MXFP4 fused prologue 12.01). The whole gap was launch count.
+
+1. **`pq_rotate_tokquant`**: channel-scale + rotate + token amax + e4m3 encode in one launch, the
+   rotated row parked in dynamic LDS between the two phases (the per-token scale needs the whole
+   row). Byte-identical to pass A + pass C (`--bench2 tokq`, 54 shapes; max_g(amax_g)/448 ==
+   max_g(amax_g/448) exactly). Prod 35.40 -> **28.48 ms/step**, combined 126 -> 184 t/s.
+2. **Per-token stream producers** `pq_add_rms_rot_tok`, `pq_ew_rot_tok<0|1|2>`: the stream-1/2
+   producers emitting (A [P,M,K], AS [P,M]) instead of the int4 per-group tuple. One workgroup per
+   (row, partition), W waves split the groups, block-reduce the token amax, encode. Byte-identical
+   to [plain producer -> hs] + `pq_rotate_tokquant(hs)` (`--bench2 tokstream`, 45 cases: hs, ro,
+   A, AS all 0 diff). `install_stream` generalized: it asks the consumer's quant method for
+   `stream_norm` / `stream_ew`, so both loaders share the patched forwards; stream 3 stays
+   int4-only. Installed 64/64 epilogues + 64/48/16 stream-2 sites on both ranks. Prod 28.48 ->
+   **26.29 ms/step**, combined 200.3 t/s, GSM8K 500q 97.40%.
+   Waves per row: the small-M cost is the serial rotation chain per wave (K=5120: 40 groups = 5
+   chains at 8 waves). Measured 8/16/32 (harness, idle GPU): norm site M=8 10.5 / 8.3 / 7.9 us,
+   down-proj producer (N=8704) 17.2 / 12.0 / 9.7, o_proj producer (N=3072) 7.7 / 6.3 / 5.6; at M=64
+   16 wins, at M=128 8. Rule `M<=16 -> 32, M<=64 -> 16, else 8` (`RADIANCE_PQ_TOK_WAVES` forces).
+   Still 2-4 us/site behind the int4 producers (5.4 / ~6 us): interleaving two chains per wave
+   (independent LDS latency chains) is the untried lever.
+3. **Single-launch merged GEMM**: `radiance_mxfp4_fp8` decode / folded / A-tiled kernels take
+   `pb1, pb2, astride`; an n-block in [pb1, pb2) shifts A and As to rotated copy 1, etc. Stock
+   `launch` passes 1<<30 (bit-identical to before); `launch_p` / `launch_at_p` are the merged
+   entries; `mxfp4_linear_pqp` the op. Replaces P GEMM launches + P slice copies (or a cat) per
+   merged linear. Not bit-identical to the loop -- the decode band picks split-K from the launch's
+   N -- 1-2 one-ulp flips per million outputs (loader test). M=8 real shapes: qkv P=3 51.7 -> 28.6
+   us, gate_up 67 -> 59, in_proj 40 -> 30, P=1 sites 27 -> 23 (no copy); per-step linears
+   10.9 -> **9.2 ms** (int4 12.7). Prod 26.29 -> **24.53 / 25.89 / 26.80 ms/step** @ctx25/8k/32k
+   (int4 24.19 / 25.74 / 26.70), combined 203.4 t/s, GSM8K 500q 97.40% (487/500, 0 errors).
+
+Prefill (TTFT proxy on the same decode benches, 8k / 32k prompts): int4 3850 / 3630 tok/s;
+MXFP4-PARO final 4524 / 4245 (**+17%**) -- above the +6-10% the TP=1 eager kernel A/B gave, since
+the stream and the single launch also take launches out of the prefill step.
+BetterBench prefill sweep, single pass, final build: **4376/4449/4423/4291/4068 PP t/s @2k/8k/16k/32k/64k** vs int4 PARO's 3782/3700/3725/3621/3450 (+16%/+20%/+19%/+18%/+18%). `bench_prefill_clean_m`: 4528 @8k, 4349 @26k, 3545 @104k, 3013 @181k.
+
+Housekeeping: the duplicate per-partition scale slabs (`ws_cat`, ~0.4 GiB/rank) are gone -- the
+single launch reads the full [K/32, N] and the A/B loop slices on the fly; KV profile had dropped
+698k (v1) -> 626k (stream) -> 578k (single) tokens at GPU_UTIL 0.92 while int4 sits at 622k, so the
+unit now runs GPU_UTIL 0.95 (AMD MXFP4 runs 0.98): KV profile **862,604 tokens** (int4 622k, 3.29x
+concurrency at 262k), decode unchanged (24.71 / 25.98 / 26.96 ms/step on that boot). Cache dir keyed
+`-rs-rs2-sl`. SPEC not re-swept:
+step time and acceptance match int4 PARO, whose sweep chose 7.
+
+**Lesson:** measure prod decode step time BEFORE shipping a loader; prefill A/B + GSM8K said "ship"
+while decode was 46% slower. And under a hipGraph the CPU is hidden but every kernel is not: a
+2-3 us node x 400-500 extra nodes per step is the entire gap.

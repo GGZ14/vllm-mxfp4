@@ -10,6 +10,7 @@
 #include "par_kernels.h"
 
 #include <vector>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <algorithm>
@@ -523,6 +524,175 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
         hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dA); hipFree(dASG); hipFree(dRS);
       }
     }
+  }
+
+  if (what == "tokq" || what == "all") {
+    // fused rotate + per-token quant (the MXFP4 prologue) must be BYTE-identical to pass A + pass C
+    int fails = 0;
+    for (const int K : {5120, 6144, 17408}) {
+      for (const int M : {1, 5, 8, 40, 64, 101}) {
+        for (const int P : {1, 2, 3}) {
+          const int krot = 8, G = K / PQ_GROUP;
+          unsigned short *dX, *dT; __half *dCS; unsigned char *dA1, *dA2; float *dASG, *dRS, *dAS1, *dAS2; __bf16 *dXR;
+          HIP_CHECK(hipMalloc(&dX, (size_t)M * K * 2));
+          HIP_CHECK(hipMalloc(&dT, (size_t)P * krot * (K / 2) * 4 * 2));
+          HIP_CHECK(hipMalloc(&dCS, (size_t)P * K * 2));
+          HIP_CHECK(hipMalloc(&dXR, (size_t)P * M * K * 2));
+          HIP_CHECK(hipMalloc(&dA1, (size_t)P * M * K)); HIP_CHECK(hipMalloc(&dA2, (size_t)P * M * K));
+          HIP_CHECK(hipMalloc(&dASG, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)P * M * G * 4));
+          HIP_CHECK(hipMalloc(&dAS1, (size_t)P * M * 4)); HIP_CHECK(hipMalloc(&dAS2, (size_t)P * M * 4));
+          {
+            std::mt19937 rng(1234u + K + M * 7 + P * 131);
+            std::normal_distribution<float> nd(0.f, 0.8f);
+            std::uniform_real_distribution<float> ud(-3.1f, 3.1f);
+            std::vector<unsigned short> Xh((size_t)M * K);
+            for (auto &v : Xh) { const float f = nd(rng); unsigned int u; memcpy(&u, &f, 4); v = (unsigned short)(u >> 16); }
+            HIP_CHECK(hipMemcpy(dX, Xh.data(), Xh.size() * 2, hipMemcpyHostToDevice));
+            std::vector<unsigned short> Tt((size_t)P * krot * (K / 2) * 4, 0);
+            std::vector<int> perm(PQ_GROUP);
+            for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g) {
+              for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i;
+              std::shuffle(perm.begin(), perm.end(), rng);
+              for (int t = 0; t < 64; ++t) {
+                const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4;
+                const float th = ud(rng); const __half c = __float2half(cosf(th)), sn = __float2half(sinf(th));
+                Tt[e] = (unsigned short)(perm[2 * t] | (perm[2 * t + 1] << 8));
+                memcpy(&Tt[e + 1], &c, 2); memcpy(&Tt[e + 2], &sn, 2);
+              }
+            }
+            HIP_CHECK(hipMemcpy(dT, Tt.data(), Tt.size() * 2, hipMemcpyHostToDevice));
+            std::vector<__half> csh((size_t)P * K);
+            for (auto &v : csh) v = __float2half(0.75f + 0.5f * (float)(rng() % 1000u) / 1000.f);
+            HIP_CHECK(hipMemcpy(dCS, csh.data(), csh.size() * 2, hipMemcpyHostToDevice));
+          }
+          const dim3 gA(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P), blk(PQ_ROT_WAVES * 32);
+          const dim3 gC((M + PQ_ROT_WAVES - 1) / PQ_ROT_WAVES, P);
+          auto twopass = [&](int) {
+            hipLaunchKernelGGL(pq_rotate_quant2<true>, gA, blk, 0, 0, (const __bf16 *)dX, dT, dCS, (unsigned char *)dXR, dASG, dRS, M, K, krot);
+            hipLaunchKernelGGL(pq_token_quant, gC, blk, 0, 0, dXR, dASG, dA1, dAS1, dRS, M, K);
+          };
+          auto fused = [&](int) {
+            hipLaunchKernelGGL(pq_rotate_tokquant, dim3(M, P), blk, (size_t)K * 2, 0, (const __bf16 *)dX, dT, dCS, dA2, dAS2, M, K, krot);
+          };
+          twopass(0); fused(0); HIP_CHECK(hipDeviceSynchronize());
+          std::vector<unsigned char> a1((size_t)P * M * K), a2(a1.size());
+          std::vector<float> s1((size_t)P * M), s2(s1.size());
+          HIP_CHECK(hipMemcpy(a1.data(), dA1, a1.size(), hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(a2.data(), dA2, a2.size(), hipMemcpyDeviceToHost));
+          HIP_CHECK(hipMemcpy(s1.data(), dAS1, s1.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(s2.data(), dAS2, s2.size() * 4, hipMemcpyDeviceToHost));
+          size_t da = 0, ds = 0;
+          for (size_t i = 0; i < a1.size(); ++i) da += a1[i] != a2[i];
+          for (size_t i = 0; i < s1.size(); ++i) ds += s1[i] != s2[i];
+          const int iters = 200; double t2p = 1e30, tf = 1e30;
+          for (int rep = 0; rep < REPS; ++rep) { t2p = std::min(t2p, time_us(twopass, iters, e0, e1)); tf = std::min(tf, time_us(fused, iters, e0, e1)); }
+          const bool pass = da == 0 && ds == 0; if (!pass) ++fails;
+          printf("  tokq K=%-5d M=%-4d P=%d  code-diff=%zu scale-diff=%zu  two-pass %7.2f us  fused %7.2f us (%.2fx) %s\n",
+                 K, M, P, da, ds, t2p, tf, t2p / tf, pass ? "OK" : "FAIL");
+          hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dXR); hipFree(dA1); hipFree(dA2); hipFree(dASG); hipFree(dRS); hipFree(dAS1); hipFree(dAS2);
+        }
+      }
+    }
+    printf("tokq: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
+  }
+
+  if (what == "tokstream" || what == "all") {
+    // per-token stream producers == [plain producer -> hs] + pq_rotate_tokquant(hs), byte-exact
+    int fails = 0;
+    std::mt19937 rng(777u);
+    std::normal_distribution<float> nd(0.f, 0.8f);
+    std::uniform_real_distribution<float> ud(-3.1f, 3.1f);
+    auto bf16v = [&](size_t n, float sd) { std::vector<unsigned short> v(n); for (auto &e : v) { const float f = nd(rng) * sd; unsigned int u; memcpy(&u, &f, 4); e = (unsigned short)(u >> 16); } return v; };
+    auto upload16 = [&](const std::vector<unsigned short> &v) { unsigned short *d; HIP_CHECK(hipMalloc(&d, v.size() * 2)); HIP_CHECK(hipMemcpy(d, v.data(), v.size() * 2, hipMemcpyHostToDevice)); return d; };
+    auto make_T = [&](int P, int krot, int K) {
+      const int G = K / PQ_GROUP; std::vector<unsigned short> Tt((size_t)P * krot * (K / 2) * 4, 0); std::vector<int> perm(PQ_GROUP);
+      for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g) {
+        for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i; std::shuffle(perm.begin(), perm.end(), rng);
+        for (int t = 0; t < 64; ++t) { const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4; const float th = ud(rng); const __half c = __float2half(cosf(th)), sn = __float2half(sinf(th)); Tt[e] = (unsigned short)(perm[2 * t] | (perm[2 * t + 1] << 8)); memcpy(&Tt[e + 1], &c, 2); memcpy(&Tt[e + 2], &sn, 2); }
+      }
+      return upload16(Tt);
+    };
+    auto make_CS = [&](int P, int K) { std::vector<unsigned short> v((size_t)P * K); for (auto &e : v) { const __half h = __float2half(0.75f + 0.5f * (float)(rng() % 1000u) / 1000.f); memcpy(&e, &h, 2); } return (__half *)upload16(v); };
+    auto cmp = [&](const void *d1, const void *d2, size_t bytes) { std::vector<unsigned char> a(bytes), b(bytes); HIP_CHECK(hipMemcpy(a.data(), d1, bytes, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(b.data(), d2, bytes, hipMemcpyDeviceToHost)); size_t d = 0; for (size_t i = 0; i < bytes; ++i) d += a[i] != b[i]; return d; };
+    const dim3 blk(PQ_ROT_WAVES * 32);
+    const int krot = 8, iters = 200;
+    // --- norm site ---
+    for (const int K : {5120}) {
+      for (const int M : {1, 8, 40, 64, 128}) {
+        for (const int P : {1, 2, 3}) {
+          const int G = K / PQ_GROUP;
+          unsigned short *dY = upload16(bf16v((size_t)M * K, 1.0f)), *dR = upload16(bf16v((size_t)M * K, 1.0f)), *dW = upload16(bf16v(K, 0.2f));
+          unsigned short *dT = make_T(P, krot, K); __half *dCS = make_CS(P, K);
+          unsigned short *dHS1, *dRO1, *dHS2, *dRO2; unsigned char *dA1, *dA2, *dAg; float *dAS1, *dAS2, *dASG, *dRS;
+          HIP_CHECK(hipMalloc(&dHS1, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dRO1, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dHS2, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dRO2, (size_t)M * K * 2));
+          HIP_CHECK(hipMalloc(&dA1, (size_t)P * M * K)); HIP_CHECK(hipMalloc(&dA2, (size_t)P * M * K)); HIP_CHECK(hipMalloc(&dAg, (size_t)P * M * K));
+          HIP_CHECK(hipMalloc(&dAS1, (size_t)P * M * 4)); HIP_CHECK(hipMalloc(&dAS2, (size_t)P * M * 4)); HIP_CHECK(hipMalloc(&dASG, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)P * M * G * 4));
+          auto ref = [&](int) {
+            hipLaunchKernelGGL(pq_add_rms_rot<false>, dim3(M, 1, 1), blk, 0, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS1, (__bf16 *)dRO1, dAg, dASG, dRS, M, K, krot, 1);
+            hipLaunchKernelGGL(pq_rotate_tokquant, dim3(M, P), blk, (size_t)K * 2, 0, (const __bf16 *)dHS1, dT, dCS, dA1, dAS1, M, K, krot);
+          };
+          auto fused = [&](int) { hipLaunchKernelGGL((pq_add_rms_rot_tok<8>), dim3(M, P), blk, (size_t)K * 2, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS2, (__bf16 *)dRO2, dA2, dAS2, M, K, krot); };
+          auto fused16 = [&](int) { hipLaunchKernelGGL((pq_add_rms_rot_tok<16>), dim3(M, P), dim3(512), (size_t)K * 2, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS2, (__bf16 *)dRO2, dA2, dAS2, M, K, krot); };
+          auto fused32 = [&](int) { hipLaunchKernelGGL((pq_add_rms_rot_tok<32>), dim3(M, P), dim3(1024), (size_t)K * 2, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS2, (__bf16 *)dRO2, dA2, dAS2, M, K, krot); };
+          // W=16/32: codes/scales must equal tokquant<W> on the kernel's OWN hs (the norm's ssq order differs from the W=8 plain kernel)
+          auto selfcheck = [&](auto kern, int W) {
+            kern(0); HIP_CHECK(hipDeviceSynchronize());
+            if (W == 16) hipLaunchKernelGGL((pq_rotate_tokquant<16>), dim3(M, P), dim3(512), (size_t)K * 2, 0, (const __bf16 *)dHS2, dT, dCS, dA1, dAS1, M, K, krot);
+            else hipLaunchKernelGGL((pq_rotate_tokquant<32>), dim3(M, P), dim3(1024), (size_t)K * 2, 0, (const __bf16 *)dHS2, dT, dCS, dA1, dAS1, M, K, krot);
+            HIP_CHECK(hipDeviceSynchronize());
+            return cmp(dA1, dA2, (size_t)P * M * K) + cmp(dAS1, dAS2, (size_t)P * M * 4);
+          };
+          const int gpw = pq_rot_gpw(M);
+          auto int4f = [&](int) { hipLaunchKernelGGL(pq_add_rms_rot<true>, dim3(M, (G + 8 * gpw - 1) / (8 * gpw), P), blk, 0, 0, (const __bf16 *)dY, (const __bf16 *)dR, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS1, (__bf16 *)dRO1, dAg, dASG, dRS, M, K, krot, gpw); };
+          ref(0); fused(0); HIP_CHECK(hipDeviceSynchronize());
+          const size_t dh = cmp(dHS1, dHS2, (size_t)M * K * 2), dr = cmp(dRO1, dRO2, (size_t)M * K * 2), da = cmp(dA1, dA2, (size_t)P * M * K), ds = cmp(dAS1, dAS2, (size_t)P * M * 4);
+          double tr = 1e30, tf = 1e30, tf16 = 1e30, tf32 = 1e30, t4 = 1e30;
+          for (int rep = 0; rep < REPS; ++rep) { tr = std::min(tr, time_us(ref, iters, e0, e1)); tf = std::min(tf, time_us(fused, iters, e0, e1)); tf16 = std::min(tf16, time_us(fused16, iters, e0, e1)); tf32 = std::min(tf32, time_us(fused32, iters, e0, e1)); t4 = std::min(t4, time_us(int4f, iters, e0, e1)); }
+          const size_t d16 = selfcheck(fused16, 16), d32 = selfcheck(fused32, 32);
+          const bool pass = !dh && !dr && !da && !ds && !d16 && !d32; if (!pass) ++fails;
+          printf("  tokstream norm K=%d M=%-4d P=%d  diff hs=%zu ro=%zu A=%zu AS=%zu w16=%zu w32=%zu  unfused %7.2f us  fused w8 %7.2f w16 %7.2f w32 %7.2f us  [int4 fused producer %7.2f] %s\n", K, M, P, dh, dr, da, ds, d16, d32, tr, tf, tf16, tf32, t4, pass ? "OK" : "FAIL");
+          hipFree(dY); hipFree(dR); hipFree(dW); hipFree(dT); hipFree(dCS); hipFree(dHS1); hipFree(dRO1); hipFree(dHS2); hipFree(dRO2); hipFree(dA1); hipFree(dA2); hipFree(dAg); hipFree(dAS1); hipFree(dAS2); hipFree(dASG); hipFree(dRS);
+        }
+      }
+    }
+    // --- elementwise sites (single partition) ---
+    for (const int N : {3072, 8704}) {
+      for (const int M : {1, 8, 40, 64, 128}) {
+        for (int mode = 0; mode < 3; ++mode) {
+          const int G = N / PQ_GROUP;
+          const size_t xn = (size_t)M * (mode == 0 ? 2 * N : N);
+          unsigned short *dX = upload16(bf16v(xn, 1.0f)), *dZ = upload16(bf16v((size_t)M * N, 1.0f)), *dW = upload16(bf16v(std::max(N, 128), 0.5f));
+          unsigned short *dT = make_T(1, krot, N); __half *dCS = make_CS(1, N);
+          unsigned short *dHS1, *dHS2; unsigned char *dA1, *dA2, *dAg; float *dAS1, *dAS2, *dASG, *dRS;
+          HIP_CHECK(hipMalloc(&dHS1, (size_t)M * N * 2)); HIP_CHECK(hipMalloc(&dHS2, (size_t)M * N * 2));
+          HIP_CHECK(hipMalloc(&dA1, (size_t)M * N)); HIP_CHECK(hipMalloc(&dA2, (size_t)M * N)); HIP_CHECK(hipMalloc(&dAg, (size_t)M * N));
+          HIP_CHECK(hipMalloc(&dAS1, (size_t)M * 4)); HIP_CHECK(hipMalloc(&dAS2, (size_t)M * 4)); HIP_CHECK(hipMalloc(&dASG, (size_t)M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)M * G * 4));
+          const long ys = N;
+          auto plain = [&](int) {
+            const dim3 grid(M, (G + 7) / 8, 1);
+            if (mode == 0) hipLaunchKernelGGL((pq_ew_rot<0, false>), grid, blk, 0, 0, (const __bf16 *)dX, (const __bf16 *)dZ, ys, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS1, dAg, dASG, dRS, M, N, krot, 1);
+            else if (mode == 1) hipLaunchKernelGGL((pq_ew_rot<1, false>), grid, blk, 0, 0, (const __bf16 *)dX, (const __bf16 *)dZ, ys, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS1, dAg, dASG, dRS, M, N, krot, 1);
+            else hipLaunchKernelGGL((pq_ew_rot<2, false>), grid, blk, 0, 0, (const __bf16 *)dX, (const __bf16 *)dZ, ys, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS1, dAg, dASG, dRS, M, N, krot, 1);
+          };
+          auto ref = [&](int i) { plain(i); hipLaunchKernelGGL(pq_rotate_tokquant, dim3(M, 1), blk, (size_t)N * 2, 0, (const __bf16 *)dHS1, dT, dCS, dA1, dAS1, M, N, krot); };
+#define EWT(W_) [&](int) {                                                                                                                                                                                              \
+            if (mode == 0) hipLaunchKernelGGL((pq_ew_rot_tok<0, W_>), dim3(M), dim3(W_ * 32), (size_t)N * 2, 0, (const __bf16 *)dX, (const __bf16 *)dZ, ys, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS2, dA2, dAS2, M, N, krot);      \
+            else if (mode == 1) hipLaunchKernelGGL((pq_ew_rot_tok<1, W_>), dim3(M), dim3(W_ * 32), (size_t)N * 2, 0, (const __bf16 *)dX, (const __bf16 *)dZ, ys, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS2, dA2, dAS2, M, N, krot); \
+            else hipLaunchKernelGGL((pq_ew_rot_tok<2, W_>), dim3(M), dim3(W_ * 32), (size_t)N * 2, 0, (const __bf16 *)dX, (const __bf16 *)dZ, ys, (const __bf16 *)dW, 1e-6f, dT, dCS, (__bf16 *)dHS2, dA2, dAS2, M, N, krot); }
+          auto fused = EWT(8); auto fused16 = EWT(16); auto fused32 = EWT(32);
+#undef EWT
+          ref(0); fused(0); HIP_CHECK(hipDeviceSynchronize());
+          const size_t dh = cmp(dHS1, dHS2, (size_t)M * N * 2), da = cmp(dA1, dA2, (size_t)M * N), ds = cmp(dAS1, dAS2, (size_t)M * 4);
+          double tr = 1e30, tf = 1e30, tf16 = 1e30, tf32 = 1e30;
+          for (int rep = 0; rep < REPS; ++rep) { tr = std::min(tr, time_us(ref, iters, e0, e1)); tf = std::min(tf, time_us(fused, iters, e0, e1)); tf16 = std::min(tf16, time_us(fused16, iters, e0, e1)); tf32 = std::min(tf32, time_us(fused32, iters, e0, e1)); }
+          // ew producers have no cross-wave reduction before the chain: every W must match the W=8 reference exactly
+          fused16(0); HIP_CHECK(hipDeviceSynchronize()); const size_t d16 = cmp(dHS1, dHS2, (size_t)M * N * 2) + cmp(dA1, dA2, (size_t)M * N) + cmp(dAS1, dAS2, (size_t)M * 4);
+          fused32(0); HIP_CHECK(hipDeviceSynchronize()); const size_t d32 = cmp(dHS1, dHS2, (size_t)M * N * 2) + cmp(dA1, dA2, (size_t)M * N) + cmp(dAS1, dAS2, (size_t)M * 4);
+          const bool pass = !dh && !da && !ds && !d16 && !d32; if (!pass) ++fails;
+          printf("  tokstream ew%d  N=%d M=%-4d      diff hs=%zu A=%zu AS=%zu w16=%zu w32=%zu  unfused %7.2f us  fused w8 %7.2f w16 %7.2f w32 %7.2f us %s\n", mode, N, M, dh, da, ds, d16, d32, tr, tf, tf16, tf32, pass ? "OK" : "FAIL");
+          hipFree(dX); hipFree(dZ); hipFree(dW); hipFree(dT); hipFree(dCS); hipFree(dHS1); hipFree(dHS2); hipFree(dA1); hipFree(dA2); hipFree(dAg); hipFree(dAS1); hipFree(dAS2); hipFree(dASG); hipFree(dRS);
+        }
+      }
+    }
+    printf("tokstream: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
   }
 
   if (what == "fuse" || what == "all") {

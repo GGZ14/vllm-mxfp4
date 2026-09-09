@@ -661,6 +661,322 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant(
   }
 }
 
+// Fused per-token prologue for the MXFP4 GEMM (decode band): channel-scale + rotate every
+// 128-group of a token, take the TOKEN amax, encode e4m3 against it. One workgroup per (token,
+// partition); waves split the groups; the rotated row is parked in dynamic LDS (K bf16) between
+// the two phases so the token-wide scale is known before encoding. Replaces pass A (rotate, bf16
+// out) + pass C (token quant): one launch instead of two and no HBM round trip of the rotated
+// row. The MXFP4 kernel needs no row-sums, so none are produced. Bit-identical to the two-pass
+// path by construction: same fmaf chain and record order, amax taken on the fp32 rotated values,
+// encode on the bf16-rounded ones, and max_g(amax_g) * (1/448) == max_g(amax_g * (1/448))
+// exactly because multiplying by a positive constant is monotone. Gated in par_harness (tokq).
+template <int W = PQ_ROT_WAVES>
+__global__ __launch_bounds__(W * 32) void pq_rotate_tokquant(
+    const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
+    const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ AS,
+    int M, int K, int krot) {
+  extern __shared__ __align__(16) unsigned char s_dyn[];
+  __bf16 *s_row = (__bf16 *)s_dyn;                 // [K] rotated row, bf16-rounded as pass A stores it
+  __shared__ float s_x[W][PQ_GROUP];
+  __shared__ float s_amax[W];
+  const int m = blockIdx.x, p = blockIdx.y;
+  const int G = K / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int c0 = lane * 4;
+  const __bf16 *__restrict__ xrow = X + (size_t)m * K;
+  float wamax = 0.f;
+  for (int g = wave; g < G; g += W) {
+    const unsigned long long *__restrict__ Tb =
+        (const unsigned long long *)T + ((size_t)p * krot) * (K / 2) + (size_t)g * 64;
+    unsigned long long rec[PQ_KROT_MAX][2];
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      const int rc = r < krot ? r : krot - 1;
+      rec[r][0] = Tb[(size_t)rc * (K / 2) + lane];
+      rec[r][1] = Tb[(size_t)rc * (K / 2) + lane + 32];
+    }
+    const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)g * PQ_GROUP + c0);
+    const float cs0 = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
+    const float cs1 = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
+    const float cs2 = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
+    const float cs3 = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
+    const uint2_t xv = *(const uint2_t *)(xrow + (size_t)g * PQ_GROUP + c0);
+    float v0 = __uint_as_float(xv[0] << 16) * cs0, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * cs1;
+    float v2 = __uint_as_float(xv[1] << 16) * cs2, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * cs3;
+    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
+    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
+#pragma unroll
+        for (int t2 = 0; t2 < 2; ++t2) {
+          const unsigned long long rv = rec[r][t2];
+          const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+          const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+          const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+          const int i = ij & 0xFF, j = ij >> 8;
+          const float xi = s_x[wave][i], xj = s_x[wave][j];
+          s_x[wave][i] = fmaf(c, xi, sn * xj);
+          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
+    }
+    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
+    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
+    wamax = fmaxf(wamax, fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3))));
+    __bf16 *sr = s_row + (size_t)g * PQ_GROUP + c0;
+    sr[0] = (__bf16)v0; sr[1] = (__bf16)v1; sr[2] = (__bf16)v2; sr[3] = (__bf16)v3;
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) wamax = fmaxf(wamax, __shfl_xor(wamax, off, 32));
+  if (lane == 0) s_amax[wave] = wamax;
+  __syncthreads();
+  float amax = 0.f;
+#pragma unroll
+  for (int w = 0; w < W; ++w) amax = fmaxf(amax, s_amax[w]);
+  const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+  const float inv = 1.f / scale;
+  if (tid == 0) AS[(size_t)p * M + m] = scale;
+  unsigned char *__restrict__ arow = A + ((size_t)p * M + m) * K;
+  for (int g = wave; g < G; g += W) {
+    const int c = g * PQ_GROUP + c0;
+    const float u0 = (float)s_row[c] * inv, u1 = (float)s_row[c + 1] * inv;
+    const float u2 = (float)s_row[c + 2] * inv, u3 = (float)s_row[c + 3] * inv;
+    const unsigned char b0 = pq_e4m3_encode(u0), b1 = pq_e4m3_encode(u1);
+    const unsigned char b2 = pq_e4m3_encode(u2), b3 = pq_e4m3_encode(u3);
+    *(unsigned int *)(arow + c) = (unsigned int)b0 | ((unsigned int)b1 << 8) |
+                                  ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+  }
+}
+// ---------------------------------------------------------------- per-token stream producers
+// The rotation-stream producers for the MXFP4 consumer (paroquant_mxfp4): the int4 producers
+// (pq_add_rms_rot / pq_ew_rot) hand the int4 GEMM a per-GROUP tuple; the MXFP4 GEMM wants
+// per-TOKEN e4m3 codes + one scale per row. One workgroup per (row, partition): the eight waves
+// split the row's groups (wave w owns g = w, w+8, ...), park the rotated row in dynamic LDS
+// (K bf16), block-reduce the token amax, encode. Bit-identical by construction to the unfused
+// chain [plain producer -> hs (bf16)] + pq_rotate_tokquant(hs): same ssq reduction (same block
+// shape and loop order), same bf16 rounding of the producer output, same chain, same parking
+// and encode. Gated in par_harness (tokstream) against exactly that chain. W = waves per row:
+// more waves = shorter serial rotation chain per wave (the M<=8 cost is pure chain latency).
+// NB the norm's ssq reduction order depends on W, so only W == PQ_ROT_WAVES is bit-identical
+// to pq_add_rms_rot<false>; other W differ from it by an ulp of rsqrt now and then (the same
+// class the int4 stream already accepted against inductor). Codes/scales ARE identical to
+// pq_rotate_tokquant<W> run on that kernel's own hs, which is what the harness gates.
+__device__ __forceinline__ void pq_tok_rotate_park(float (&nv)[4], const float (&cs)[4],
+                                                   const unsigned long long (&rec)[PQ_KROT_MAX][2],
+                                                   int krot, float (*s_xw), int c0, __bf16 *s_row_g,
+                                                   float &wamax) {
+  float v0 = nv[0] * cs[0], v1 = nv[1] * cs[1], v2 = nv[2] * cs[2], v3 = nv[3] * cs[3];
+  s_xw[c0 + 0] = v0; s_xw[c0 + 1] = v1; s_xw[c0 + 2] = v2; s_xw[c0 + 3] = v3;
+  __asm__ volatile("s_waitcnt lgkmcnt(0)");
+#pragma unroll
+  for (int r = 0; r < PQ_KROT_MAX; ++r) {
+    if (r < krot) {
+#pragma unroll
+      for (int t2 = 0; t2 < 2; ++t2) {
+        const unsigned long long rv = rec[r][t2];
+        const unsigned int ij = (unsigned int)(rv & 0xFFFFu);
+        const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
+        const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
+        const int i = ij & 0xFF, j = ij >> 8;
+        const float xi = s_xw[i], xj = s_xw[j];
+        s_xw[i] = fmaf(c, xi, sn * xj);
+        s_xw[j] = fmaf(c, xj, -sn * xi);
+      }
+      __asm__ volatile("s_waitcnt lgkmcnt(0)");
+    }
+  }
+  v0 = s_xw[c0 + 0]; v1 = s_xw[c0 + 1]; v2 = s_xw[c0 + 2]; v3 = s_xw[c0 + 3];
+  wamax = fmaxf(wamax, fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3))));
+  s_row_g[c0 + 0] = (__bf16)v0; s_row_g[c0 + 1] = (__bf16)v1;
+  s_row_g[c0 + 2] = (__bf16)v2; s_row_g[c0 + 3] = (__bf16)v3;
+  __asm__ volatile("s_waitcnt lgkmcnt(0)");           // s_x reuse across groups
+}
+
+// token amax -> scale -> encode the parked row. Every thread of the block calls it.
+template <int W>
+__device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, const __bf16 *s_row,
+                                                  unsigned char *__restrict__ arow, float *__restrict__ as_out,
+                                                  int G, int wave, int lane, int tid) {
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) wamax = fmaxf(wamax, __shfl_xor(wamax, off, 32));
+  if (lane == 0) s_amax[wave] = wamax;
+  __syncthreads();
+  float amax = 0.f;
+#pragma unroll
+  for (int w = 0; w < W; ++w) amax = fmaxf(amax, s_amax[w]);
+  const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+  const float inv = 1.f / scale;
+  if (tid == 0) *as_out = scale;
+  const int c0 = lane * 4;
+  for (int g = wave; g < G; g += W) {
+    const int c = g * PQ_GROUP + c0;
+    const float u0 = (float)s_row[c] * inv, u1 = (float)s_row[c + 1] * inv;
+    const float u2 = (float)s_row[c + 2] * inv, u3 = (float)s_row[c + 3] * inv;
+    const unsigned char b0 = pq_e4m3_encode(u0), b1 = pq_e4m3_encode(u1);
+    const unsigned char b2 = pq_e4m3_encode(u2), b3 = pq_e4m3_encode(u3);
+    *(unsigned int *)(arow + c) = (unsigned int)b0 | ((unsigned int)b1 << 8) |
+                                  ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+  }
+}
+
+// residual add + Gemma RMSNorm + rotate + token quant. Grid (M, P). Out HS/RO [M, K] (p == 0),
+// A [P, M, K], AS [P, M]. == pq_add_rms_rot<false> + pq_rotate_tokquant, bit-exact.
+template <int W>
+__global__ __launch_bounds__(W * 32) void pq_add_rms_rot_tok(
+    const __bf16 *__restrict__ Y, const __bf16 *__restrict__ RES,
+    const __bf16 *__restrict__ Wn, float eps,
+    const unsigned short *__restrict__ T, const __half *__restrict__ CS,
+    __bf16 *__restrict__ HS, __bf16 *__restrict__ RO,
+    unsigned char *__restrict__ A, float *__restrict__ AS, int M, int K, int krot) {
+  extern __shared__ __align__(16) unsigned char s_dyn[];
+  __bf16 *s_row = (__bf16 *)s_dyn;
+  __shared__ float s_red[W];
+  __shared__ float s_amax[W];
+  __shared__ float s_x[W][PQ_GROUP];
+  const int m = blockIdx.x, p = blockIdx.y;
+  const int G = K / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int c0 = lane * 4;
+  // row pass, identical to pq_add_rms_rot: v = y + res (fp32), sum of squares, residual out
+  const uint4_t *__restrict__ y4 = (const uint4_t *)(Y + (size_t)m * K);
+  const uint4_t *__restrict__ r4 = (const uint4_t *)(RES + (size_t)m * K);
+  uint4_t *__restrict__ o4 = (uint4_t *)(RO + (size_t)m * K);
+  const int KV = K >> 3;
+  float ssq = 0.f;
+  for (int i = tid; i < KV; i += W * 32) {
+    const uint4_t vy = y4[i], vr = r4[i];
+    uint4_t vo;
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+      const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+      const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+      ssq = fmaf(a0, a0, ssq);
+      ssq = fmaf(a1, a1, ssq);
+      const __bf16 b0 = (__bf16)a0, b1 = (__bf16)a1;
+      vo[h] = (unsigned int)__bfloat16_as_ushort(b0) | ((unsigned int)__bfloat16_as_ushort(b1) << 16);
+    }
+    if (p == 0) o4[i] = vo;
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) ssq += __shfl_xor(ssq, off, 32);
+  if (lane == 0) s_red[wave] = ssq;
+  __syncthreads();
+  float tot = 0.f;
+#pragma unroll
+  for (int w = 0; w < W; ++w) tot += s_red[w];
+  const float inv = rsqrtf(tot / (float)K + eps);
+
+  unsigned long long rec[PQ_KROT_MAX][2];
+  float cs[4];
+  float wamax = 0.f;
+  for (int g = wave; g < G; g += W) {
+    pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
+    const int kb = g * PQ_GROUP + c0;
+    const uint2_t vy = *(const uint2_t *)(Y + (size_t)m * K + kb);
+    const uint2_t vr = *(const uint2_t *)(RES + (size_t)m * K + kb);
+    const uint2_t vw = *(const uint2_t *)(Wn + kb);
+    float nv[4];
+    unsigned int hsw[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float a0 = __uint_as_float(vy[h] << 16) + __uint_as_float(vr[h] << 16);
+      const float a1 = __uint_as_float(vy[h] & 0xFFFF0000u) + __uint_as_float(vr[h] & 0xFFFF0000u);
+      const float w0 = __uint_as_float(vw[h] << 16) + 1.f, w1 = __uint_as_float(vw[h] & 0xFFFF0000u) + 1.f;
+      const __bf16 n0 = (__bf16)((a0 * inv) * w0), n1 = (__bf16)((a1 * inv) * w1);
+      nv[2 * h] = (float)n0; nv[2 * h + 1] = (float)n1;
+      hsw[h] = (unsigned int)__bfloat16_as_ushort(n0) | ((unsigned int)__bfloat16_as_ushort(n1) << 16);
+    }
+    if (p == 0) *(uint2_t *)(HS + (size_t)m * K + kb) = uint2_t{hsw[0], hsw[1]};
+    pq_tok_rotate_park(nv, cs, rec, krot, s_x[wave], c0, s_row + (size_t)g * PQ_GROUP, wamax);
+  }
+  pq_tok_encode_row<W>(wamax, s_amax, s_row, A + ((size_t)p * M + m) * K, AS + (size_t)p * M + m,
+                    G, wave, lane, tid);
+}
+
+// silu-mul (0) / attention gate (1) / GDN gated rmsnorm (2) + rotate + token quant, single
+// partition. Grid (M). Out HS [M, N], A [M, N], AS [M]. == pq_ew_rot<MODE,false> +
+// pq_rotate_tokquant, bit-exact.
+template <int MODE, int W>
+__global__ __launch_bounds__(W * 32) void pq_ew_rot_tok(
+    const __bf16 *__restrict__ X, const __bf16 *__restrict__ Y, long ys,
+    const __bf16 *__restrict__ Wn, float eps,
+    const unsigned short *__restrict__ T, const __half *__restrict__ CS,
+    __bf16 *__restrict__ HS, unsigned char *__restrict__ A, float *__restrict__ AS,
+    int M, int N, int krot) {
+  extern __shared__ __align__(16) unsigned char s_dyn[];
+  __bf16 *s_row = (__bf16 *)s_dyn;
+  __shared__ float s_amax[W];
+  __shared__ float s_x[W][PQ_GROUP];
+  const int m = blockIdx.x;
+  const int G = N / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int c0 = lane * 4;
+  unsigned long long rec[PQ_KROT_MAX][2];
+  float cs[4];
+  float wamax = 0.f;
+  for (int g = wave; g < G; g += W) {
+    pq_load_group(T, CS, 0, g, N, krot, lane, rec, cs);
+    const int kb = g * PQ_GROUP + c0;
+    float nv[4];
+    if constexpr (MODE == 0) {
+      const uint2_t vg = *(const uint2_t *)(X + (size_t)m * 2 * N + kb);
+      const uint2_t vu = *(const uint2_t *)(X + (size_t)m * 2 * N + N + kb);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float g0f = __uint_as_float(vg[h] << 16), g1f = __uint_as_float(vg[h] & 0xFFFF0000u);
+        const float u0 = __uint_as_float(vu[h] << 16), u1 = __uint_as_float(vu[h] & 0xFFFF0000u);
+        const float t0 = (float)(__bf16)(g0f / (1.f + expf(-g0f)));
+        const float t1 = (float)(__bf16)(g1f / (1.f + expf(-g1f)));
+        nv[2 * h] = (float)(__bf16)(t0 * u0);
+        nv[2 * h + 1] = (float)(__bf16)(t1 * u1);
+      }
+    } else if constexpr (MODE == 1) {
+      const uint2_t vx = *(const uint2_t *)(X + (size_t)m * N + kb);
+      const uint2_t vz = *(const uint2_t *)(Y + (size_t)m * ys + kb);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float x0 = __uint_as_float(vx[h] << 16), x1 = __uint_as_float(vx[h] & 0xFFFF0000u);
+        const float z0 = __uint_as_float(vz[h] << 16), z1 = __uint_as_float(vz[h] & 0xFFFF0000u);
+        const float s0 = (float)(__bf16)(1.f / (1.f + expf(-z0)));
+        const float s1 = (float)(__bf16)(1.f / (1.f + expf(-z1)));
+        nv[2 * h] = (float)(__bf16)(x0 * s0);
+        nv[2 * h + 1] = (float)(__bf16)(x1 * s1);
+      }
+    } else {
+      const uint2_t vx = *(const uint2_t *)(X + (size_t)m * N + kb);
+      const uint2_t vz = *(const uint2_t *)(Y + (size_t)m * ys + kb);
+      const uint2_t vw = *(const uint2_t *)(Wn + c0);
+      float xv[4] = {__uint_as_float(vx[0] << 16), __uint_as_float(vx[0] & 0xFFFF0000u),
+                     __uint_as_float(vx[1] << 16), __uint_as_float(vx[1] & 0xFFFF0000u)};
+      float ssq = 0.f;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) ssq = fmaf(xv[e], xv[e], ssq);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) ssq += __shfl_xor(ssq, off, 32);
+      const float inv = rsqrtf(ssq * (1.f / 128.f) + eps);
+      const float zv[4] = {__uint_as_float(vz[0] << 16), __uint_as_float(vz[0] & 0xFFFF0000u),
+                           __uint_as_float(vz[1] << 16), __uint_as_float(vz[1] & 0xFFFF0000u)};
+      const float wv[4] = {__uint_as_float(vw[0] << 16), __uint_as_float(vw[0] & 0xFFFF0000u),
+                           __uint_as_float(vw[1] << 16), __uint_as_float(vw[1] & 0xFFFF0000u)};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float sg = zv[e] / (1.f + expf(-zv[e]));
+        nv[e] = (float)(__bf16)(((xv[e] * inv) * wv[e]) * sg);
+      }
+    }
+    {
+      unsigned int h0 = (unsigned int)__bfloat16_as_ushort((__bf16)nv[0]) | ((unsigned int)__bfloat16_as_ushort((__bf16)nv[1]) << 16);
+      unsigned int h1 = (unsigned int)__bfloat16_as_ushort((__bf16)nv[2]) | ((unsigned int)__bfloat16_as_ushort((__bf16)nv[3]) << 16);
+      *(uint2_t *)(HS + (size_t)m * N + kb) = uint2_t{h0, h1};
+    }
+    pq_tok_rotate_park(nv, cs, rec, krot, s_x[wave], c0, s_row + (size_t)g * PQ_GROUP, wamax);
+  }
+  pq_tok_encode_row<W>(wamax, s_amax, s_row, A + (size_t)m * N, AS + m, G, wave, lane, tid);
+}
+
 // ------------------------------------------------------------------ decode path (small M)
 //
 // Structure is the AutoRound decode kernel. PARO deltas:
