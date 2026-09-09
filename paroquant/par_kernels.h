@@ -1048,6 +1048,73 @@ __global__ __launch_bounds__(W * 32) void pq_ew_rot_tok(
   else pq_tok_encode_row<W, false>(wamax, s_amax, s_row, A + (size_t)m * N, AS + m, G, wave, lane, tid);
 }
 
+// ------------------------------------------------------------------ skinny bf16 GEMM
+// C[M,N] = X[M,K] . W[N,K]^T in bf16 for the small unquantized projections a decode step still
+// runs through hipBLASLt (the GDN gate projection in_proj_ba: N=48/96, K=5120, 29 us per call for a
+// 480 KB weight; the drafter's kernel_projection N=1280 and hidden_projection N=256). Grid
+// (N/16, K/256): a workgroup owns 16 output columns and a 256-wide K slice; lane l of a wave reads
+// 16 consecutive k of W row n (32 B, coalesced across the 16 lanes of a row) and dots them against
+// X for every row m, then the 16 k-lanes shuffle-reduce. Cross-slice reduction: fp32 partials
+// [KS][M][N] and a per-column-tile counter; the last-arriving slice sums the partials in slice
+// order (deterministic) and writes bf16. M <= 64.
+#define PQ_SK_KCH 256
+#define PQ_SK_MAXM 64
+__global__ __launch_bounds__(256) void pq_skinny_bf16(
+    const __bf16 *__restrict__ X, const __bf16 *__restrict__ W, __bf16 *__restrict__ C,
+    float *__restrict__ P, int *__restrict__ cnt, int M, int N, int K) {
+  __shared__ int s_last;
+  __shared__ __align__(16) unsigned short s_x[PQ_SK_MAXM * PQ_SK_KCH];   // X[m][k0..k0+256) bf16, 32 KB at M=64
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int kpart = lane & 15;                       // 16 k-chunks of 16 per row
+  const int n = blockIdx.x * 16 + wave * 2 + (lane >> 4);
+  const int kb = blockIdx.y * PQ_SK_KCH;
+  const int KS = gridDim.y;
+  // stage the X slice: M rows x 256 k = M x 512 B; 16 B per thread per iteration
+  for (int i = tid; i < M * (PQ_SK_KCH / 8); i += 256) {
+    const int m = i / (PQ_SK_KCH / 8), c = (i % (PQ_SK_KCH / 8)) * 8;
+    *(uint4_t *)(&s_x[m * PQ_SK_KCH + c]) = *(const uint4_t *)(X + (size_t)m * K + kb + c);
+  }
+  float wf[16];
+  const bool live = n < N;
+  {
+    const __bf16 *wp = W + (size_t)(live ? n : 0) * K + kb + kpart * 16;
+    const uint4_t w0 = *(const uint4_t *)wp, w1 = *(const uint4_t *)(wp + 8);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      wf[2 * i] = __uint_as_float(w0[i] << 16); wf[2 * i + 1] = __uint_as_float(w0[i] & 0xFFFF0000u);
+      wf[8 + 2 * i] = __uint_as_float(w1[i] << 16); wf[8 + 2 * i + 1] = __uint_as_float(w1[i] & 0xFFFF0000u);
+    }
+  }
+  __syncthreads();
+  for (int m = 0; m < M; ++m) {
+    const uint4_t x0 = *(const uint4_t *)(&s_x[m * PQ_SK_KCH + kpart * 16]);
+    const uint4_t x1 = *(const uint4_t *)(&s_x[m * PQ_SK_KCH + kpart * 16 + 8]);
+    float a = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      a = fmaf(__uint_as_float(x0[i] << 16), wf[2 * i], a); a = fmaf(__uint_as_float(x0[i] & 0xFFFF0000u), wf[2 * i + 1], a);
+      a = fmaf(__uint_as_float(x1[i] << 16), wf[8 + 2 * i], a); a = fmaf(__uint_as_float(x1[i] & 0xFFFF0000u), wf[8 + 2 * i + 1], a);
+    }
+#pragma unroll
+    for (int off = 8; off >= 1; off >>= 1) a += __shfl_xor(a, off, 32);
+    if (kpart == 0 && live) P[((size_t)blockIdx.y * M + m) * N + n] = a;
+  }
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = (atomicAdd(&cnt[blockIdx.x], 1) == KS - 1);
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  for (int idx = tid; idx < M * 16; idx += 256) {
+    const int m = idx >> 4, nn = blockIdx.x * 16 + (idx & 15);
+    if (nn >= N) continue;
+    float a = 0.f;
+    for (int s2 = 0; s2 < KS; ++s2) a += P[((size_t)s2 * M + m) * N + nn];
+    C[(size_t)m * N + nn] = (__bf16)a;
+  }
+  if (tid == 0) cnt[blockIdx.x] = 0;
+}
+
 // ------------------------------------------------------------------ decode path (small M)
 //
 // Structure is the AutoRound decode kernel. PARO deltas:
