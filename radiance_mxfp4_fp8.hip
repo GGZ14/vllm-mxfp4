@@ -240,7 +240,8 @@ template <int TN, bool WPERM, bool EPIFAST = true>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
     const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
-    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K) {
+    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K,
+    int pb1, int pb2, long astride) {
   __shared__ unsigned char sA[BMF * ASTR];
   __shared__ unsigned char sW[WN * TN * 16 * WSTR];
 
@@ -249,6 +250,14 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_folded(
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
   constexpr int BNF_T = WN * TN * 16;
   const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF_T;
+  // Merged-linear partition select (paroquant: one launch over the whole N, partition p's n-blocks
+  // read the p-th rotated copy of A and its scales). Boundaries are multiples of every n-tile
+  // (launcher-checked), so a block never straddles one. pb1 = pb2 = 1<<30 (the default) is p = 0.
+  {
+    const int p_ = n0 >= pb2 ? 2 : (n0 >= pb1 ? 1 : 0);
+    A += (size_t)p_ * astride;
+    As += (size_t)p_ * M;
+  }
 
   floatx8 acc[TM][TN];
 #pragma unroll
@@ -522,7 +531,8 @@ template <int TN, bool WPERM, int LBK = BK>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
-    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K) {
+    const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K,
+    int pb1, int pb2, long astride) {
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + PAD;
   constexpr int BNF_T = WN * TN * 16;
@@ -535,6 +545,14 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   const int wm = wave / WN, wn = wave % WN;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
   const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF_T;
+  // Merged-linear partition select (paroquant: one launch over the whole N, partition p's n-blocks
+  // read the p-th rotated copy of A and its scales). Boundaries are multiples of every n-tile
+  // (launcher-checked), so a block never straddles one. pb1 = pb2 = 1<<30 (the default) is p = 0.
+  {
+    const int p_ = n0 >= pb2 ? 2 : (n0 >= pb1 ? 1 : 0);
+    AT += (size_t)p_ * astride;
+    As += (size_t)p_ * M;
+  }
   const int ksteps_g = K / 16;
   const int Mt = (M + 15) >> 4;
 
@@ -777,7 +795,7 @@ __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, float *__restrict__ P, int *__restrict__ cnt,
-    __bf16 *__restrict__ C, int M, int N, int K) {
+    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2, long astride) {
   constexpr int BND = DWN * 16;
   constexpr int DASTR = DBK + DEC_PAD, DWSTR = DBK + DEC_PAD;
   constexpr int DNTHREADS = DWN * 32;
@@ -789,6 +807,14 @@ __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
   const int n0 = blockIdx.x * BND;
   const int ks = blockIdx.z;
+  // Merged-linear partition select (paroquant: one launch over the whole N, partition p's n-blocks
+  // read the p-th rotated copy of A and its scales). Boundaries are multiples of every n-tile
+  // (launcher-checked), so a block never straddles one. pb1 = pb2 = 1<<30 (the default) is p = 0.
+  {
+    const int p_ = n0 >= pb2 ? 2 : (n0 >= pb1 ? 1 : 0);
+    A += (size_t)p_ * astride;
+    As += (size_t)p_ * M;
+  }
 
   const int slabs = (K + DBK - 1) / DBK;
   const int spb = (slabs + DKS - 1) / DKS;
@@ -1102,9 +1128,14 @@ static void set_decode_scratch(uintptr_t ptr, size_t bytes, uintptr_t cnt) {
   g_decode_cnt = (int *)cnt;        // must be ZEROED by the caller, once
 }
 
-static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
-                   uintptr_t c, int M, int N, int K, uintptr_t stream) {
+static void launch_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
+                        uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
+                        uintptr_t stream) {
   if (K % BK) throw std::runtime_error("radiance_mxfp4_fp8: K must be a multiple of 64");
+  // partition boundaries must be n-tile aligned for every kernel below (decode 128, folded 64/128)
+  if ((pb1 < N && pb1 % 128) || (pb2 < N && pb2 % 128))
+    throw std::runtime_error("radiance_mxfp4_fp8: partition boundaries must be multiples of 128");
+  if (!wref && pb1 < N) throw std::runtime_error("radiance_mxfp4_fp8: partitions need the folded path");
   dim3 block(NWAVE * 32);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
   // the tuned folded kernel wins at every shape measured, so it is the default whenever the
@@ -1194,7 +1225,7 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
                          0, (hipStream_t)stream, (const unsigned char *)a,                     \
                          (const unsigned char *)w, (const unsigned char *)ws,                  \
                          (const unsigned char *)wref, (const float *)as, P, g_decode_cnt,      \
-                         (__bf16 *)c, M, N, K)
+                         (__bf16 *)c, M, N, K, pb1, pb2, astride)
 #define RAD_DEC_BY_TM(BK_, KS_)                                                               \
       if (tm == 1)      RAD_DEC_LAUNCH(BK_, KS_, 1);                                           \
       else if (tm == 2) RAD_DEC_LAUNCH(BK_, KS_, 2);                                           \
@@ -1250,7 +1281,8 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
       hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_folded<TN_, WP_, EF_>), fgrid, fblock, 0,     \
                          (hipStream_t)stream, (const unsigned char *)a,                         \
                          (const unsigned char *)w, (const unsigned char *)ws,                   \
-                         (const unsigned char *)wref, (const float *)as, (__bf16 *)c, M, N, K); \
+                         (const unsigned char *)wref, (const float *)as, (__bf16 *)c, M, N, K, \
+                         pb1, pb2, astride);                                                    \
     } while (0)
 #define RAD_FOLDED(TN_, WP_)                                                                    \
     do { if (epifast) RAD_FOLDED_E(TN_, WP_, true); else RAD_FOLDED_E(TN_, WP_, false); } while (0)
@@ -1269,6 +1301,19 @@ static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintp
     hipLaunchKernelGGL(radiance_mxfp4_fp8_gemm, grid, block, 0, (hipStream_t)stream,
                        (const unsigned char *)a, (const unsigned char *)w,
                        (const unsigned char *)ws, (const float *)as, (__bf16 *)c, M, N, K);
+}
+
+// Stock entry: one activation, one partition (bit-identical to before the partition select).
+static void launch(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
+                   uintptr_t c, int M, int N, int K, uintptr_t stream) {
+  launch_impl(a, w, ws, wref, as, c, M, N, K, 1 << 30, 1 << 30, 0, stream);
+}
+// Merged-linear entry (paroquant): a = [P, M, K] rotated copies astride bytes apart, as = [P, M];
+// n-blocks in [0, pb1) read copy 0, [pb1, pb2) copy 1, [pb2, N) copy 2.
+static void launch_p(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
+                     uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
+                     uintptr_t stream) {
+  launch_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream);
 }
 
 
@@ -1595,9 +1640,12 @@ static void launch_add_rms_quant(uintptr_t y, uintptr_t res, uintptr_t w, uintpt
 // GEMM on a fragment-tiled activation (see radiance_mxfp4_fp8_gemm_atiled). The caller decides
 // the layout per tensor (radiance_mxfp4.py a_tiled_*); this only dispatches. Prefill-class M
 // only: the decode kernel reads row-major A, so the Python side never tiles below its band.
-static void launch_at(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
-                      uintptr_t c, int M, int N, int K, uintptr_t stream) {
+static void launch_at_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
+                           uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
+                           uintptr_t stream) {
   if (K % 128) throw std::runtime_error("radiance_mxfp4_fp8: tiled A needs K % 128 == 0");
+  if ((pb1 < N && pb1 % 128) || (pb2 < N && pb2 % 128))
+    throw std::runtime_error("radiance_mxfp4_fp8: partition boundaries must be multiples of 128");
   if (!wref) throw std::runtime_error("radiance_mxfp4_fp8: tiled A needs the folded path (wref)");
   static const int tn4_min_m = [] {
     const char *e = getenv("RADIANCE_MXFP4_TN4_MIN_M");
@@ -1616,16 +1664,27 @@ static void launch_at(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, ui
                        fgrid, fblock, 0,                                                        \
                        (hipStream_t)stream, (const unsigned char *)a, (const unsigned char *)w, \
                        (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, \
-                       (__bf16 *)c, M, N, K);                                                   \
+                       (__bf16 *)c, M, N, K, pb1, pb2, astride);                               \
   } while (0)
   if (M >= tn4_min_m && N >= BNF_OF(4)) { if (wperm) RAD_AT(4, true); else RAD_AT(4, false); }
   else                                  { if (wperm) RAD_AT(2, true); else RAD_AT(2, false); }
 #undef RAD_AT
 }
+static void launch_at(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
+                      uintptr_t c, int M, int N, int K, uintptr_t stream) {
+  launch_at_impl(a, w, ws, wref, as, c, M, N, K, 1 << 30, 1 << 30, 0, stream);
+}
+static void launch_at_p(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
+                        uintptr_t c, int M, int N, int K, int pb1, int pb2, long astride,
+                        uintptr_t stream) {
+  launch_at_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream);
+}
 
 PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch_at", &launch_at, "MXFP4 x FP8 WMMA GEMM on a fragment-tiled activation");
   m.def("launch", &launch, "MXFP4 x FP8 WMMA GEMM (gfx1201)");
+  m.def("launch_p", &launch_p, "MXFP4 x FP8 GEMM over a merged linear: P rotated A copies, partition by n-block (pb1, pb2, astride)");
+  m.def("launch_at_p", &launch_at_p, "fragment-tiled A variant of launch_p");
   m.def("launch_silu_mul_quant", &launch_silu_mul_quant,
         "fused silu(gate)*up + per-token e4m3 quant, one WG per row",
         py::arg("gu"), py::arg("q"), py::arg("scale"), py::arg("M"), py::arg("N"),

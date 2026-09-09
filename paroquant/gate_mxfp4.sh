@@ -16,10 +16,11 @@ MODELS=${MODELS:-$HOME/models}
 PSEUDO=${PSEUDO:-Qwen3.8-27B-PARO-MXFP4-pseudo}
 # REAL=1: the directory is a real paroquant_mxfp4 checkpoint, served through the W4A8 kernel path
 # (the deployed accuracy, not the W4A16 upper bound the pseudo model gives). The v1 loader takes
-# no rotation-stream tuple, so the streams are forced off, and CHECKALL gates every partition.
+# with the rotation streams at the launcher defaults (STREAMS=0 forces them off to gate the plain
+# prologue instead), and CHECKALL gates every partition.
 REAL=${REAL:-0}
 if [ "$REAL" = 1 ]; then
-  export RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 RADIANCE_PQ_ROT_STREAM3=0
+  [ "${STREAMS:-1}" = 0 ] && export RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 RADIANCE_PQ_ROT_STREAM3=0
   export RADIANCE_PQM_CHECKALL=${RADIANCE_PQM_CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120"}
 fi
 N=${N:-500}

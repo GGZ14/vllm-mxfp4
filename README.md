@@ -289,7 +289,9 @@ A second ParoQuant format keeps the learned rotations on **MXFP4 weights** (e2m1
 which puts the GEMM on the zero-VALU fp8-WMMA loop AMD's MXFP4 runs on -- `quant_method:
 paroquant_mxfp4`, built by `paroquant/build_hybrid.py` from the bf16 base and z-lab's rotations,
 served by `paroquant/radiance_paroquant_mxfp4.py`. In-serve CHECKALL with real inputs holds rel 0.0012-0.0021 (bf16 rounding) on
-every shape and partition at TP=2; served-path GSM8K 500q **97.60%** (int4 PARO 97.60, AMD MXFP4 97.8). See
+every shape and partition at TP=2; served-path GSM8K 500q **97.60%** (int4 PARO 97.60, AMD MXFP4 97.8);
+prod decode at parity with int4 PARO (24.53 vs 24.19 ms/step) once the prologue, the stream producers
+and the merged-linear GEMM each became one launch. See
 [PAROQUANT.md](PAROQUANT.md#mxfp4-weights-the-zero-valu-loop).
 
 The format, the kernels, the knob reference and the rejected experiments are in
@@ -662,6 +664,8 @@ and hipcc must still link a HIP shared object, since AITER JITs at runtime.
 | `paroquant/radiance_paroquant.hip` | Kernel module. Compiled in-container at launch |
 | `paroquant/par_kernels.h` | The rotation and W4A8 GEMM device code |
 | `paroquant/par_harness.hip` | Standalone gates for the kernels, no server needed (`run.sh`, `run2.sh`) |
+| `paroquant/radiance_paroquant_mxfp4.py` | The `paroquant_mxfp4` quant method: MXFP4 weights + rotations on the W4A8 MXFP4 GEMM, per-token stream producers |
+| `paroquant/test_mxfp4_loader.py`, `bench_linear_tp2.py` | GPU unit test (fp32 reference, stream equivalence, single-launch equivalence) and the int4-vs-MXFP4 per-shape decode microbench |
 | `paroquant/RESULTS.md` | The change-by-change engineering log |
 
 ### Where the HIP kernels live

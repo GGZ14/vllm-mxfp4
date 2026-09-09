@@ -113,7 +113,7 @@ def main():
     layer.to(dev)
     method.process_weights_after_loading(layer)
     print(f"prepared: P={layer.rec.shape[0]} pb1={layer.pq_pb1} pb2={layer.pq_pb2} "
-          f"weight={tuple(layer.weight.shape)} ws_cat={layer.ws_cat.numel()} wref={tuple(layer.wref.shape)}")
+          f"weight={tuple(layer.weight.shape)} ws_t={tuple(layer.ws_t.shape)} wref={tuple(layer.wref.shape)}")
     assert layer.rec.shape[0] == len(mods), "distinct rotations must NOT dedup"
 
     bounds = [0, sizes[0], N]
@@ -134,6 +134,83 @@ def main():
         print(f"  M={Mrows:4d} {band:7s} rel={rel:.4f}")
         assert rel < 4e-2, f"M={Mrows}: rel {rel} too large -- layout or scale mismatch"
     print("PASS: paroquant_mxfp4 linear matches fp32 reference at every band")
+    # single-launch merged GEMM (partition select in the kernel) vs the per-partition loop + cat
+    print("single launch vs per-partition loop (P=2):")
+    for Mrows in [1, 5, 8, 40, 64, 200, 600, 2048]:
+        x = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
+        M.SINGLE_LAUNCH = True;  y1 = method.apply(layer, x)
+        M.SINGLE_LAUNCH = False; y0 = method.apply(layer, x)
+        M.SINGLE_LAUNCH = True
+        # not bit-identical by design: the decode band picks split-K from the launch's N, so the
+        # merged launch may reassociate the fp32 partial sums differently from the per-partition
+        # loop. Equivalent to bf16 rounding: a handful of 1-ulp flips, rel ~1e-4.
+        rel = ((y1.float() - y0.float()).norm() / y0.float().norm()).item()
+        nd = int((y0 != y1).sum())
+        print(f"  M={Mrows:4d}: single vs loop rel={rel:.2e}  differing elems {nd}/{y0.numel()}")
+        assert rel < 1e-3, f"M={Mrows}: single-launch output differs from the per-partition loop (rel {rel})"
+    print("PASS: single-launch merged GEMM matches the per-partition loop to bf16 rounding")
+
+    # ---- rotation stream producers: the fused (norm|silu|gate|gdn-norm) + rotate + token quant
+    # producers must give the SAME GEMM output as feeding their own hs through the plain path
+    # (which runs pq_rotate_tokquant on hs) -- bit-exact, at every M below the tiled threshold.
+    print("rotation stream (per-token producers) vs plain path on the producer's own hs:")
+    wn = (torch.randn(K, device=dev) * 0.1).to(torch.bfloat16)          # Gemma-style (1 + w)
+    for Mrows in [1, 5, 8, 40, 64, 200, 600]:
+        y = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
+        res = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
+        hs, ro, a, as_tok = torch.ops.radiance.pqm_add_rms_rot(y, res, wn, 1e-6, layer.rec, layer.cs)
+        # residual out is exact bf16(y + res) in fp32
+        ro_ref = (y.float() + res.float()).to(torch.bfloat16)
+        assert torch.equal(ro, ro_ref), f"M={Mrows}: residual out differs"
+        # hs vs a torch Gemma RMSNorm (reduction order differs -> allow ulps)
+        v = (y.float() + res.float())
+        hs_ref = (v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + 1e-6) * (1.0 + wn.float())).to(torch.bfloat16)
+        hs_rel = ((hs.float() - hs_ref.float()).norm() / hs_ref.float().norm()).item()
+        assert hs_rel < 2e-3, f"M={Mrows}: hs rel {hs_rel} vs torch rmsnorm"
+        y_pre = method.apply(layer, (hs, a, as_tok))
+        y_plain = method.apply(layer, hs)
+        same = torch.equal(y_pre, y_plain)
+        fused = M._stream_fused(Mrows)
+        print(f"  norm site M={Mrows:4d} {'fused' if fused else 'plain (tiled band)'}: pre == plain {same}  hs rel {hs_rel:.2e}")
+        assert same, f"M={Mrows}: stream tuple output differs from the plain path"
+    # elementwise sites: a single-partition consumer (out_proj-like) -- reuse partition 0 of this
+    # layer as the consumer with P=1 by building a P=1 layer from the first module
+    l1 = nn.Module()
+    l1.weight = nn.Parameter(mods[0]["weight"].clone(), requires_grad=False)
+    l1.weight_scale = nn.Parameter(mods[0]["weight_scale"].clone(), requires_grad=False)
+    l1.theta = nn.Parameter(mods[0]["theta"].unsqueeze(0).clone(), requires_grad=False)
+    l1.pairs = nn.Parameter(mods[0]["pairs"].unsqueeze(0).clone(), requires_grad=False)
+    l1.channel_scales = nn.Parameter(mods[0]["channel_scales"].reshape(1, -1).clone(), requires_grad=False)
+    l1.pq_output_partition_sizes = [sizes[0]]
+    l1.to(dev)
+    method.process_weights_after_loading(l1)
+    w128 = (torch.randn(128, device=dev) * 0.5).to(torch.bfloat16)
+    for mode, label in ((0, "silu-mul"), (1, "attn-gate"), (2, "gdn-norm")):
+        for Mrows in [1, 8, 64, 600]:
+            if mode == 0:
+                x = (torch.randn(Mrows, 2 * K, device=dev) * 0.8).to(torch.bfloat16)
+                yy = x
+                g, u = x[:, :K].float(), x[:, K:].float()
+                hs_ref = ((g / (1 + torch.exp(-g))).to(torch.bfloat16).float() * u).to(torch.bfloat16)
+            else:
+                x = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
+                yy = (torch.randn(Mrows, K, device=dev) * 0.8).to(torch.bfloat16)
+                if mode == 1:
+                    hs_ref = (x.float() * (1 / (1 + torch.exp(-yy.float()))).to(torch.bfloat16).float()).to(torch.bfloat16)
+                else:
+                    xv = x.float().view(Mrows, -1, 128)
+                    n = xv * torch.rsqrt(xv.pow(2).mean(-1, keepdim=True) + 1e-6) * w128.float()
+                    z = yy.float().view(Mrows, -1, 128)
+                    hs_ref = (n * (z / (1 + torch.exp(-z)))).view(Mrows, K).to(torch.bfloat16)
+            hs, a, as_tok = torch.ops.radiance.pqm_ew_rot(mode, x, yy, w128 if mode == 2 else l1.cs, 1e-6, l1.rec, l1.cs)
+            hs_rel = ((hs.float() - hs_ref.float()).norm() / hs_ref.float().norm()).item()
+            y_pre = method.apply(l1, (hs, a, as_tok))
+            y_plain = method.apply(l1, hs)
+            same = torch.equal(y_pre, y_plain)
+            print(f"  {label:9s} M={Mrows:4d}: pre == plain {same}  hs rel {hs_rel:.2e}")
+            assert same, f"{label} M={Mrows}: stream tuple output differs from the plain path"
+            assert hs_rel < 5e-3, f"{label} M={Mrows}: hs rel {hs_rel} vs torch reference"
+    print("PASS: per-token rotation-stream producers are output-identical to the plain path")
 
 
 if __name__ == "__main__":

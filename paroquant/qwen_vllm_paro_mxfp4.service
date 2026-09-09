@@ -11,11 +11,9 @@ Environment=SPEC=7
 Environment="SERVED_NAMES=Qwen3.8 Qwen3.6 Qwen3.8-PARO Qwen3.8-PARO-MXFP4"
 Environment=MODEL_DIR=Qwen3.8-27B-PARO-MXFP4-ft
 Environment=NAME=vllmparomx
-Environment=CACHE=/home/brian/.radiance-cache-paro-mxfp4-093
+Environment=GPU_UTIL=0.95
+Environment=CACHE=/home/brian/.radiance-cache-paro-mxfp4-093-rs-rs2-sl
 # v1 MXFP4 loader takes no rotation-stream tuple (gap #2, pending)
-Environment=RADIANCE_PQ_ROT_STREAM=0
-Environment=RADIANCE_PQ_ROT_STREAM2=0
-Environment=RADIANCE_PQ_ROT_STREAM3=0
 ExecStart=/home/brian/deadcode-vllm/paroquant/run_paroquant.sh
 ExecStop=/usr/bin/podman stop -t 30 vllmparomx
 Restart=no

@@ -14,8 +14,9 @@
 #   - MXFP4-only env knobs are left at prod values but are INERT here (no quark layers load).
 #
 # MXFP4 checkpoint (quant_method paroquant_mxfp4, from paroquant/build_hybrid.py): same launcher,
-#   MODEL_DIR=Qwen3.8-27B-PARO-MXFP4 RADIANCE_PQ_ROT_STREAM=0 RADIANCE_PQ_ROT_STREAM2=0 -- the v1
-#   loader takes no rotation-stream tuple. MODE=eval then gates RADIANCE_PQM_CHECKALL per partition.
+#   MODEL_DIR=Qwen3.8-27B-PARO-MXFP4-ft. The rotation streams (defaults on) apply: the loader's
+#   per-token producers (pqm_add_rms_rot / pqm_ew_rot) replace the int4 per-group ones through the
+#   same install_stream. MODE=eval then gates RADIANCE_PQM_CHECKALL per partition.
 #   The RADIANCE_MXFP4_* kernel knobs (fragment-order weights, NT decode loads, decode band) are
 #   passed at MXFP4 prod's values; they are inert for the int4 checkpoint (no quark layers load)
 #   and load-bearing for MXFP4-PARO's speed.

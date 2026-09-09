@@ -286,7 +286,7 @@ ParoQuant format keeps the learned rotations and changes only the weight grid to
 e2m1 elements, one e8m0 (power-of-two) scale per 32 along K. The e8m0 scale folds at weight
 staging, e2m1 has no zero point, and the inner loop is fp8 x fp8 WMMA with nothing else in it --
 the same W4A8 path AMD's MXFP4 release runs on. Weight traffic is unchanged at 4.25 bits/weight
-(4 + 8/32 vs 4 + 32/128), so decode is untouched; this is a prefill format.
+(4 + 8/32 vs 4 + 32/128), so decode traffic is untouched; the decode *step* is a launch-count story, see below.
 
 **Checkpoint** (`quant_method: paroquant_mxfp4`, `paroquant/build_hybrid.py`): per projection the
 Quark MXFP4 buffers -- `weight [N, K/2]` u8 (two e2m1 per byte, even index in the low nibble),
@@ -343,26 +343,71 @@ serve, the *ratio* is the point):
 | 8k | 2223 | **2411** | +8.5% |
 | 16k | 2186 | **2334** | +6.8% |
 | 30k | 2095 | **2224** | +6.2% |
-| decode, 8k ctx (eager, single stream, indicative only) | 14.8 tok/s | **18.8** | +27% |
 
 The prefill gain is the zero-VALU loop's +25% on the GEMM diluted by the unchanged prologue,
-attention and everything else in a prefill step. The eager decode edge is *despite* v1's
-two-launch prologue and no fused streams; prod decode (compiled graphs, drafter, TP=2) is
-where the rotation-stream gap still has to be closed.
+attention and everything else in a prefill step.
+
+**Prod decode: the launch-count regression and its three fixes** (2026-09-08; compiled graphs,
+DFlash2 SPEC=7, TP=2, `bench_decode_ctx` + BetterBench decode single pass, same tools as the int4
+records). The first prod boot of this loader decoded at **35.40 ms/step** against int4 PARO's
+24.19 -- with acceptance at parity (acc/draft 1.85 vs int4's 1.57-1.78 on the same bench) and the
+GEMM at parity (`paroquant/bench_linear_tp2.py`, real TP=2 shapes). The whole gap was launch count:
+two prologue kernels per linear, unfused norm / silu / gate kernels, one GEMM per rotated partition,
+and an output copy per partition. hipGraph hides CPU cost, not kernel count.
+
+| prod build | ms/step @ctx25 / 8k / 32k | BetterBench combined | GSM8K 500q |
+|---|---|---|---|
+| int4 PARO (reference) | 24.19 / 25.74 / 26.70 | 226.2 t/s | 97.4-98.0 |
+| MXFP4-PARO v1 (two-launch prologue, no streams) | 35.40 / 36.43 / 37.53 | 126.3 | 97.60 |
+| + `pq_rotate_tokquant` (one launch: scale + rotate + token amax + e4m3) | 28.48 / 30.23 / 30.85 | 184.4 | -- |
+| + per-token stream producers (`pq_add_rms_rot_tok`, `pq_ew_rot_tok<0/1/2>`) | 26.29 / 27.51 / 28.34 | 200.3 | 97.40 |
+| + single-launch merged GEMM (partition select in-kernel) | **24.53 / 25.89 / 26.80** | 203.4 | 97.40 |
+| + scale slabs dropped, `GPU_UTIL=0.95` (shipped) | 24.71 / 25.98 / 26.96 | -- | KV 862k tokens |
+
+Each step is gated bit-identical to the path it replaced (`par_harness --bench2 tokq` and
+`tokstream`: 54 + 45 shapes, codes / scales / hs / residual byte-exact) and output-identical at the
+loader level (`test_mxfp4_loader.py`: stream tuple vs plain path `torch.equal` at every site and M).
+The single launch is *not* bit-identical to the per-partition loop -- the decode band picks split-K
+from the launch's N, so the fp32 partials reassociate -- and measures 1-2 one-ulp bf16 flips per
+million outputs (rel 3e-8 .. 4e-6), the same class as any split-K change.
+
+- **Stream plumbing is shared.** `radiance_paroquant.install_stream` now asks each consumer linear's
+  quant method for its producers (`quant_method.stream_norm` / `stream_ew`), so the int4 method
+  hands its GEMM the per-group tuple and `paroquant_mxfp4` hands its GEMM `(A [P,M,K], AS [P,M])`.
+  Stream 3 (fused all-reduce) stays int4-only (`pq_ar_capable`). Same guards, same patched
+  forwards, same "installed: 64/64/64/48/16" line.
+- **Per-token producers need the whole row in one workgroup** (the scale is a row max), so they
+  cannot split rows across workgroups the way the per-group producers do; the small-M cost is the
+  serial rotation chain per wave (5 chains per wave at 8 waves for K=5120). Waves per row are chosen
+  by M -- 32 at M<=16, 16 at M<=64, 8 above (`RADIANCE_PQ_TOK_WAVES` forces one) -- which takes the
+  norm producer from 10.5 to 7.9 us and the down-proj producer from 17.2 to 9.7 us at M=8. They are
+  still 2-4 us behind the int4 producers per site (5.4 / ~6 us); interleaving two chains per wave is
+  the untried lever.
+- **Single-launch merged GEMM.** `radiance_mxfp4_fp8` kernels (decode, folded prefill, A-tiled) take
+  `pb1, pb2, astride`: an n-block in `[pb1, pb2)` reads rotated copy 1 of A and its scales, etc.
+  Boundaries must be 128-aligned (loader-checked; every Qwen3.8 shape at TP=1/2 is). The stock entry
+  `launch` passes `1<<30` and is bit-identical to before. At M=8 on the real TP=2 shapes this took the
+  per-step linear cost from 10.9 to **9.2 ms** (int4: 12.7): qkv P=3 51.7 -> 28.6 us, gate_up 67 -> 59,
+  in_proj 40 -> 30; the P=1 sites also lost their output copy (27 -> 23 us).
+
+Prod prefill (BetterBench prefill sweep, single pass, final build): **4376/4449/4423/4291/4068 PP t/s** at
+2k/8k/16k/32k/64k vs int4 PARO's 3782/3700/3725/3621/3450 (+16%/+20%/+19%/+18%/+18%) -- above the +6-10% of the
+TP=1 eager kernel A/B because the stream producers and the single merged-linear launch take
+launches out of the prefill step too.
+
+Where it stands: step time at parity with int4 PARO; combined BetterBench 203 vs 226 on a single pass
+(tokens per update trail on prose / file_edit, step time does not -- acceptance on this checkpoint,
+not the kernels); prefill +6-10%. **Open:** the producers' 2-4 us per site; KV profile had come out at
+578k tokens vs int4's 622k on the same `GPU_UTIL=0.92` (consumed memory 17.0 vs 16.1 GiB between the
+stream and single-launch boots; the duplicate per-partition scale slabs, 0.4 GiB/rank, were part of
+it) -- with the slabs removed and the unit at `GPU_UTIL=0.95` it is **862k tokens** (3.29x
+concurrency at 262k ctx), decode unchanged; SPEC re-sweep not redone -- step time and acceptance match int4 PARO, whose sweep chose 7.
 
 **Fine-tune** (`STAGE=finetune`: weights + e8m0 bias under the MXFP4 grid, rotations frozen at
 z-lab's, 256 samples x 2 epochs): mean -4.4% layer-output error per layer (-84% at layer 0, -1.7 to
 -9% at depth). The optimizer keeps the whole fp16 model CPU-resident; on 60 GiB that thrashed, so
 each finished block's storage is now released as the loop passes it (memory only). 64 layers in
 ~5 min each once that landed.
-
-**Result:** accuracy parity with int4 PARO and AMD MXFP4 on the served path, +6-10% prefill over int4
-PARO on the kernel path, in-serve numerics at the bf16 floor. **Open:** prod decode -- v1 runs
-rotate -> token-quant as two launches and has no fused rotation streams, so compiled-graph decode
-trails int4 PARO until the producers emit the per-token tuple (the agreed next item), then a SPEC
-re-sweep. **Known gap:** the fused rotation-stream producers still emit
-the int4 GEMM's per-group tuple, so v1 runs rotate -> token-quant as two launches per linear and
-its decode trails int4 PARO's 226 t/s until they are adapted to the per-token tuple.
 
 **Traps, so nobody re-hits them:** the pseudo config must not carry `torch_dtype: float16` (R4D
 attention is bf16-only); `GPUS=<one card>` needs `HIP_VISIBLE_DEVICES` to index into the

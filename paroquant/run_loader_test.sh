@@ -12,6 +12,7 @@ exec podman run --rm --privileged --ipc=host --network=host \
   -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_ROT_V2=1 \
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
+  -e SCRIPT="${SCRIPT:-test_mxfp4_loader.py}" -e BL_MS="${BL_MS:-}" -e BL_ITERS="${BL_ITERS:-}" \
   -e PQM_CKPT="${PQM_CKPT:-}" -e PQM_MS="${PQM_MS:-}" -e PQM_MODULES="${PQM_MODULES:-}" -e PQM_TP="${PQM_TP:-1}" \
   -v "$REPO":/patches:z -v "$MODELS":/models \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
@@ -26,4 +27,4 @@ exec podman run --rm --privileged --ipc=host --network=host \
       radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so
     cp radiance_paroquant.py radiance_paroquant_mxfp4.py "$SP"/
     cd /
-    python3 /patches/paroquant/test_mxfp4_loader.py'
+    python3 /patches/paroquant/${SCRIPT:-test_mxfp4_loader.py}'

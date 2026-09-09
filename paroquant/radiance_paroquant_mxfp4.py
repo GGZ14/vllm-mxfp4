@@ -23,8 +23,10 @@ tiled reader use the SAME fragment layout -- [m-tile][k-step][half][row 16][8 B]
 so above RADIANCE_MXFP4_A_TILED_MIN_M the prologue writes tiled A straight into the MXFP4 kernel's
 a_tiled register and the GEMM takes its -12..-16% path with no relayout.
 
-v1 limit, deliberate: no rotation-stream fusion (RADIANCE_PQ_ROT_STREAM must be 0 -- those
-producers hand the int4 GEMM's per-group tuple). That is the remaining decode-side gap.
+Rotation stream: radiance_paroquant.install_stream patches the decoder layers and asks each
+consumer linear's quant method for its producers; ours (pqm_add_rms_rot, pqm_ew_rot) fuse the norm /
+silu-mul / attention gate / GDN gated norm with rotate + per-TOKEN quant in one launch and hand the
+GEMM (A, AS) directly. RADIANCE_PQ_ROT_STREAM=1/ROT_STREAM2=1 turn it on (launcher defaults).
 """
 import os
 import re
@@ -50,6 +52,11 @@ GROUP, KROT_MAX, MXBLOCK = _pq.GROUP, _pq.KROT_MAX, 32
 _ca = os.environ.get("RADIANCE_PQM_CHECKALL", "").strip()
 CHECK_ALL = ({tuple(int(v) for v in p.split(":")) for p in _ca.split(",") if p} if _ca else None)
 CHECK_MAX_M = int(os.environ.get("RADIANCE_PQM_CHECK_MAX_M", "128"))
+# Single-launch rotate + per-token quant for the non-tiled path (default on).
+FUSED_TOKQ = os.environ.get("RADIANCE_PQM_FUSED_TOKQ", "1") == "1"
+# One GEMM launch per merged linear (partition select by n-block in the kernel) instead of one per
+# rotated partition plus an output cat (default on; 0 = the per-partition loop, kept for A/Bs).
+SINGLE_LAUNCH = os.environ.get("RADIANCE_PQM_SINGLE_LAUNCH", "1") == "1"
 _checked: set = set()
 
 
@@ -77,7 +84,7 @@ def _partitions(N: int, pb1: int, pb2: int):
     return [(bounds[i], bounds[i + 1]) for i in range(3) if bounds[i + 1] > bounds[i]]
 
 
-def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
+def _linear_impl(x2, weight, ws_t, wref, rec, cs, pb1, pb2, pre=None):
     """Whole dispatch, opaque to dynamo (a data-dependent M branch in apply() would split the
     compiled graph at every linear)."""
     N, K = weight.shape[0], weight.shape[1] * 2
@@ -87,27 +94,74 @@ def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
     _pq._ensure_scratch(x2.device)
     stream = torch.cuda.current_stream().cuda_stream
 
-    # pass A: channel-scale + rotate (all P partitions in one launch), bf16 out
-    xr = torch.empty((P, M, K), device=x2.device, dtype=torch.bfloat16)
-    asg = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
-    rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
-    _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
-                             asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
-    # pass C: per-token e4m3 codes + per-token dequant scale (the MXFP4 kernel's x contract).
-    # Tiled above the MXFP4 kernel's A-tiled threshold: 16-row-padded fragment layout, identical
-    # for both kernels, registered so mxfp4_linear_pq dispatches its tiled GEMM.
     tiled = bool(_mx.A_TILED_MIN_M) and M >= _mx.A_TILED_MIN_M
-    Mt = (M + 15) // 16
-    a_codes = torch.empty((P, Mt * 16 * K) if tiled else (P, M, K), device=x2.device,
-                          dtype=torch.uint8)
-    as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
-    _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(), as_tok.data_ptr(),
-                            rs.data_ptr(), M, K, P, stream, 1 if tiled else 0)
+    if pre is not None and not tiled:
+        # rotation stream: the producer (pqm_add_rms_rot / pqm_ew_rot) already rotated + token-
+        # quantized this linear's input; x2 (hs) is only consulted above the tiled threshold
+        a_codes, as_tok = pre
+        if a_codes.shape[0] != P:
+            raise RuntimeError(f"paroquant_mxfp4: pre-quantized tuple has {a_codes.shape[0]} "
+                               f"partition(s), layer has {P} -- a producer was hooked to the wrong linear")
+        as_tok = as_tok.contiguous()
+    elif tiled:
+        as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
+        # prefill: pass A (rotate, bf16 out) then pass C writing the fragment-tiled layout the
+        # MXFP4 A-tiled GEMM reads (identical for both kernels), registered for dispatch below
+        xr = torch.empty((P, M, K), device=x2.device, dtype=torch.bfloat16)
+        asg = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+        rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+        _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
+                                 asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
+        Mt = (M + 15) // 16
+        a_codes = torch.empty((P, Mt * 16 * K), device=x2.device, dtype=torch.uint8)
+        _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
+                                as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream, 1)
+    else:
+        as_tok = torch.empty((P, M), device=x2.device, dtype=torch.float32)
+        # decode band and row-major prefill: ONE launch does channel-scale + rotate + token amax
+        # + e4m3 encode, bit-identical to pass A + pass C (par_harness tokq). Saves a launch and
+        # the HBM round trip of the rotated row per linear; RADIANCE_PQM_FUSED_TOKQ=0 falls back.
+        a_codes = torch.empty((P, M, K), device=x2.device, dtype=torch.uint8)
+        if FUSED_TOKQ:
+            _pqk.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
+                                        a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot, stream)
+        else:
+            xr = torch.empty((P, M, K), device=x2.device, dtype=torch.bfloat16)
+            asg = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+            rs = torch.empty((P, M, G), device=x2.device, dtype=torch.float32)
+            _pqk.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
+                                     asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
+            _pqk.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
+                                    as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream, 0)
 
-    out = torch.empty((M, N), device=x2.device, dtype=torch.bfloat16)
+    if SINGLE_LAUNCH:
+        # one GEMM launch over the whole N: partition p's n-blocks read rotated copy p of A
+        # (radiance_mxfp4_fp8 launch_p). Merged linears (qkv P=3, gate_up / in_proj P=2) thus cost
+        # one launch and no output concatenation; boundaries are 128-aligned (loader-checked).
+        if tiled:
+            _mx.a_tiled_register(a_codes, M, K)
+        out = torch.ops.radiance.mxfp4_linear_pqp(a_codes, as_tok, weight, ws_t, wref, M, pb1, pb2)
+        if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M:
+            for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
+                if (N, K, M, p) in _checked:
+                    continue
+                _checked.add((N, K, M, p))
+                x_rm = _pq.untile_a(a_codes, P, M, K)[p] if tiled else a_codes[p]
+                ws_p = ws_t[:, n0:n1].contiguous()
+                ref = _mx._exact_ref(x_rm.view(torch.float8_e4m3fn), as_tok[p].view(M, 1),
+                                     weight[n0:n1], ws_p, n1 - n0, K)
+                y = out[:, n0:n1]
+                num = (y.float() - ref.float()).pow(2).sum().sqrt()
+                den = ref.float().pow(2).sum().sqrt()
+                verdict = "zero-input" if float(den) < 1e-20 else f"rel={float(num / den.clamp_min(1e-30)):.5f}"
+                sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} part={p} "
+                                 f"path={'tiled' if tiled else 'rowmajor'}+single"
+                                 f"{'+pre' if pre is not None and not tiled else ''} {verdict}\n")
+        return out
+    ys = []
     for p, (n0, n1) in enumerate(_partitions(N, pb1, pb2)):
         w_p = weight[n0:n1]                                              # rows: contiguous
-        ws_p = ws_cat[G32 * n0: G32 * n1].view(G32, n1 - n0)             # pre-split at load
+        ws_p = ws_t[:, n0:n1].contiguous()      # A/B path only: a column slice is not contiguous
         if tiled:
             # an [M, K] view over the padded tiled storage: the kernel reads by data_ptr and its
             # own tiled addressing; the shape only carries M (see mxfp4_linear_pq)
@@ -116,7 +170,7 @@ def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
         else:
             x_p = a_codes[p]
         y = torch.ops.radiance.mxfp4_linear_pq(x_p, as_tok[p], w_p, ws_p, wref[n0:n1])
-        out[:, n0:n1] = y
+        ys.append(y)
         if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
                 and (N, K, M, p) not in _checked:
             _checked.add((N, K, M, p))
@@ -132,22 +186,139 @@ def _linear_impl(x2, weight, ws_cat, wref, rec, cs, pb1, pb2):
             # which proves nothing. Say so instead of looking like a pass.
             verdict = "zero-input" if float(den) < 1e-20 else f"rel={float(num / den.clamp_min(1e-30)):.5f}"
             sys.stderr.write(f"[radiance.paroquant_mxfp4] CHECKALL N={N} K={K} M={M} P={P} "
-                             f"part={p} path={'tiled' if tiled else 'rowmajor'} {verdict}\n")
-    return out
+                             f"part={p} path={'tiled' if tiled else 'rowmajor'}"
+                             f"{'+pre' if pre is not None and not tiled else ''} {verdict}\n")
+    # one output tensor per linear: the single-partition case IS the GEMM output (no copy), merged
+    # linears pay one cat instead of P slice copies
+    return ys[0] if len(ys) == 1 else torch.cat(ys, dim=1)
 
 
 @torch.library.custom_op("radiance::paroquant_mxfp4_linear", mutates_args=())
-def paroquant_mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, ws_cat: torch.Tensor,
+def paroquant_mxfp4_linear(x: torch.Tensor, weight: torch.Tensor, ws_t: torch.Tensor,
                            wref: torch.Tensor, rec: torch.Tensor, cs: torch.Tensor,
                            pb1: int, pb2: int) -> torch.Tensor:
     K = weight.shape[1] * 2
-    out = _linear_impl(x.reshape(-1, K), weight, ws_cat, wref, rec, cs, pb1, pb2)
+    out = _linear_impl(x.reshape(-1, K), weight, ws_t, wref, rec, cs, pb1, pb2)
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
 @paroquant_mxfp4_linear.register_fake
-def _(x, weight, ws_cat, wref, rec, cs, pb1, pb2):
+def _(x, weight, ws_t, wref, rec, cs, pb1, pb2):
     return torch.empty((*x.shape[:-1], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("radiance::paroquant_mxfp4_linear_pre", mutates_args=())
+def paroquant_mxfp4_linear_pre(hs: torch.Tensor, a: torch.Tensor, as_tok: torch.Tensor,
+                               weight: torch.Tensor, ws_t: torch.Tensor, wref: torch.Tensor,
+                               rec: torch.Tensor, cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
+    """Linear on the per-token rotation-stream tuple: (A [P, M, K], AS [P, M]) from a pqm_*
+    producer below the tiled threshold; hs (bf16) for the tiled prefill path above it."""
+    K = weight.shape[1] * 2
+    out = _linear_impl(hs.reshape(-1, K), weight, ws_t, wref, rec, cs, pb1, pb2, pre=(a, as_tok))
+    return out.view(*hs.shape[:-1], weight.shape[0])
+
+
+@paroquant_mxfp4_linear_pre.register_fake
+def _(hs, a, as_tok, weight, ws_t, wref, rec, cs, pb1, pb2):
+    return torch.empty((*hs.shape[:-1], weight.shape[0]), device=hs.device, dtype=torch.bfloat16)
+
+
+def _stream_fused(M: int) -> bool:
+    """The per-token producers quantize for the row-major GEMM; above the A-tiled threshold the
+    consumer needs the fragment-tiled layout and recomputes from hs instead."""
+    return not (bool(_mx.A_TILED_MIN_M) and M >= _mx.A_TILED_MIN_M)
+
+
+@torch.library.custom_op("radiance::pqm_add_rms_rot", mutates_args=())
+def pqm_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+                    rec: torch.Tensor, cs: torch.Tensor
+                    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Residual add + Gemma RMSNorm + rotate + per-TOKEN e4m3 quant for the MXFP4 consumer ->
+    (hs, residual_out, A [P, M, K], AS [P, M]). Above the tiled threshold the plain norm kernel
+    runs and A/AS are allocated but untouched (the consumer recomputes from hs)."""
+    y2 = y.reshape(-1, y.shape[-1])
+    M, K = y2.shape
+    P = rec.shape[0]
+    res = residual.reshape(M, K)
+    if not res.is_contiguous():
+        res = res.contiguous()
+    if not y2.is_contiguous():
+        y2 = y2.contiguous()
+    hs = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
+    ro = torch.empty((M, K), device=y.device, dtype=torch.bfloat16)
+    a = torch.empty((P, M, K), device=y.device, dtype=torch.uint8)
+    as_tok = torch.empty((P, M), device=y.device, dtype=torch.float32)
+    stream = torch.cuda.current_stream().cuda_stream
+    if _stream_fused(M):
+        _pqk.launch_add_rms_rot_tok(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+                                    rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
+                                    a.data_ptr(), as_tok.data_ptr(), M, K, P, rec.shape[1], stream)
+    else:
+        G = K // GROUP
+        asg = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
+        rs = torch.empty((P, M, G), device=y.device, dtype=torch.float32)
+        _pqk.launch_add_rms_rot(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
+                                rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
+                                a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
+                                0, stream)
+    return hs.view(y.shape), ro.view(residual.shape), a, as_tok
+
+
+@pqm_add_rms_rot.register_fake
+def _(y, residual, weight, eps, rec, cs):
+    K = y.shape[-1]
+    M = y.numel() // K
+    P = rec.shape[0]
+    return (torch.empty(y.shape, device=y.device, dtype=torch.bfloat16),
+            torch.empty(residual.shape, device=y.device, dtype=torch.bfloat16),
+            torch.empty((P, M, K), device=y.device, dtype=torch.uint8),
+            torch.empty((P, M), device=y.device, dtype=torch.float32))
+
+
+@torch.library.custom_op("radiance::pqm_ew_rot", mutates_args=())
+def pqm_ew_rot(mode: int, x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, eps: float,
+               rec: torch.Tensor, cs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Producer + rotate + per-token quant for the single-partition sites: mode 0 silu-mul
+    (x = gate_up [M, 2N]), mode 1 attention gate (x * sigmoid(y)), mode 2 GDN gated rmsnorm
+    (x, z = y, w [128]). Returns (hs, A [1, M, N], AS [1, M])."""
+    x2 = x.reshape(-1, x.shape[-1])
+    M = x2.shape[0]
+    N = x2.shape[1] // 2 if mode == 0 else x2.shape[1]
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    if mode == 0:
+        y2, ys = x2, 0
+    else:
+        y2 = y.reshape(M, -1)
+        if y2.stride(-1) != 1 or (y2.stride(0) & 7):
+            y2 = y2.contiguous()
+        ys = y2.stride(0)
+    hs = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    a = torch.empty((1, M, N), device=x.device, dtype=torch.uint8)
+    as_tok = torch.empty((1, M), device=x.device, dtype=torch.float32)
+    stream = torch.cuda.current_stream().cuda_stream
+    if _stream_fused(M):
+        _pqk.launch_ew_rot_tok(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
+                               rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
+                               as_tok.data_ptr(), M, N, rec.shape[1], stream)
+    else:
+        G = N // GROUP
+        asg = torch.empty((1, M, G), device=x.device, dtype=torch.float32)
+        rs = torch.empty((1, M, G), device=x.device, dtype=torch.float32)
+        _pqk.launch_ew_rot(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
+                           rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
+                           asg.data_ptr(), rs.data_ptr(), M, N, rec.shape[1], 0, stream)
+    return hs, a, as_tok
+
+
+@pqm_ew_rot.register_fake
+def _(mode, x, y, w, eps, rec, cs):
+    Kx = x.shape[-1]
+    M = x.numel() // Kx
+    N = Kx // 2 if mode == 0 else Kx
+    return (torch.empty((M, N), device=x.device, dtype=torch.bfloat16),
+            torch.empty((1, M, N), device=x.device, dtype=torch.uint8),
+            torch.empty((1, M), device=x.device, dtype=torch.float32))
 
 
 @register_quantization_config("paroquant_mxfp4")
@@ -289,10 +460,8 @@ class ParoQuantMXFP4LinearMethod(LinearMethodBase):
         # ---- MXFP4 weight, prepared exactly as the MXFP4 kernel class prepares AMD's ----
         ws_t = layer.weight_scale.data.T.contiguous()                    # [K/32, N]
         wref = _mx.make_row_ref(ws_t)                                    # [N] e8m0 row max
-        # Per-partition contiguous scale slabs, concatenated: the GEMM runs once per distinct
-        # rotation on an N-slice, and a column slice of [K/32, N] is not contiguous.
-        parts = _partitions(N, layer.pq_pb1, layer.pq_pb2)
-        ws_cat = torch.cat([ws_t[:, n0:n1].contiguous().reshape(-1) for n0, n1 in parts])
+        # the full [K/32, N] is what the single-launch GEMM reads (partition select in-kernel);
+        # the per-partition A/B loop slices it on the fly
         w = layer.weight.data
         if _mx.WPERM:
             if N % 16 or K % 16:
@@ -301,18 +470,39 @@ class ParoQuantMXFP4LinearMethod(LinearMethodBase):
 
         del layer.weight, layer.weight_scale, layer.theta, layer.pairs, layer.channel_scales
         layer.weight = torch.nn.Parameter(w.contiguous(), requires_grad=False)
-        layer.ws_cat = torch.nn.Parameter(ws_cat.contiguous(), requires_grad=False)
+        layer.ws_t = torch.nn.Parameter(ws_t, requires_grad=False)          # full [K/32, N]
+        for b in (layer.pq_pb1, layer.pq_pb2):
+            if b < N and b % 128:
+                raise RuntimeError(f"paroquant_mxfp4: partition boundary {b} not 128-aligned (N={N})")
         layer.wref = torch.nn.Parameter(wref, requires_grad=False)
         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
 
+    # rotation stream (radiance_paroquant.install_stream): the norm / silu-mul / gate / gdn-norm
+    # producers of THIS method build the per-token tuple (hs, A, AS) its GEMM consumes
+    pq_stream_capable = True
+    pq_ar_capable = False
+
+    @staticmethod
+    def stream_norm(y, residual, weight, eps, cons):
+        hs, ro, a, as_tok = torch.ops.radiance.pqm_add_rms_rot(y, residual, weight, eps, cons.rec, cons.cs)
+        return hs, ro, (a, as_tok)
+
+    @staticmethod
+    def stream_ew(mode, x, y, w, eps, cons):
+        hs, a, as_tok = torch.ops.radiance.pqm_ew_rot(mode, x, y, w, eps, cons.rec, cons.cs)
+        return hs, (a, as_tok)
+
     def apply(self, layer, x, bias: torch.Tensor | None = None) -> torch.Tensor:
-        if isinstance(x, tuple):
-            raise RuntimeError("paroquant_mxfp4 v1 does not take the rotation-stream tuple; "
-                               "serve with RADIANCE_PQ_ROT_STREAM=0")
-        out = torch.ops.radiance.paroquant_mxfp4_linear(x, layer.weight, layer.ws_cat, layer.wref,
-                                                        layer.rec, layer.cs, layer.pq_pb1,
-                                                        layer.pq_pb2)
+        if isinstance(x, tuple):          # rotation stream: (hs, A, AS)
+            hs, a, as_tok = x
+            out = torch.ops.radiance.paroquant_mxfp4_linear_pre(hs, a, as_tok, layer.weight,
+                                                                layer.ws_t, layer.wref, layer.rec,
+                                                                layer.cs, layer.pq_pb1, layer.pq_pb2)
+        else:
+            out = torch.ops.radiance.paroquant_mxfp4_linear(x, layer.weight, layer.ws_t, layer.wref,
+                                                            layer.rec, layer.cs, layer.pq_pb1,
+                                                            layer.pq_pb2)
         if bias is not None:
             out = out + bias
         return out
@@ -320,5 +510,6 @@ class ParoQuantMXFP4LinearMethod(LinearMethodBase):
 
 if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
     sys.stderr.write("[radiance.paroquant_mxfp4] registered (e2m1+e8m0/32 weights, z-lab rotations, "
-                     f"per-token W4A8 -> MXFP4 GEMM; WPERM={'on' if _mx.WPERM else 'off'}, "
+                     f"per-token W4A8 -> MXFP4 GEMM; fused prologue {'on' if FUSED_TOKQ else 'off'}, single launch {'on' if SINGLE_LAUNCH else 'off'}, "
+                     f"rot stream {'on' if _pq.ROT_STREAM else 'off'}{'+2' if _pq.ROT_STREAM2 else ''}, WPERM={'on' if _mx.WPERM else 'off'}, "
                      f"decode band M<={_mx.DECODE_MAX_M})\n")
