@@ -254,7 +254,7 @@ def evaluate(model, embed, head, files, tag):
 
 
 # ------------------------------------------------------------------ main
-files = sorted(glob.glob(os.path.join(args.capture, "*.pt")))
+files = sorted(f for f in glob.glob(os.path.join(args.capture, "*.pt")) if os.path.getsize(f) > (args.min_ctx + 16) * 25700)  # drop warmup/short captures
 if args.max_files: files = files[: args.max_files]
 random.Random(args.seed).shuffle(files)
 val_files, train_files = files[: args.val], files[args.val:]
@@ -274,7 +274,8 @@ evaluate(model, embed, head, val_files, "before")
 if args.eval_only: sys.exit(0)
 
 # CPU fp32 master + AdamW (offloaded optimizer); GPU keeps bf16 params/grads
-master = [q.detach().float().cpu().pin_memory().requires_grad_(True) for _, q in trainable]
+def _pin(t): return t.pin_memory() if dev.type == "cuda" else t
+master = [_pin(q.detach().float().cpu()).requires_grad_(True) for _, q in trainable]
 opt = torch.optim.AdamW(master, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0, foreach=True)
 steps_per_epoch = math.ceil(len(train_files) / args.seqs); total = int(steps_per_epoch * args.epochs)
 warm = max(1, int(total * args.warmup))

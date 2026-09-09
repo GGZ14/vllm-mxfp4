@@ -432,3 +432,41 @@ at M>=40 it loses 5-20%. So the remaining producer cost at W=32 is not chain lat
 phase structure the per-token scale forces (row pass -> barrier -> chains -> barrier -> LDS re-read
 + encode) against the int4 producer's single register-resident pass. ~2-2.5 us x 256 sites =
 ~0.5 ms/step; parked.
+
+## 2026-09-09: DFlash2 drafter fine-tuned on the MXFP4-PARO target (self-distillation)
+
+The remaining decode gap to int4 PARO is acceptance, not step time. No public DFlash2 training code
+exists (z-lab's repo is inference-only), so the loop was written against vLLM's own forward
+(`paroquant/drafter/train_drafter.py`), validated by reproducing the original drafter's per-position
+top-1 on real captures. Recipe (DFlash paper): CE on the 7 mask positions weighted exp(-(k-1)/4),
+random anchors per sequence, target embed / lm_head and the candidate selector frozen, fp32 master
++ AdamW offloaded to the CPU (1.8B trainable params on one R9700, 7 s/step).
+
+Data: 2,400 prompts (1,200 ultrachat_200k, 700 CodeAlpaca, 500 GSM8K-train) answered by the served
+MXFP4-PARO target (prod sampling, reasoning on, <=1024 tokens), captured in-serve by
+`radiance_dflash_capture.py` (aux hidden states of layers 5/19/33/47/61 as e4m3 + per-token scale,
+rejected draft slots trimmed): 2,410 sequences, 1.62M completion tokens, 44 GB. 2 epochs, lr 5e-5.
+
+Held-out proxy (96 seqs, prefix-expected accepted/block): **1.979 -> 2.041** (+3.1%); weighted CE
+2.00 -> 1.71; top-1 by position 0.807/0.687/0.586/0.523/0.462/0.415/0.372 ->
+0.819/0.693/0.597/0.532/0.472/0.420/0.380. The proxy's 1.98 matched the served 1.84-1.90 acc/draft.
+
+Served A/B, same prod config (SPEC=7, TP=2), FP8 block-128 export of the fine-tune vs tcclaviger's:
+
+| | old drafter | **fine-tuned** |
+|---|---|---|
+| bench_decode_ctx acc/draft @ctx25 / 8k / 32k | 1.844 / 1.844 / 1.703 | **2.053 / 2.077 / 1.985** (+11 / +13 / +17%) |
+| single-stream decode tok/s @ctx25 / 8k / 32k | 116.2 / 109.4 / 100.9 | **125.0 / 118.0 / 111.2** (+8 / +8 / +10%) |
+| ms/step | 24.47 / 26.00 / 26.78 | 24.42 / 26.07 / 26.84 (unchanged) |
+| BetterBench combined (single pass) | 207.5 | 209.2 (+0.8%) |
+| BB by category: chat / code / json / math | 101 / 214 / 231 / 240 | **104 / 222 / 257 / 255** |
+| BB by category: file_edit / prose / reasoning / summarization | 217 / 105 / 242 / 227 | 205 / 104 / 237 / 208 |
+| GSM8K 500q | 97.60 | 97.60 |
+
+Reading: acceptance rose where the training mix has coverage (chat, code, json, math) and slipped on
+the categories it does not (summarization, file_edit, long reasoning prompts). Output quality is
+unchanged (lossless drafting; GSM8K identical). The overnight gate's bar was +2% BetterBench
+combined, so prod was restored with the OLD drafter pending a decision. The fine-tuned drafter is at
+`~/models/Qwen3.8-27B-DFlash2-FP8-paro` (bf16 at `~/drafter_ft/ft_bf16`); serve it with
+`DRAFTER=Qwen3.8-27B-DFlash2-FP8-paro`. Next round, if wanted: widen the prompt mix to summarization
+/ file-edit / long-document prompts and raise the lr (5e-5 barely moved top-1 in 1,154 steps).
