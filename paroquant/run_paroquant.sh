@@ -26,6 +26,10 @@
 # MODE=prod           : full config -- DFlash2 FP8 drafter (SPEC tokens configurable), 262K ctx,
 #                       compiled graphs.
 #
+# Env knobs this script reads (the rest are passed through to the container unchanged):
+#   RUNTIME=podman|docker   container runtime; auto-detected, podman preferred
+#   MAXLEN= MAXSEQS=        --max-model-len / --max-num-seqs, in BOTH modes (defaults per mode)
+#
 # Port 8080 is prod's port and both need both GPUs: stop production first
 #   systemctl --user stop qwen_vllm_38        restore with: vllm-switch 38
 #
@@ -41,6 +45,34 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PATCHES_DIR="$(realpath -m "${PATCHES:-$SCRIPT_DIR/..}")"
 MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
 HF_CACHE="$(realpath -m "${HF_CACHE:-$HOME/.cache/huggingface}")"
+
+# ---------------------------------------------------------------- container runtime
+# Same three differences serve-mxfp4.sh handles, and only these: `--replace` is podman-only,
+# `--group-add keep-groups` is podman-only (docker wants numeric render/video GIDs), and docker
+# needs the stale container removed by hand. Every other flag below is identical on both.
+RUNTIME=${RUNTIME:-}
+if [ -z "$RUNTIME" ]; then
+  if   command -v podman >/dev/null 2>&1; then RUNTIME=podman
+  elif command -v docker >/dev/null 2>&1; then RUNTIME=docker
+  else echo "no container runtime found: install podman (preferred) or docker" >&2; exit 1
+  fi
+fi
+command -v "$RUNTIME" >/dev/null 2>&1 || { echo "RUNTIME=$RUNTIME is not on PATH" >&2; exit 1; }
+
+RT_FLAGS=()
+GROUP_FLAGS=()
+if [ "$RUNTIME" = podman ]; then
+  RT_FLAGS+=(--replace)
+  GROUP_FLAGS+=(--group-add keep-groups)
+else
+  # keep-groups has no docker equivalent: pass the GIDs of the GPU device nodes by number. They
+  # only matter if --privileged is ever dropped, but a missing group is a permission denial from
+  # inside a TP worker, which is a much worse place to find it.
+  for g in render video; do
+    gid=$(getent group "$g" 2>/dev/null | cut -d: -f3) || true
+    if [ -n "$gid" ]; then GROUP_FLAGS+=(--group-add "$gid"); fi
+  done
+fi
 
 MODE=${MODE:-eval}
 PORT=${PORT:-8080}
@@ -61,7 +93,15 @@ PROFILE=${PROFILE:-0}                          # 1: arm the torch profiler (trac
 ASYNC=${ASYNC:-0}
 if [ "$ASYNC" = 1 ]; then ASYNC_FLAG="--async-scheduling"; UNPAD=false; else ASYNC_FLAG="--no-async-scheduling"; UNPAD=true; fi
 CHUNK=${CHUNK:-8192} # prod prefill chunk (--max-num-batched-tokens); sweep knob
-MAXLEN=${MAXLEN:-262144}; MAXSEQS=${MAXSEQS:-8}   # prod context / concurrency; a TP=1 serve on one 32 GB card needs MAXLEN <= 65536
+# Context length and concurrency, overridable in BOTH modes. The defaults differ because the modes
+# do: prod is the shipped serving config, eval boots short so a CHECKALL gate fits on one card.
+# MAXLEN_EVAL is the old name for the eval default and still wins over it (ab_prefill_tp1.sh).
+# A TP=1 serve on one 32 GB card needs MAXLEN <= 65536.
+if [ "$MODE" = eval ]; then
+  MAXLEN=${MAXLEN:-${MAXLEN_EVAL:-32768}}; MAXSEQS=${MAXSEQS:-8}
+else
+  MAXLEN=${MAXLEN:-262144}; MAXSEQS=${MAXSEQS:-8}
+fi
 GPU_UTIL=${GPU_UTIL:-0.92}
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
 # also zeroes the cudagraph pad rows. The AutoRound int4 serve (same bf16-input linear contract)
@@ -104,7 +144,6 @@ mkdir -p "$CACHE"
 MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
 MODEL=/models/$MODEL_DIR
 [ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
-MAXLEN_EVAL=${MAXLEN_EVAL:-32768}
 # TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
 TP=${TP:-2}
 GPUS=${GPUS:-0,1}
@@ -119,14 +158,14 @@ MEM_ARGS=(); [ -n "$MEM_LIMIT" ] && MEM_ARGS=(--memory "$MEM_LIMIT")
 CAPTURE_MOUNT=(); if [ -n "$CAPTURE_DIR" ]; then mkdir -p "$CAPTURE_DIR"; CAPTURE_MOUNT=(-v "$CAPTURE_DIR:/capture:z"); fi
 
 if [ "$MODE" = eval ]; then
-  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN_EVAL" --max-num-seqs 8
+  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS"
               --max-num-batched-tokens 8192)
   # Per-rank quantized shapes: qkv, o, gate_up, down, in_proj(+merge), out_proj
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
   SPEC_ARGS=()
 else
   PROF_ARGS=(); [ "$PROFILE" = 1 ] && PROF_ARGS=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false); [ "$PROFILE" = 1 ] && mkdir -p "$CACHE/prof"
-  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "${MAXLEN:-262144}" --max-num-seqs "${MAXSEQS:-8}" --max-num-batched-tokens "${CHUNK:-8192}"
+  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-num-batched-tokens "$CHUNK"
               $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
@@ -135,8 +174,11 @@ else
     "{\"method\":\"dflash\",\"model\":\"/models/${DRAFTER}\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":${UNPAD},\"draft_sample_method\":\"greedy\"}")
 fi
 
-exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
-  --device /dev/kfd --device /dev/dri --group-add keep-groups \
+# podman --replace does this itself; docker refuses the name while a stale container holds it.
+if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
+
+exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
+  --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
   -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$HIP_IDX" \
   -e HF_HUB_OFFLINE=1 \
@@ -161,7 +203,6 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_MXFP4_W4A8="${RADIANCE_MXFP4_W4A8:-1}" -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
   -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-1}" -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
   -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
-  -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_PQ_CHECKALL="$CHECKALL" \
   -e RADIANCE_PQM_CHECKALL="${RADIANCE_PQM_CHECKALL:-$CHECKALL}" \
@@ -231,7 +272,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     cp /patches/radiance_dflash_capture.py "$SP"/ 2>/dev/null || cp ../radiance_dflash_capture.py "$SP"/
     # NB: appended to the STDLIB sitecustomize, not written to site-packages -- Ubuntu ships
     # /usr/lib/python3.12/sitecustomize.py and it shadows any site-packages one, so a file
-    # dropped there is silently never imported. Each podman run starts from the pristine image,
+    # dropped there is silently never imported. Each container run starts from the pristine image,
     # so the append does not accumulate.
     printf "%s\n" \
       "try:" \
