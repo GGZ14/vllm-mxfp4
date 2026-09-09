@@ -50,6 +50,9 @@ NAME=${NAME:-vllmparo}
 # with the prod ids so clients like the Pi (model id Qwen3.6) work unchanged.
 SERVED_NAMES=${SERVED_NAMES:-Qwen3.8-PARO}
 SPEC=${SPEC:-5}      # dflash re-sweep 2026-08: 5 beats 7 by 8-13% aggregate on this stack
+DRAFTER=${DRAFTER:-Qwen3.8-27B-DFlash2-FP8}   # DFlash2 drafter dir under $MODELS
+PREFIX_CACHE=${PREFIX_CACHE:-1}                # 0 for a drafter-capture serve (cached prefixes yield no hidden states)
+CAPTURE_DIR=${CAPTURE_DIR:-}                   # host dir: record drafter training data (radiance_dflash_capture.py)
 CHUNK=${CHUNK:-8192} # prod prefill chunk (--max-num-batched-tokens); sweep knob
 GPU_UTIL=${GPU_UTIL:-0.92}
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
@@ -105,6 +108,7 @@ HIP_IDX=$(seq -s, 0 $(( $(tr -cd , <<<"$GPUS" | wc -c) )))
 # a job that owns most of the host's RAM: the server OOMs itself instead of starving the job.
 MEM_LIMIT=${MEM_LIMIT:-}
 MEM_ARGS=(); [ -n "$MEM_LIMIT" ] && MEM_ARGS=(--memory "$MEM_LIMIT")
+CAPTURE_MOUNT=(); if [ -n "$CAPTURE_DIR" ]; then mkdir -p "$CAPTURE_DIR"; CAPTURE_MOUNT=(-v "$CAPTURE_DIR:/capture:z"); fi
 
 if [ "$MODE" = eval ]; then
   EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN_EVAL" --max-num-seqs 8
@@ -114,12 +118,12 @@ if [ "$MODE" = eval ]; then
   SPEC_ARGS=()
 else
   EXTRA_ARGS=(--max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "${CHUNK:-8192}"
-              --enable-prefix-caching
+              $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
   CHECKALL=${CHECKALL:-}
   SPEC_ARGS=(--speculative-config
-    "{\"method\":\"dflash\",\"model\":\"/models/Qwen3.8-27B-DFlash2-FP8\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true,\"draft_sample_method\":\"greedy\"}")
+    "{\"method\":\"dflash\",\"model\":\"/models/${DRAFTER}\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true,\"draft_sample_method\":\"greedy\"}")
 fi
 
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
@@ -134,6 +138,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e NCCL_PROTO=Simple \
   -e RADIANCE_USE_R4D=1 -e RADIANCE_USE_R4D_AR=1 -e RADIANCE_USE_R4D_AR_QUANT=1 \
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB=86016 \
+  -e RADIANCE_DFLASH_CAPTURE_DIR="${CAPTURE_DIR:+/capture}" "${CAPTURE_MOUNT[@]}" \
   -e RADIANCE_PRESHUFFLE=1 -e RADIANCE_FUSE_RMS_QUANT=1 \
   -e R4D_ATTN_FP8=3 \
   -e RADIANCE_GDN_FUSED_UPDATE="$GDN_FUSED" -e RADIANCE_GDN_MERGE_INPROJ=0 \
@@ -210,6 +215,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so
     cp radiance_paroquant.py radiance_paroquant_mxfp4.py "$SP"/
+    cp /patches/radiance_dflash_capture.py "$SP"/ 2>/dev/null || cp ../radiance_dflash_capture.py "$SP"/
     # NB: appended to the STDLIB sitecustomize, not written to site-packages -- Ubuntu ships
     # /usr/lib/python3.12/sitecustomize.py and it shadows any site-packages one, so a file
     # dropped there is silently never imported. Each podman run starts from the pristine image,
@@ -218,6 +224,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
       "try:" \
       "    import radiance_paroquant  # registers the paroquant quantization config" \
       "    import radiance_paroquant_mxfp4  # and the MXFP4-weights variant (paroquant_mxfp4)" \
+      "    import radiance_dflash_capture  # drafter training-data capture (inert unless RADIANCE_DFLASH_CAPTURE_DIR)" \
       "except Exception as e:" \
       "    import sys" \
       "    sys.stderr.write(\"[radiance.paroquant] registration failed: %r\\n\" % (e,))" \
