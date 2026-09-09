@@ -363,6 +363,7 @@ and an output copy per partition. hipGraph hides CPU cost, not kernel count.
 | + per-token stream producers (`pq_add_rms_rot_tok`, `pq_ew_rot_tok<0/1/2>`) | 26.29 / 27.51 / 28.34 | 200.3 | 97.40 |
 | + single-launch merged GEMM (partition select in-kernel) | **24.53 / 25.89 / 26.80** | 203.4 | 97.40 |
 | + scale slabs dropped, `GPU_UTIL=0.95` (shipped) | 24.71 / 25.98 / 26.96 | -- | KV 862k tokens |
+| + fused TILED prologue for the A-tiled band (shipped) | 24.53 / 26.43 / 26.97 | -- | prefill +5-9%, see below |
 
 Each step is gated bit-identical to the path it replaced (`par_harness --bench2 tokq` and
 `tokstream`: 54 + 45 shapes, codes / scales / hs / residual byte-exact) and output-identical at the
@@ -390,10 +391,13 @@ million outputs (rel 3e-8 .. 4e-6), the same class as any split-K change.
   per-step linear cost from 10.9 to **9.2 ms** (int4: 12.7): qkv P=3 51.7 -> 28.6 us, gate_up 67 -> 59,
   in_proj 40 -> 30; the P=1 sites also lost their output copy (27 -> 23 us).
 
-Prod prefill (BetterBench prefill sweep, single pass, final build): **4376/4449/4423/4291/4068 PP t/s** at
-2k/8k/16k/32k/64k vs int4 PARO's 3782/3700/3725/3621/3450 (+16%/+20%/+19%/+18%/+18%) -- above the +6-10% of the
-TP=1 eager kernel A/B because the stream producers and the single merged-linear launch take
-launches out of the prefill step too.
+Prod prefill (BetterBench prefill sweep, single pass): the single-launch build measured
+4376/4449/4423/4291/4068 PP t/s at 2k/8k/16k/32k/64k; the **fused tiled prologue** (one workgroup per
+row writes the fragment-tiled A directly, `pq_rotate_tokquant<W, TILED>`, byte-exact vs pass A +
+tiled pass C and 1.3-1.4x faster at M>=600) took it to **4770/4827/4649/4495/4273** (+9%/+8%/+5%/+5%/+5%), which is
++26%/+30%/+25%/+24%/+24% over int4 PARO's 3782/3700/3725/3621/3450. The stream producers emit the tiled tuple in
+that band too, so an A-tiled linear now runs zero prologue launches. Two-chain interleaving in the
+per-token producers was built and measured neutral at the wave counts in use (kept dark, `IL`).
 
 Where it stands: step time at parity with int4 PARO; combined BetterBench 203 vs 226 on a single pass
 (tokens per update trail on prose / file_edit, step time does not -- acceptance on this checkpoint,
