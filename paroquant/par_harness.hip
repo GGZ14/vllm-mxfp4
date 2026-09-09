@@ -10,6 +10,7 @@
 #include "par_kernels.h"
 
 #include <vector>
+#include <array>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -653,6 +654,34 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
       }
     }
     printf("tokqt: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
+  }
+
+  if (what == "skinny" || what == "all") {
+    int fails = 0; std::mt19937 rng(99u); std::normal_distribution<float> nd(0.f, 1.0f);
+    for (auto shp : std::vector<std::array<int, 3>>{{8, 48, 5120}, {6, 96, 5120}, {64, 48, 5120}, {8, 256, 5120}, {8, 1280, 5120}, {64, 1280, 5120}, {16, 96, 5120}}) {
+      const int M = shp[0], N = shp[1], K = shp[2], KS = K / PQ_SK_KCH;
+      std::vector<unsigned short> Xh((size_t)M * K), Wh((size_t)N * K); std::vector<float> Xf(Xh.size()), Wf(Wh.size());
+      auto fill = [&](std::vector<unsigned short> &h, std::vector<float> &f) { for (size_t i = 0; i < h.size(); ++i) { float v = nd(rng); unsigned int u; memcpy(&u, &v, 4); h[i] = (unsigned short)(u >> 16); unsigned int b = (unsigned int)h[i] << 16; memcpy(&f[i], &b, 4); } };
+      fill(Xh, Xf); fill(Wh, Wf);
+      unsigned short *dX, *dW, *dC; float *dP; int *dCnt;
+      HIP_CHECK(hipMalloc(&dX, Xh.size() * 2)); HIP_CHECK(hipMalloc(&dW, Wh.size() * 2)); HIP_CHECK(hipMalloc(&dC, (size_t)M * N * 2));
+      HIP_CHECK(hipMalloc(&dP, (size_t)KS * M * N * 4)); HIP_CHECK(hipMalloc(&dCnt, (N / 16) * 4)); HIP_CHECK(hipMemset(dCnt, 0, (N / 16) * 4));
+      HIP_CHECK(hipMemcpy(dX, Xh.data(), Xh.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dW, Wh.data(), Wh.size() * 2, hipMemcpyHostToDevice));
+      auto run = [&](int) { hipLaunchKernelGGL(pq_skinny_bf16, dim3(N / 16, KS), dim3(256), 0, 0, (const __bf16 *)dX, (const __bf16 *)dW, (__bf16 *)dC, dP, dCnt, M, N, K); };
+      run(0); HIP_CHECK(hipDeviceSynchronize());
+      std::vector<unsigned short> Ch((size_t)M * N); HIP_CHECK(hipMemcpy(Ch.data(), dC, Ch.size() * 2, hipMemcpyDeviceToHost));
+      double num = 0, den = 0; float maxrel = 0;
+      for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+        double r = 0; for (int k = 0; k < K; ++k) r += (double)Xf[(size_t)m * K + k] * Wf[(size_t)n * K + k];
+        unsigned int b = (unsigned int)Ch[(size_t)m * N + n] << 16; float c; memcpy(&c, &b, 4);
+        num += (c - r) * (c - r); den += r * r; maxrel = std::max(maxrel, (float)(fabs(c - r) / (fabs(r) + 1e-3)));
+      }
+      double t = 1e30; for (int rep = 0; rep < REPS; ++rep) t = std::min(t, time_us(run, 200, e0, e1));
+      const bool pass = sqrt(num / den) < 5e-3; if (!pass) ++fails;
+      printf("  skinny M=%-3d N=%-5d K=%d  rel %.2e maxrel %.2e  %6.2f us %s\n", M, N, K, sqrt(num / den), maxrel, t, pass ? "OK" : "FAIL");
+      hipFree(dX); hipFree(dW); hipFree(dC); hipFree(dP); hipFree(dCnt);
+    }
+    printf("skinny: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
   }
 
   if (what == "tokstream" || what == "all") {

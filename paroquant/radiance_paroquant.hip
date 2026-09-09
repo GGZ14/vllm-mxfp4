@@ -180,6 +180,16 @@ static void launch_ew_rot_tok(int mode, uintptr_t x, uintptr_t y, long ys, uintp
 #undef PQ_EWT
 }
 
+// Skinny bf16 GEMM (see pq_skinny_bf16). p = fp32 partial scratch [K/256][M][N], cnt = int[N/16]
+// zero-initialised once (the kernel re-zeroes its own counter). N % 16 == 0, K % 256 == 0, M <= 64.
+static void launch_skinny_bf16(uintptr_t x, uintptr_t w, uintptr_t c, uintptr_t p, uintptr_t cnt,
+                               int M, int N, int K, uintptr_t stream) {
+  if (N % 16 || K % PQ_SK_KCH || M < 1 || M > PQ_SK_MAXM) throw std::runtime_error("skinny_bf16: N%16, K%256, 1<=M<=64");
+  hipLaunchKernelGGL(pq_skinny_bf16, dim3(N / 16, K / PQ_SK_KCH), dim3(256), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const __bf16 *>(w), reinterpret_cast<__bf16 *>(c),
+                     reinterpret_cast<float *>(p), reinterpret_cast<int *>(cnt), M, N, K);
+}
+
 static void launch_token_quant(uintptr_t xr, uintptr_t asg, uintptr_t a, uintptr_t as,
                                uintptr_t rs, int M, int K, int P, uintptr_t stream,
                                int tiled) {
@@ -384,6 +394,7 @@ PYBIND11_MODULE(radiance_paroquant_kernel, m) {
         "y, res, w, eps, T, cs, hs, ro, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("y"), py::arg("res"), py::arg("w"), py::arg("eps"), py::arg("T"), py::arg("cs"), py::arg("hs"), py::arg("ro"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
   m.def("launch_ew_rot_tok", &launch_ew_rot_tok,
         "mode, x, y, ys, w, eps, T, cs, hs, a, as, M, N, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("mode"), py::arg("x"), py::arg("y"), py::arg("ys"), py::arg("w"), py::arg("eps"), py::arg("T"), py::arg("cs"), py::arg("hs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("N"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
+  m.def("launch_skinny_bf16", &launch_skinny_bf16, "skinny bf16 GEMM C=X.W^T: x, w, c, partials, cnt, M, N, K, stream");
   m.def("launch_token_quant", &launch_token_quant,
         "prefill pass C: per-token scale + e4m3 encode + code row-sums (gfx1201)");
   m.def("launch_rotate_quant", &launch_rotate_quant,

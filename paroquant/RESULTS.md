@@ -432,3 +432,72 @@ at M>=40 it loses 5-20%. So the remaining producer cost at W=32 is not chain lat
 phase structure the per-token scale forces (row pass -> barrier -> chains -> barrier -> LDS re-read
 + encode) against the int4 producer's single register-resident pass. ~2-2.5 us x 256 sites =
 ~0.5 ms/step; parked.
+
+## 2026-09-09: DFlash2 drafter fine-tuned on the MXFP4-PARO target (self-distillation)
+
+The remaining decode gap to int4 PARO is acceptance, not step time. No public DFlash2 training code
+exists (z-lab's repo is inference-only), so the loop was written against vLLM's own forward
+(`paroquant/drafter/train_drafter.py`), validated by reproducing the original drafter's per-position
+top-1 on real captures. Recipe (DFlash paper): CE on the 7 mask positions weighted exp(-(k-1)/4),
+random anchors per sequence, target embed / lm_head and the candidate selector frozen, fp32 master
++ AdamW offloaded to the CPU (1.8B trainable params on one R9700, 7 s/step).
+
+Data: 2,400 prompts (1,200 ultrachat_200k, 700 CodeAlpaca, 500 GSM8K-train) answered by the served
+MXFP4-PARO target (prod sampling, reasoning on, <=1024 tokens), captured in-serve by
+`radiance_dflash_capture.py` (aux hidden states of layers 5/19/33/47/61 as e4m3 + per-token scale,
+rejected draft slots trimmed): 2,410 sequences, 1.62M completion tokens, 44 GB. 2 epochs, lr 5e-5.
+
+Held-out proxy (96 seqs, prefix-expected accepted/block): **1.979 -> 2.041** (+3.1%); weighted CE
+2.00 -> 1.71; top-1 by position 0.807/0.687/0.586/0.523/0.462/0.415/0.372 ->
+0.819/0.693/0.597/0.532/0.472/0.420/0.380. The proxy's 1.98 matched the served 1.84-1.90 acc/draft.
+
+Served A/B, same prod config (SPEC=7, TP=2), FP8 block-128 export of the fine-tune vs tcclaviger's:
+
+| | old drafter | **fine-tuned** |
+|---|---|---|
+| bench_decode_ctx acc/draft @ctx25 / 8k / 32k | 1.844 / 1.844 / 1.703 | **2.053 / 2.077 / 1.985** (+11 / +13 / +17%) |
+| single-stream decode tok/s @ctx25 / 8k / 32k | 116.2 / 109.4 / 100.9 | **125.0 / 118.0 / 111.2** (+8 / +8 / +10%) |
+| ms/step | 24.47 / 26.00 / 26.78 | 24.42 / 26.07 / 26.84 (unchanged) |
+| BetterBench combined (single pass) | 207.5 | 209.2 (+0.8%) |
+| BB by category: chat / code / json / math | 101 / 214 / 231 / 240 | **104 / 222 / 257 / 255** |
+| BB by category: file_edit / prose / reasoning / summarization | 217 / 105 / 242 / 227 | 205 / 104 / 237 / 208 |
+| GSM8K 500q | 97.60 | 97.60 |
+
+Reading: acceptance rose where the training mix has coverage (chat, code, json, math) and slipped on
+the categories it does not (summarization, file_edit, long reasoning prompts). Output quality is
+unchanged (lossless drafting; GSM8K identical). The overnight gate's bar was +2% BetterBench
+combined, so prod was restored with the OLD drafter pending a decision. The fine-tuned drafter is at
+`~/models/Qwen3.8-27B-DFlash2-FP8-paro` (bf16 at `~/drafter_ft/ft_bf16`); serve it with
+`DRAFTER=Qwen3.8-27B-DFlash2-FP8-paro`. Next round, if wanted: widen the prompt mix to summarization
+/ file-edit / long-document prompts and raise the lr (5e-5 barely moved top-1 in 1,154 steps).
+
+## 2026-09-09: drafter-kernel attribution on the live serve (torch profiler + RADIANCE_STEP_TRACE)
+
+Single-stream step, MXFP4-PARO prod (TP=2, SPEC=7, old drafter). `RADIANCE_STEP_TRACE=60` (now wired
+into run_paroquant.sh with patch_step_trace.py / patch_async_dynwidth.py): step 24.02 ms = gpu_span;
+worker CPU exec_model 1.02 + sample_tok 1.30 ms, engine schedule 0.04 ms, rpc_wait 21.6 ms (the
+worker idles behind the GPU) -- no host bubble. **The torch profiler adds ~2 ms/step** (25.9 ms
+profiled): a 3.1 ms "GPU idle after the selector walk" in the profiled trace is the profiler's own
+per-step overhead, not a scheduling gap. Async scheduling re-tested on this stack: 24.29 / 25.86 /
+26.75 ms/step vs sync 24.47 / 26.00 / 26.78, BetterBench 210.4 vs 207.5 -- parity, as recorded on
+2026-09-04 for the MXFP4 stack. ASYNC stays 0.
+
+Drafter tail 3.43 ms (14% of the step): visible kernels ~1.2 ms -- int2 draft head 0.42, context-K/V
+a8w8 GEMM 0.23, input prep + K/V precompute (norm, permute, k-norm, rope, 5 cache inserts) + selector
+glue 0.33 (24 launches, uncaptured), rejection sampler + one NCCL kernel 0.25 -- and ~2.2 ms in the
+five-layer query forward, which runs inside a FULL cudagraph the ROCm profiler does not expand
+(weight stream ~1.3 ms at roofline for 0.83 GB/rank FP8; the rest is attention/convs/norms/gaps).
+
+**Target-side find:** the 48 GDN gate projections `in_proj_ba` (bf16, N=48/rank, K=5120) run as
+hipBLASLt calls at 29 us each = **1.4 ms/step (5.8%)** for a 480 KB weight. radiance_gemm.py's R4D
+skinny kernel does that shape in 3.4 us but was parked behind `RADIANCE_SKINNY_GEMM=all` on 2026-08
+because the bf16-ulp perturbation cost the (bit-exact-target-trained) drafter acceptance. With the
+self-distilled drafter that objection dissolves: the drafter is trained on the target as served.
+A/B with `all` (also routes the drafter's kernel_projection [1280,5120] and hidden_projection
+[256,5120]): see the next entry.
+
+Plan, in order of value: (1) `RADIANCE_SKINNY_GEMM=all` + retrain the drafter against it (~-3.7%
+step); (2) MXFP4 weights for the drafter via a quantize-aware loop round (-0.65 ms, ~2.7%);
+(3) fuse the 24-launch uncaptured precompute/selector glue into 2-3 kernels (~-0.25 ms);
+(4) the NCCL call in the sampler path onto the r4d one-shot AR (-0.1 ms); (5) in-graph glue of the
+drafter's five layers (~0.3 ms, needs the graph's kernels visible: rocprof rather than kineto).
