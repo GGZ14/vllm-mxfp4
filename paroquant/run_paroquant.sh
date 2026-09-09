@@ -54,6 +54,12 @@ DRAFTER=${DRAFTER:-Qwen3.8-27B-DFlash2-FP8}   # DFlash2 drafter dir under $MODEL
 PREFIX_CACHE=${PREFIX_CACHE:-1}                # 0 for a drafter-capture serve (cached prefixes yield no hidden states)
 CAPTURE_DIR=${CAPTURE_DIR:-}                   # host dir: record drafter training data (radiance_dflash_capture.py)
 PROFILE=${PROFILE:-0}                          # 1: arm the torch profiler (traces in $CACHE/prof; POST /start_profile, /stop_profile)
+# Async scheduling overlaps the engine's scheduling round trip with GPU execution. vLLM refuses it
+# together with disable_padded_drafter_batch, so the two are one switch (as in serve-mxfp4.sh). The
+# 2026-09-09 drafter profile on this stack showed a 3.1 ms GPU-idle bubble per step between the
+# drafter's last kernel and the next step's input prep in sync mode -- the case async exists for.
+ASYNC=${ASYNC:-0}
+if [ "$ASYNC" = 1 ]; then ASYNC_FLAG="--async-scheduling"; UNPAD=false; else ASYNC_FLAG="--no-async-scheduling"; UNPAD=true; fi
 CHUNK=${CHUNK:-8192} # prod prefill chunk (--max-num-batched-tokens); sweep knob
 GPU_UTIL=${GPU_UTIL:-0.92}
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
@@ -125,7 +131,7 @@ else
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
   CHECKALL=${CHECKALL:-}
   SPEC_ARGS=(--speculative-config
-    "{\"method\":\"dflash\",\"model\":\"/models/${DRAFTER}\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true,\"draft_sample_method\":\"greedy\"}")
+    "{\"method\":\"dflash\",\"model\":\"/models/${DRAFTER}\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":${UNPAD},\"draft_sample_method\":\"greedy\"}")
 fi
 
 exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
@@ -140,6 +146,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e NCCL_PROTO=Simple \
   -e RADIANCE_USE_R4D=1 -e RADIANCE_USE_R4D_AR=1 -e RADIANCE_USE_R4D_AR_QUANT=1 \
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB=86016 \
+  -e RADIANCE_STEP_TRACE="${RADIANCE_STEP_TRACE:-0}" \
   -e RADIANCE_DFLASH_CAPTURE_DIR="${CAPTURE_DIR:+/capture}" "${CAPTURE_MOUNT[@]}" \
   -e RADIANCE_PRESHUFFLE=1 -e RADIANCE_FUSE_RMS_QUANT=1 \
   -e R4D_ATTN_FP8=3 \
@@ -169,7 +176,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_PQ_ROT_V2="${RADIANCE_PQ_ROT_V2:-1}" \
   -e RADIANCE_FAST_DRAFT=1 -e RADIANCE_DRAFT_TAU=0.20 -e RADIANCE_DRAFT_RERANK=80 \
   -e RADIANCE_VERIFY_HEAD=1 -e RADIANCE_VERIFY_HEAD_MAX_M=32 \
-  -e RADIANCE_TOPK_TRITON_MIN_ROWS=1 -e RADIANCE_SKINNY_GEMM=1 \
+  -e RADIANCE_TOPK_TRITON_MIN_ROWS=1 -e RADIANCE_SKINNY_GEMM="${RADIANCE_SKINNY_GEMM:-1}" \
   -e RADIANCE_GDN_PATHS=both \
   -e RADIANCE_KV_GROUP_OPT=1 \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
@@ -196,6 +203,9 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_kv_group_size.py
     python3 patch_topk_composite.py
     python3 patch_gdn_shared_build.py
+    python3 patch_async_dynwidth.py     # dynamic verify width under async (AsyncScheduler bypasses update_draft_token_ids)
+    python3 patch_step_trace.py         # RADIANCE_STEP_TRACE=N per-step CPU/GPU trace
+    python3 patch_skinny_gemm.py        # small bf16 projections -> radiance_gemm (RADIANCE_SKINNY_GEMM=all adds in_proj_ba)
     python3 patch_dflash_selector_topk.py
     python3 patch_dynwidth.py
     python3 patch_ar_geometry.py
@@ -203,7 +213,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
-    cp radiance_mxfp4.py radiance_gdn.py radiance_gdnmerge.py radiance_rmsquant.py \
+    cp radiance_mxfp4.py radiance_gemm.py radiance_gdn.py radiance_gdnmerge.py radiance_rmsquant.py \
        radiance_drafthead.py radiance_verifyhead.py radiance_aroverlap.py radiance_topk.py \
        radiance_arnq.py "$SP"/
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
@@ -243,7 +253,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   --tensor-parallel-size "$TP" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --attention-backend R4D \
-  --no-async-scheduling \
+  $ASYNC_FLAG \
   --mamba-cache-mode align \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \

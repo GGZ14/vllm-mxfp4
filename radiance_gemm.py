@@ -105,8 +105,31 @@ if ENABLED:
     # would have taken without R4D.
     _name = _r4d.select("gemm_nt", M=64, K=5120, dtype="bf16")
     if _name is None:
-        ENABLED = False
-        sys.stderr.write("[radiance.gemm] no gemm_nt kernel for M<=64 bf16, disabled\n")
+        # The pinned libr4d rebuilds this stack runs (b9e42ab-rx5/rx6, for the GDN overflow fix)
+        # predate gemm_bf16_nt_m64. Fall back to the paroquant module's split-K skinny kernel
+        # (pq_skinny_bf16: same contract, bf16-rounding-exact vs an fp32 reference, harness `skinny`).
+        try:
+            import radiance_paroquant_kernel as _pqk
+            _M_MAX = 64
+            _PQ_SCRATCH: dict = {}
+
+            def _pq_gemm(xp, wp, cp, m, k, n, wv, sk, mb, stream, _x=None, _w=None):
+                key = (n, k)
+                if key not in _PQ_SCRATCH:
+                    if torch.cuda.is_current_stream_capturing():
+                        return False          # never allocate inside a capture; caller falls back
+                    ks = k // 256
+                    _PQ_SCRATCH[key] = (torch.empty(ks * _M_MAX * n, dtype=torch.float32, device="cuda"),
+                                        torch.zeros(n // 16 + 1, dtype=torch.int32, device="cuda"))
+                P, cnt = _PQ_SCRATCH[key]
+                _pqk.launch_skinny_bf16(xp, wp, cp, P.data_ptr(), cnt.data_ptr(), m, n, k, stream)
+                return True
+            _GEMM = _pq_gemm
+            sys.stderr.write("[radiance.gemm] libr4d has no gemm_nt M<=64 bf16; skinny GEMM on paroquant pq_skinny_bf16 for: %s\n"
+                             % ", ".join("%dx%d" % nk for nk in sorted(_CFG)))
+        except Exception as e:  # noqa: BLE001
+            ENABLED = False
+            sys.stderr.write(f"[radiance.gemm] no gemm_nt kernel for M<=64 bf16 and no paroquant fallback ({e!r}), disabled\n")
     else:
         _GEMM = getattr(_r4d, _name)
         _M_MAX = int(_r4d.GEMM64_MAX_M)
@@ -139,7 +162,11 @@ def maybe_gemm(x: torch.Tensor, weight: torch.Tensor):
         _seen.add((n, k, m))
         sys.stderr.write("[radiance.gemm] claimed N=%d K=%d M=%d  WV=%d SK=%d MB=%d\n"
                          % (n, k, m, cfg[0], cfg[1], cfg[2]))
+    if k % 256:
+        return None
     c = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    _GEMM(x2.data_ptr(), weight.data_ptr(), c.data_ptr(), m, k, n, cfg[0], cfg[1], cfg[2],
-          torch.cuda.current_stream().cuda_stream)
+    ok = _GEMM(x2.data_ptr(), weight.data_ptr(), c.data_ptr(), m, k, n, cfg[0], cfg[1], cfg[2],
+               torch.cuda.current_stream().cuda_stream)
+    if ok is False:
+        return None
     return c.reshape(*x.shape[:-1], n)
