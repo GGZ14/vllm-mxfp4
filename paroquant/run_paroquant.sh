@@ -61,6 +61,7 @@ PROFILE=${PROFILE:-0}                          # 1: arm the torch profiler (trac
 ASYNC=${ASYNC:-0}
 if [ "$ASYNC" = 1 ]; then ASYNC_FLAG="--async-scheduling"; UNPAD=false; else ASYNC_FLAG="--no-async-scheduling"; UNPAD=true; fi
 CHUNK=${CHUNK:-8192} # prod prefill chunk (--max-num-batched-tokens); sweep knob
+MAXLEN=${MAXLEN:-262144}; MAXSEQS=${MAXSEQS:-8}   # prod context / concurrency; a TP=1 serve on one 32 GB card needs MAXLEN <= 65536
 GPU_UTIL=${GPU_UTIL:-0.92}
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
 # also zeroes the cudagraph pad rows. The AutoRound int4 serve (same bf16-input linear contract)
@@ -125,7 +126,7 @@ if [ "$MODE" = eval ]; then
   SPEC_ARGS=()
 else
   PROF_ARGS=(); [ "$PROFILE" = 1 ] && PROF_ARGS=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false); [ "$PROFILE" = 1 ] && mkdir -p "$CACHE/prof"
-  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "${CHUNK:-8192}"
+  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "${MAXLEN:-262144}" --max-num-seqs "${MAXSEQS:-8}" --max-num-batched-tokens "${CHUNK:-8192}"
               $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
