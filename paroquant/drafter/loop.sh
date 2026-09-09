@@ -7,7 +7,7 @@
 # Usage: loop.sh <rounds> [prompts_per_round]
 set -u
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
-ROUNDS=${1:-6}; PER=${2:-2000}
+ROUNDS=${1:-6}; PER=${2:-1500}
 D=$HOME/drafter_ft; L=$D/loop; S=$HOME/deadcode-vllm/paroquant/drafter; mkdir -p "$L" "$L/capture_live" "$L/gate"
 LOG=$L/loop.log; say() { echo "$(date +%H:%M:%S) $*" | tee -a "$LOG"; }
 UNIT=qwen_vllm_paro_mxfp4; DROP=~/.config/systemd/user/$UNIT.service.d/loop.conf
@@ -61,6 +61,8 @@ PY
     -e HIP_VISIBLE_DEVICES=1 -v $D:/data:z -v $HOME/models:/models:z -v $S:/scripts:z --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc \
     "cd /data && python3 /scripts/train_drafter.py --capture $(echo $DATA | sed "s|$D|/data|g") --val-dir /data/val_fixed --drafter $(echo $BEST_BF16 | sed "s|$D|/data|") --target /models/Qwen3.8-27B-embed-head --out /data/loop/ft_r$N --epochs 1 --lr 5e-5 --seqs 6 --anchors 64 --eval-every 200 --save-every 100000" > "$L/train_r$N.log" 2>&1
   grep -E "\[eval (before|after)\]" "$L/train_r$N.log" | tee -a "$LOG"
+  # the big round-2 set is baked into the round-1 model: free its 117 GB once it has been trained on
+  [ $N = 1 ] && [ -f "$L/ft_r1/model.safetensors" ] && rm -rf "$D/capture2" && say "capture2 removed after round 1 training"
   before=$(grep "\[eval before\]" "$L/train_r$N.log" | grep -oE "accepted/block [0-9.]+" | grep -oE "[0-9.]+$"); after=$(grep "\[eval after\]" "$L/train_r$N.log" | grep -oE "accepted/block [0-9.]+" | grep -oE "[0-9.]+$")
   [ -f "$L/ft_r$N/model.safetensors" ] || { say "round $N: training failed"; continue; }
   # 4. export
