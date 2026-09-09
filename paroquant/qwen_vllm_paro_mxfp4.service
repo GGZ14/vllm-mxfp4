@@ -1,0 +1,22 @@
+[Unit]
+Description=Qwen3.8-27B-PARO-MXFP4-ft (ParoQuant rotations on MXFP4 weights, W4A8) on stilldeadcode/vllm-radiance:0.9.3 (dflash SPEC=7, fp8 attn, dynwidth)
+After=network-online.target
+Conflicts=qwen_vllm_38.service qwen_vllm_fp8mtp.service qwen_vllm_38unc.service qwen_vllm_awq.service qwen_vllm_35b.service qwen_vllm_mxfp4.service qwen_vllm_paro.service
+
+[Service]
+Type=simple
+TimeoutStartSec=1800
+Environment=MODE=prod
+Environment=SPEC=7
+Environment="SERVED_NAMES=Qwen3.8 Qwen3.6 Qwen3.8-PARO Qwen3.8-PARO-MXFP4"
+Environment=MODEL_DIR=Qwen3.8-27B-PARO-MXFP4-ft
+Environment=NAME=vllmparomx
+Environment=GPU_UTIL=0.95
+Environment=CACHE=/home/brian/.radiance-cache-paro-mxfp4-093-rs-rs2-sl
+# v1 MXFP4 loader takes no rotation-stream tuple (gap #2, pending)
+ExecStart=/home/brian/deadcode-vllm/paroquant/run_paroquant.sh
+ExecStop=/usr/bin/podman stop -t 30 vllmparomx
+Restart=no
+
+[Install]
+WantedBy=default.target

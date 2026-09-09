@@ -369,8 +369,8 @@ class _PqSiluMulRot(torch.nn.Module):
 
     def forward(self, gu):
         d = self._down[0]
-        hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(0, gu, gu, d.cs, 0.0, d.rec, d.cs)
-        return (hs, a, asg, rs)
+        hs, rest = d.quant_method.stream_ew(0, gu, gu, d.cs, 0.0, d)
+        return (hs, *rest)
 
 
 def _rot_gdn_output_projection(self, core_attn_out, z):
@@ -380,9 +380,8 @@ def _rot_gdn_output_projection(self, core_attn_out, z):
     x = core_attn_out.reshape(T, -1)
     zz = z.reshape(T, -1)
     op = self.out_proj
-    hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(2, x, zz, self.norm.weight, float(self.norm.eps),
-                                                  op.rec, op.cs)
-    output, _ = op((hs, a, asg, rs))
+    hs, rest = op.quant_method.stream_ew(2, x, zz, self.norm.weight, float(self.norm.eps), op)
+    output, _ = op((hs, *rest))
     return output
 
 
@@ -394,8 +393,8 @@ def _rot_attn_forward(self, positions, hidden_states):
     attn_output = self.attn(q, k, v)
     if gate is not None:
         op = self.o_proj
-        hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(1, attn_output, gate, op.cs, 0.0, op.rec, op.cs)
-        output, _ = op((hs, a, asg, rs))
+        hs, rest = op.quant_method.stream_ew(1, attn_output, gate, op.cs, 0.0, op)
+        output, _ = op((hs, *rest))
         return output
     output, _ = self.o_proj(attn_output)
     return output
@@ -549,11 +548,16 @@ def _rot_layer_forward(self, hidden_states, residual, positions=None, **kwargs):
         hs = hidden_states
     elif self._pq_rot_in is not None:
         cons = self._pq_rot_in
-        op = torch.ops.radiance.pq_ar_add_rms_rot if self._pq_ar_in else torch.ops.radiance.pq_add_rms_rot
-        hsb, residual, a, asg, rs = op(
-            hidden_states, residual, self.input_layernorm.weight,
-            float(self.input_layernorm.variance_epsilon), cons.rec, cons.cs)
-        hs = (hsb, a, asg, rs)
+        if self._pq_ar_in:
+            hsb, residual, a, asg, rs = torch.ops.radiance.pq_ar_add_rms_rot(
+                hidden_states, residual, self.input_layernorm.weight,
+                float(self.input_layernorm.variance_epsilon), cons.rec, cons.cs)
+            hs = (hsb, a, asg, rs)
+        else:
+            hsb, residual, rest = cons.quant_method.stream_norm(
+                hidden_states, residual, self.input_layernorm.weight,
+                float(self.input_layernorm.variance_epsilon), cons)
+            hs = (hsb, *rest)
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hs = hidden_states
@@ -565,11 +569,16 @@ def _rot_layer_forward(self, hidden_states, residual, positions=None, **kwargs):
 
     if self._pq_rot_mid is not None:
         cons = self._pq_rot_mid
-        op = torch.ops.radiance.pq_ar_add_rms_rot if self._pq_ar_mid else torch.ops.radiance.pq_add_rms_rot
-        hsb, residual, a, asg, rs = op(
-            attn_out, residual, self.post_attention_layernorm.weight,
-            float(self.post_attention_layernorm.variance_epsilon), cons.rec, cons.cs)
-        hidden_states = self.mlp((hsb, a, asg, rs))
+        if self._pq_ar_mid:
+            hsb, residual, a, asg, rs = torch.ops.radiance.pq_ar_add_rms_rot(
+                attn_out, residual, self.post_attention_layernorm.weight,
+                float(self.post_attention_layernorm.variance_epsilon), cons.rec, cons.cs)
+            hidden_states = self.mlp((hsb, a, asg, rs))
+        else:
+            hsb, residual, rest = cons.quant_method.stream_norm(
+                attn_out, residual, self.post_attention_layernorm.weight,
+                float(self.post_attention_layernorm.variance_epsilon), cons)
+            hidden_states = self.mlp((hsb, *rest))
     else:
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
         hidden_states = self.mlp(hidden_states)
@@ -602,8 +611,15 @@ def _rot_gdn_forward_hip(self, hidden_states):
 
 
 def _is_pq(lin) -> bool:
+    """A linear whose quant method can consume a rotation-stream tuple (int4 per-group or
+    paroquant_mxfp4 per-token): it exposes stream_norm/stream_ew that build ITS tuple."""
     return (lin is not None and getattr(lin, "rec", None) is not None
-            and isinstance(getattr(lin, "quant_method", None), ParoQuantLinearMethod))
+            and getattr(getattr(lin, "quant_method", None), "pq_stream_capable", False))
+
+
+def _is_pq_ar(lin) -> bool:
+    """Stream 3 (fused all-reduce) only exists for the int4 per-group tuple."""
+    return _is_pq(lin) and getattr(lin.quant_method, "pq_ar_capable", False)
 
 
 def install_stream(model) -> None:
@@ -672,7 +688,7 @@ def install_stream(model) -> None:
             # mid: this layer's o_proj/out_proj stays partial, the mid epilogue reduces it
             row = (layer.linear_attn.out_proj if layer.layer_type == "linear_attention"
                    else layer.self_attn.o_proj)
-            if layer._pq_rot_mid is not None and _is_pq(row) and row.bias is None \
+            if layer._pq_rot_mid is not None and _is_pq_ar(row) and row.bias is None \
                     and getattr(row, "reduce_results", False):
                 row.reduce_results = False
                 layer._pq_ar_mid = True
@@ -681,7 +697,7 @@ def install_stream(model) -> None:
             # reduces it. Never on the last layer (model.norm and the drafter read its output).
             nxt = core.layers[i + 1] if i + 1 < L else None
             down = getattr(mlp, "down_proj", None)
-            if nxt is not None and _is_pq(down) and down.bias is None \
+            if nxt is not None and _is_pq_ar(down) and down.bias is None \
                     and getattr(down, "reduce_results", False) \
                     and not getattr(nxt, "layer_scale", False) \
                     and not getattr(nxt, "use_attn_reduce_scatter_for_moe", False) \
@@ -691,7 +707,7 @@ def install_stream(model) -> None:
                        else getattr(nxt.self_attn, "qkv_proj", None))
                 gdn_next_ok = (nxt.layer_type != "linear_attention"
                                or (gdn_ok and getattr(nxt.linear_attn, "in_proj_ba", None) is not None))
-                if _is_pq(nin) and gdn_next_ok:
+                if _is_pq_ar(nin) and gdn_next_ok:
                     down.reduce_results = False
                     nxt._pq_ar_in = True
                     n_ar += 1
@@ -960,6 +976,20 @@ class ParoQuantLinearMethod(LinearMethodBase):
         layer.sz = torch.nn.Parameter(sz.contiguous(), requires_grad=False)
         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
+
+    # rotation stream: this method's producers build the per-GROUP tuple its GEMM consumes
+    pq_stream_capable = True
+    pq_ar_capable = True
+
+    @staticmethod
+    def stream_norm(y, residual, weight, eps, cons):
+        hs, ro, a, asg, rs = torch.ops.radiance.pq_add_rms_rot(y, residual, weight, eps, cons.rec, cons.cs)
+        return hs, ro, (a, asg, rs)
+
+    @staticmethod
+    def stream_ew(mode, x, y, w, eps, cons):
+        hs, a, asg, rs = torch.ops.radiance.pq_ew_rot(mode, x, y, w, eps, cons.rec, cons.cs)
+        return hs, (a, asg, rs)
 
     def apply(self, layer, x, bias: torch.Tensor | None = None) -> torch.Tensor:
         if isinstance(x, tuple):          # rotation stream: (hs, A, ASG, RS)

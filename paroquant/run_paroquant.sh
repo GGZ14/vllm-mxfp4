@@ -13,6 +13,14 @@
 #     18563072000 could OOM. First boots run util 0.92; pin after measuring.
 #   - MXFP4-only env knobs are left at prod values but are INERT here (no quark layers load).
 #
+# MXFP4 checkpoint (quant_method paroquant_mxfp4, from paroquant/build_hybrid.py): same launcher,
+#   MODEL_DIR=Qwen3.8-27B-PARO-MXFP4-ft. The rotation streams (defaults on) apply: the loader's
+#   per-token producers (pqm_add_rms_rot / pqm_ew_rot) replace the int4 per-group ones through the
+#   same install_stream. MODE=eval then gates RADIANCE_PQM_CHECKALL per partition.
+#   The RADIANCE_MXFP4_* kernel knobs (fragment-order weights, NT decode loads, decode band) are
+#   passed at MXFP4 prod's values; they are inert for the int4 checkpoint (no quark layers load)
+#   and load-bearing for MXFP4-PARO's speed.
+#
 # MODE=eval  (default): --enforce-eager, CHECKALL numerics gate on the four model shapes,
 #                       no speculative decoding, 32K ctx. For correctness gating only.
 # MODE=prod           : full config -- DFlash2 FP8 drafter (SPEC tokens configurable), 262K ctx,
@@ -20,7 +28,19 @@
 #
 # Port 8080 is prod's port and both need both GPUs: stop production first
 #   systemctl --user stop qwen_vllm_38        restore with: vllm-switch 38
+#
+# 2026-09-03 default sampling temperature 1.0 -> 0.7 (--override-generation-config), fleet-wide
+#   across every vllm-switch target. DEFAULT only -- a client-supplied temperature still wins.
+#   Rollback: sed -i 's/"temperature":0.7/"temperature":1.0/' run_paroquant.sh && systemctl --user restart qwen_vllm_paro
+#
 set -euo pipefail
+
+# Paths are derived, not hardcoded: this script is the one the systemd unit runs, so it has to
+# work from a clone anywhere. PATCHES defaults to the repo root (this file lives in paroquant/).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PATCHES_DIR="$(realpath -m "${PATCHES:-$SCRIPT_DIR/..}")"
+MODELS="$(realpath -m "${MODELS:-$HOME/models}")"
+HF_CACHE="$(realpath -m "${HF_CACHE:-$HOME/.cache/huggingface}")"
 
 MODE=${MODE:-eval}
 PORT=${PORT:-8080}
@@ -36,7 +56,22 @@ GPU_UTIL=${GPU_UTIL:-0.92}
 # has run it since 08-30; the merge hook it needs is installed with the merge itself left OFF
 # (in_proj_a/b are fp16 here, there is nothing to merge). Compile cache keyed on the flag.
 GDN_FUSED=${RADIANCE_GDN_FUSED_UPDATE:-1}
+# Pinned to the build the shipped PARO numbers were measured on. serve-mxfp4.sh now derives
+# b9e42ab-rx6 from r4d_radiance_extras.patch (rx6 adds the 3-rank all-reduce for TP=3); rx5 is not
+# reproducible from the current patch, so a fresh box has to use rx6 and re-gate GSM8K for this
+# stack. Override with R4D_KEY=.
 R4D_KEY=${R4D_KEY:-b9e42ab-rx5}
+R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
+# The image's own libr4d predates the gated-delta-net overflow fix and NaNs this model, and the
+# in-container copy is guarded by [ -f /r4d/r4d.so ] -- a missing build there is a silent fallback
+# to the NaN kernel, not an error. Check it on the host, where it can still be a message.
+[ -f "$R4D_CACHE/$R4D_KEY/r4d.so" ] || {
+  echo "libr4d $R4D_KEY not built at $R4D_CACHE/$R4D_KEY/r4d.so" >&2
+  echo "  serving without it falls back to the image's libr4d, which NaNs this model." >&2
+  echo "  Build the current one:  ./setup-paroquant.sh   (produces b9e42ab-rx6)" >&2
+  echo "  then either R4D_KEY=b9e42ab-rx6 $0 ... or re-gate and change the default here." >&2
+  exit 1
+}
 # Rotation stream: fused add+rmsnorm+rotate+quant producers for the norm-fed linears (decode
 # band); patches the decoder-layer forward, so the compile cache is keyed (-rs).
 ROT_STREAM=${RADIANCE_PQ_ROT_STREAM:-1}
@@ -51,11 +86,27 @@ CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && 
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
-MODEL=/models/Qwen3.8-27B-PARO
-[ -d "$HOME/models/Qwen3.8-27B-PARO" ] || { echo "model missing" >&2; exit 1; }
+# MODEL_DIR names a directory under $MODELS. Overridable so the same launcher (same patches,
+# same patched libr4d, same template) can serve a pseudo-quantized checkpoint for an accuracy
+# gate -- keeping every variable but the weights fixed.
+MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
+MODEL=/models/$MODEL_DIR
+[ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
+MAXLEN_EVAL=${MAXLEN_EVAL:-32768}
+# TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
+TP=${TP:-2}
+GPUS=${GPUS:-0,1}
+# ROCR_VISIBLE_DEVICES selects the physical cards; HIP_VISIBLE_DEVICES then indexes INTO that
+# filtered list. Passing the same list to both works for "0,1" only by coincidence and breaks a
+# single-card run (GPUS=1 -> HIP asks for index 1 of a one-element list -> "No CUDA GPUs").
+HIP_IDX=$(seq -s, 0 $(( $(tr -cd , <<<"$GPUS" | wc -c) )))
+# Optional cgroup memory cap for the container (e.g. MEM_LIMIT=14g). Lets a gate boot run beside
+# a job that owns most of the host's RAM: the server OOMs itself instead of starving the job.
+MEM_LIMIT=${MEM_LIMIT:-}
+MEM_ARGS=(); [ -n "$MEM_LIMIT" ] && MEM_ARGS=(--memory "$MEM_LIMIT")
 
 if [ "$MODE" = eval ]; then
-  EXTRA_ARGS=(--enforce-eager --max-model-len 32768 --max-num-seqs 8
+  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN_EVAL" --max-num-seqs 8
               --max-num-batched-tokens 8192)
   # Per-rank quantized shapes: qkv, o, gate_up, down, in_proj(+merge), out_proj
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
@@ -70,10 +121,10 @@ else
     "{\"method\":\"dflash\",\"model\":\"/models/Qwen3.8-27B-DFlash2-FP8\",\"num_speculative_tokens\":${SPEC},\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true,\"draft_sample_method\":\"greedy\"}")
 fi
 
-exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host \
+exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host "${MEM_ARGS[@]}" \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
-  -e ROCR_VISIBLE_DEVICES=0,1 -e HIP_VISIBLE_DEVICES=0,1 \
+  -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$HIP_IDX" \
   -e HF_HUB_OFFLINE=1 \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
@@ -91,7 +142,14 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e RADIANCE_AR_QNB=96 -e RADIANCE_AR_QNT=1024 -e RADIANCE_AR_OVERLAP=0 \
   -e RADIANCE_DFLASH_SELECTOR_TOPK= \
   -e RADIANCE_PAROQUANT=1 \
+  -e RADIANCE_MXFP4_W4A8="${RADIANCE_MXFP4_W4A8:-1}" -e RADIANCE_MXFP4_WPERM="${RADIANCE_MXFP4_WPERM:-1}" \
+  -e RADIANCE_MXFP4_DECODE_NT="${RADIANCE_MXFP4_DECODE_NT:-1}" -e RADIANCE_MXFP4_DECODE_MAX_M="${RADIANCE_MXFP4_DECODE_MAX_M:-64}" \
+  -e RADIANCE_MXFP4_EPIFAST="${RADIANCE_MXFP4_EPIFAST:-1}" -e RADIANCE_MXFP4_TN4_MIN_M="${RADIANCE_MXFP4_TN4_MIN_M:-2048}" \
+  -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
+  -e RADIANCE_MXFP4_A_TILED_MIN_M="${RADIANCE_MXFP4_A_TILED_MIN_M:-513}" \
   -e RADIANCE_PQ_CHECKALL="$CHECKALL" \
+  -e RADIANCE_PQM_CHECKALL="${RADIANCE_PQM_CHECKALL:-$CHECKALL}" \
+  -e RADIANCE_PQM_CHECK_MAX_M="${RADIANCE_PQM_CHECK_MAX_M:-128}" \
   -e RADIANCE_PQ_CHECK_MAX_M=${PQ_CHECK_MAX_M:-128} \
   -e RADIANCE_PQ_DECODE_MAX_M=${PQ_DECODE_MAX_M:-64} \
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_DECODE_NT="${RADIANCE_PQ_DECODE_NT:-1}" \
@@ -109,13 +167,13 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
   -e TRITON_CACHE_DIR=/cache/triton -e AITER_ROOT_DIR=/cache/aiter \
   -e TRITON_CACHE_AUTOTUNING=1 \
-  -v /home/brian/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/brian/models:/models \
+  -v "$HF_CACHE":/root/.cache/huggingface \
+  -v "$MODELS":/models \
   -v "$CACHE":/cache \
-  -v /home/brian/deadcode-vllm:/patches:z \
-  -v /home/brian/mxfp4_work/paro:/paro:z \
-  -v /home/brian/.cache/radiance-libr4d/$R4D_KEY:/r4d:z \
-  -e R4D_SO=/home/brian/.cache/radiance-libr4d/$R4D_KEY \
+  -v "$PATCHES_DIR":/patches:z \
+  -v "$SCRIPT_DIR":/paro:z \
+  -v "$R4D_CACHE/$R4D_KEY":/r4d:z \
+  -e R4D_SO="$R4D_CACHE/$R4D_KEY" \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
     set -e
     SP=/opt/vllm/lib/python3.12/site-packages
@@ -150,7 +208,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     cd /paro
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
       radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so
-    cp radiance_paroquant.py "$SP"/
+    cp radiance_paroquant.py radiance_paroquant_mxfp4.py "$SP"/
     # NB: appended to the STDLIB sitecustomize, not written to site-packages -- Ubuntu ships
     # /usr/lib/python3.12/sitecustomize.py and it shadows any site-packages one, so a file
     # dropped there is silently never imported. Each podman run starts from the pristine image,
@@ -158,6 +216,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
     printf "%s\n" \
       "try:" \
       "    import radiance_paroquant  # registers the paroquant quantization config" \
+      "    import radiance_paroquant_mxfp4  # and the MXFP4-weights variant (paroquant_mxfp4)" \
       "except Exception as e:" \
       "    import sys" \
       "    sys.stderr.write(\"[radiance.paroquant] registration failed: %r\\n\" % (e,))" \
@@ -171,7 +230,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   --served-model-name $SERVED_NAMES \
   --host 0.0.0.0 --port "$PORT" \
   --kv-cache-dtype fp8 \
-  --tensor-parallel-size 2 \
+  --tensor-parallel-size "$TP" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --attention-backend R4D \
   --no-async-scheduling \

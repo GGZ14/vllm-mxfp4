@@ -558,6 +558,36 @@ def mxfp4_linear_pq(x_fp8: torch.Tensor, x_scale: torch.Tensor, weight: torch.Te
     return out
 
 
+@torch.library.custom_op("radiance::mxfp4_linear_pqp", mutates_args=())
+def mxfp4_linear_pqp(a: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor,
+                     weight_scale: torch.Tensor, weight_ref: torch.Tensor, M: int, pb1: int,
+                     pb2: int) -> torch.Tensor:
+    """Merged linear with per-partition rotated activations in ONE launch (paroquant_mxfp4):
+    a is [P, M, K] e4m3 (or the P-stacked fragment-tiled storage registered via
+    a_tiled_register with (M, K)), x_scale [P, M]; n-blocks of partition p read copy p.
+    weight_scale is the FULL [K/32, N]. Output [M, N]."""
+    if not _stats_reported[0]:
+        report_stats()
+    N = weight.shape[0]
+    K = weight_scale.shape[0] * 32
+    P = x_scale.shape[0]
+    astride = a.numel() // P                      # bytes between the P copies (row-major or tiled)
+    out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    tiled = bool(A_TILED_MIN_M) and a_tiled_take(a, M, K)
+    if tiled:
+        _A_TILED_STATS[0] += 1
+    launch = _ext.launch_at_p if tiled else _ext.launch_p
+    launch(a.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(), weight_ref.data_ptr(),
+           x_scale.data_ptr(), out.data_ptr(), M, N, K, pb1, pb2, astride,
+           torch.cuda.current_stream().cuda_stream)
+    return out
+
+
+@mxfp4_linear_pqp.register_fake
+def _(a, x_scale, weight, weight_scale, weight_ref, M, pb1, pb2):
+    return torch.empty((M, weight.shape[0]), device=a.device, dtype=torch.bfloat16)
+
+
 @mxfp4_linear_pq.register_fake
 def _(x_fp8, x_scale, weight, weight_scale, weight_ref):
     return torch.empty((x_fp8.shape[0], weight.shape[0]), device=x_fp8.device, dtype=torch.bfloat16)
