@@ -39,14 +39,19 @@ gate_tp1() {  # $1 = fp8 dir name, $2 = tag ; leaves the unit stopped; TP per LO
 
 # baseline gate for the current best at TP=1 (once)
 if [ ! -f "$L/best_bb.txt" ]; then
-  say "baseline gate at TP=1 for $BEST_FP8"; bb=$(gate_tp1 "$BEST_FP8" best_tp1 | tail -1)
+  say "baseline gate (LOOP_TP=$LOOP_TP) for $BEST_FP8"; bb=$(gate_tp1 "$BEST_FP8" best_tp1 | tail -1)
   python3 -c "float('${bb:-x}')" 2>/dev/null || { say "baseline gate failed ($bb) -- restoring prod at TP=2 and stopping"; rm -f "$DROP"; systemctl --user daemon-reload; systemctl --user start $UNIT; exit 1; }
   echo "$bb" > "$L/best_bb.txt"; say "best BB combined @TP1 = $bb"
 fi
 prod_up "$BEST_FP8" || exit 1
 
 for r in $(seq 1 "$ROUNDS"); do
-  N=$(($(ls "$L" | grep -cE '^capture_r[0-9]+$') + 1)); say "===== round $N (loop iteration $r) best=$BEST_FP8 BB=$(cat $L/best_bb.txt)"
+  # resume: if the newest capture round was never trained to completion (e.g. a reboot mid-training),
+  # take it as this round and skip generation
+  LAST=$(ls "$L" | grep -E '^capture_r[0-9]+$' | sed 's/capture_r//' | sort -n | tail -1); RESUME=0
+  if [ -n "$LAST" ] && [ -d "$L/capture_r$LAST" ] && ! grep -qs "\[eval after\]" "$L/train_r$LAST.log"; then N=$LAST; RESUME=1; else N=$((${LAST:-0} + 1)); fi
+  say "===== round $N (loop iteration $r, resume=$RESUME) best=$BEST_FP8 BB=$(cat $L/best_bb.txt)"
+  if [ "$RESUME" = 0 ]; then
   # 1. sample prompts
   python3 - "$D/pool.jsonl" "$L/pool_used.txt" "$L/prompts_r$N.jsonl" "$PER" <<'PY'
 import json, random, sys
@@ -64,6 +69,7 @@ PY
   python3 "$S/generate.py" "$L/prompts_r$N.jsonl" "$L/responses_r$N.jsonl" 8 768 2>&1 | tail -2 | tee -a "$LOG"
   sleep 40; mkdir -p "$L/capture_r$N"; find "$L/capture_live" -maxdepth 1 -name '*.pt' -size +1200k -exec mv {} "$L/capture_r$N/" \; ; find "$L/capture_live" -maxdepth 1 -name '*.pt' -delete
   say "round $N: $(ls $L/capture_r$N | wc -l) captures, $(du -sh $L/capture_r$N | cut -f1), disk free $(df -h /home | awk 'NR==2{print $4}')"
+  fi   # RESUME
   # 3. train from best on the last two rounds (round 1 also sees the big round-2 set). TP=2 mode: prod
   #    is stopped for the training window (both cards busy otherwise); TP=1 mode: GPU 1 lane.
   if [ "$LOOP_TP" = 2 ]; then systemctl --user stop $UNIT; sleep 8; say "round $N: prod stopped for training"; fi
