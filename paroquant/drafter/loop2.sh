@@ -87,9 +87,13 @@ PY
   podman run --rm -v $D:/data:z -v $HOME/models:/models:z -v $S:/scripts:z --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc "python3 /scripts/export_fp8.py /data/loop/ft_r$N /models/Qwen3.8-27B-DFlash2-FP8 /models/$CAND" | tee -a "$LOG"
   # 5. gate at TP=1 (prod is stopped by the gate script; restarted below)
   systemctl --user stop $UNIT; sleep 8
-  bb=$(gate_tp1 "$CAND" "r$N"); best_bb=$(cat "$L/best_bb.txt")
-  win=$(python3 -c "b,c,a,f=float('${best_bb:-0}'),float('${bb:-0}'),float('${after:-0}'),float('${before:-0}'); print('yes' if c>=b*1.015 and a>=f else 'no')")
-  say "round $N: proxy $before -> $after | BB combined @TP1 cand=$bb best=$best_bb | promote=$win"
+  bb=$(gate_tp1 "$CAND" "r$N" | tail -1); best_bb=$(cat "$L/best_bb.txt")
+  acc_of() { grep -oE "acc/draft [0-9.]+" "$1" | grep -oE "[0-9.]+" | python3 -c "import sys; v=[float(x) for x in sys.stdin.read().split()]; print(f'{sum(v)/len(v):.4f}' if v else '0')"; }
+  cand_acc=$(acc_of "$L/gate/r$N.decode_ctx.log"); best_acc=$(cat "$L/best_acc.txt" 2>/dev/null || acc_of "$L/gate/best_tp1.decode_ctx.log")
+  # promote on the decode bench's mean acc/draft (3 contexts x 400 tokens, far steadier than a single
+  # BetterBench pass whose same-build spread is ~10%) AND the fixed held-out proxy not worse
+  win=$(python3 -c "b,c,a,f=float('${best_acc:-0}'),float('${cand_acc:-0}'),float('${after:-0}'),float('${before:-0}'); print('yes' if c>=b*1.03 and a>=f else 'no')")
+  say "round $N: proxy $before -> $after | acc/draft cand=$cand_acc best=$best_acc (bar +3%) | BB combined cand=$bb best=$best_bb (reported only) | promote=$win"
   if [ "$win" = yes ]; then
     if [ "${SKIP_GSM8K:-1}" = 1 ]; then   # quality check only on promotion candidates
       env $GE OUT=$L/gate SKIP_GSM8K=0 "$S/gate_drafter.sh" "$CAND" "r${N}_gsm" 2>&1 | grep -E "accuracy" | tee -a "$LOG"; podman stop -t 30 vllmparomx >/dev/null 2>&1; sleep 8
@@ -97,7 +101,7 @@ PY
     fi
   fi
   if [ "$win" = yes ]; then
-    BEST_BF16="$L/ft_r$N"; BEST_FP8="$CAND"; echo "$BEST_BF16|$BEST_FP8" > "$L/best.txt"; echo "$bb" > "$L/best_bb.txt"
+    BEST_BF16="$L/ft_r$N"; BEST_FP8="$CAND"; echo "$BEST_BF16|$BEST_FP8" > "$L/best.txt"; echo "$bb" > "$L/best_bb.txt"; echo "$cand_acc" > "$L/best_acc.txt"
     for f in ~/.config/systemd/user/$UNIT.service ~/deadcode-vllm/paroquant/$UNIT.service; do grep -q "^Environment=DRAFTER=" "$f" && sed -i "s|^Environment=DRAFTER=.*|Environment=DRAFTER=$CAND|" "$f" || sed -i "/^Environment=NAME=vllmparomx$/a Environment=DRAFTER=$CAND" "$f"; done
     say "round $N: PROMOTED $CAND"
   else
