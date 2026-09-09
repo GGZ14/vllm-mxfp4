@@ -53,6 +53,7 @@ SPEC=${SPEC:-5}      # dflash re-sweep 2026-08: 5 beats 7 by 8-13% aggregate on 
 DRAFTER=${DRAFTER:-Qwen3.8-27B-DFlash2-FP8}   # DFlash2 drafter dir under $MODELS
 PREFIX_CACHE=${PREFIX_CACHE:-1}                # 0 for a drafter-capture serve (cached prefixes yield no hidden states)
 CAPTURE_DIR=${CAPTURE_DIR:-}                   # host dir: record drafter training data (radiance_dflash_capture.py)
+PROFILE=${PROFILE:-0}                          # 1: arm the torch profiler (traces in $CACHE/prof; POST /start_profile, /stop_profile)
 CHUNK=${CHUNK:-8192} # prod prefill chunk (--max-num-batched-tokens); sweep knob
 GPU_UTIL=${GPU_UTIL:-0.92}
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
@@ -117,7 +118,8 @@ if [ "$MODE" = eval ]; then
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
   SPEC_ARGS=()
 else
-  EXTRA_ARGS=(--max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "${CHUNK:-8192}"
+  PROF_ARGS=(); [ "$PROFILE" = 1 ] && PROF_ARGS=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false); [ "$PROFILE" = 1 ] && mkdir -p "$CACHE/prof"
+  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens "${CHUNK:-8192}"
               $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
@@ -243,7 +245,7 @@ exec podman run --replace --name "$NAME" --privileged --ipc=host --network=host 
   --attention-backend R4D \
   --no-async-scheduling \
   --mamba-cache-mode align \
-  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
   --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja \
   "${SPEC_ARGS[@]}" \

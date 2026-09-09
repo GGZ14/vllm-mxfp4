@@ -11,7 +11,7 @@ except FileNotFoundError: pass
 todo = [r for r in rows if r["id"] not in done]
 print(f"{len(todo)} prompts to run ({len(done)} done), conc {conc}, max_tokens {max_tokens}", flush=True)
 def one(r):
-    body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": r["prompt"]}], "max_tokens": max_tokens}).encode()
+    body = json.dumps({"model": MODEL, "messages": r.get("messages") or [{"role": "user", "content": r["prompt"]}], "max_tokens": max_tokens}).encode()
     req = urllib.request.Request(URL, body, {"Content-Type": "application/json"})
     t0 = time.time()
     try:

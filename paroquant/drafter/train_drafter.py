@@ -23,8 +23,9 @@ p.add_argument("--out", required=True)
 p.add_argument("--epochs", type=float, default=2.0); p.add_argument("--lr", type=float, default=1e-4)
 p.add_argument("--anchors", type=int, default=64, help="anchors per sequence per step")
 p.add_argument("--seqs", type=int, default=4, help="sequences per step")
-p.add_argument("--max-len", type=int, default=3072); p.add_argument("--min-ctx", type=int, default=32)
+p.add_argument("--max-len", type=int, default=4096); p.add_argument("--min-ctx", type=int, default=32)
 p.add_argument("--val", type=int, default=96); p.add_argument("--warmup", type=float, default=0.04)
+p.add_argument("--val-dir", default="", help="fixed held-out capture dir (excluded from training); overrides --val")
 p.add_argument("--gamma", type=float, default=4.0); p.add_argument("--freeze-mlp", action="store_true")
 p.add_argument("--eval-only", action="store_true"); p.add_argument("--eval-every", type=int, default=150)
 p.add_argument("--save-every", type=int, default=300); p.add_argument("--seed", type=int, default=0)
@@ -254,10 +255,14 @@ def evaluate(model, embed, head, files, tag):
 
 
 # ------------------------------------------------------------------ main
-files = sorted(f for f in glob.glob(os.path.join(args.capture, "*.pt")) if os.path.getsize(f) > (args.min_ctx + 16) * 25700)  # drop warmup/short captures
+files = sorted(f for d in args.capture.split(",") for f in glob.glob(os.path.join(d, "*.pt")) if os.path.getsize(f) > (args.min_ctx + 16) * 25700)  # drop warmup/short captures; comma-separated dirs
 if args.max_files: files = files[: args.max_files]
 random.Random(args.seed).shuffle(files)
-val_files, train_files = files[: args.val], files[args.val:]
+if args.val_dir:
+    val_files = sorted(f for f in glob.glob(os.path.join(args.val_dir, "*.pt")) if os.path.getsize(f) > (args.min_ctx + 16) * 25700)
+    train_files = files
+else:
+    val_files, train_files = files[: args.val], files[args.val:]
 log(f"{len(files)} capture files: {len(train_files)} train / {len(val_files)} val")
 model = Drafter().to(dev)
 selector_sd = load_drafter(model, args.drafter)
