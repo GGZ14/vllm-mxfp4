@@ -82,6 +82,9 @@ PTOK_ENABLED = os.environ.get("RADIANCE_PQ_PTOK", "1") == "1"
 # Prefill GEMM on a fragment-tiled activation (pass C writes the tile layout, the GEMM reads A
 # straight from global into the WMMA register; no A tile in LDS). Harness-gated 2026-09-02.
 ATILED_ENABLED = os.environ.get("RADIANCE_PQ_ATILED", "1") == "1"
+# Fused prefill prologue: pass A + pass C as one launch (pq_rotate_tokquant with row-sums), byte-exact
+# (par_harness tokqrs). 0 = the two-pass path.
+FUSED_TOKQ = os.environ.get("RADIANCE_PQ_FUSED_TOKQ", "1") == "1"
 # Weight layout: fragment order (one 32-lane u32 slot per (n-tile, k-step)) rather than the
 # loader's [N, K/8]. The kernels read RADIANCE_PQ_WPERM themselves; this flag and theirs MUST
 # agree or the weight is read as garbage. Fragment order is what makes the decode kernel's
@@ -205,16 +208,22 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None):
         # encode + plain row-sums), PTOK GEMM (AutoRound-cost fold, As in the epilogue).
         # Tiled: pass C emits the fragment-tiled layout (16-row padded) and the A-direct GEMM
         # consumes it; row-major otherwise.
-        xr = torch.empty((P, M, K), device=x.device, dtype=torch.bfloat16)
         as_tok = torch.empty((P, M), device=x.device, dtype=torch.float32)
-        _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
-                                 asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
         if tiled:
             Mt = (M + 15) // 16
             a_codes = torch.empty((P, Mt * 16 * K), device=x.device, dtype=torch.uint8)
-        _ext.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
-                                as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream,
-                                1 if tiled else 0)
+        if FUSED_TOKQ:
+            # one launch: rotate -> token amax -> encode (+ tiled layout) + plain row-sums
+            _ext.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
+                                        a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot,
+                                        stream, 1 if tiled else 0, rs.data_ptr())
+        else:
+            xr = torch.empty((P, M, K), device=x.device, dtype=torch.bfloat16)
+            _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
+                                     asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
+            _ext.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
+                                    as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream,
+                                    1 if tiled else 0)
         gemm_scale = as_tok
     else:
         _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),

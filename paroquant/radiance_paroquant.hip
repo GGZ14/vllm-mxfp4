@@ -113,21 +113,26 @@ static int pq_tok_waves(int M, int K = 0) {
 
 static void launch_rotate_tokquant(uintptr_t x, uintptr_t t, uintptr_t cs, uintptr_t a,
                                    uintptr_t as, int M, int K, int P, int krot, uintptr_t stream,
-                                   int tiled = 0) {
+                                   int tiled = 0, uintptr_t rs = 0) {
   if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
   if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
   const size_t smem = (size_t)K * 2;             // the rotated bf16 row
   if (smem > 60u * 1024u) throw std::runtime_error("ParoQuant: rotate_tokquant needs K*2 B of LDS; K too large");
   const dim3 grid(M, P);
   const int W = pq_tok_waves(M, K);
-#define PQ_TQ(W_, T_)                                                                            \
-  hipLaunchKernelGGL((pq_rotate_tokquant<W_, T_>), grid, dim3(W_ * 32), smem,                    \
+#define PQ_TQ(W_, T_, R_)                                                                        \
+  hipLaunchKernelGGL((pq_rotate_tokquant<W_, T_, false, R_>), grid, dim3(W_ * 32), smem,         \
                      reinterpret_cast<hipStream_t>(stream),                                      \
                      reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const unsigned short *>(t), \
                      reinterpret_cast<const __half *>(cs), reinterpret_cast<unsigned char *>(a),  \
-                     reinterpret_cast<float *>(as), M, K, krot)
-  if (tiled) { if (W == 32) PQ_TQ(32, true); else if (W == 16) PQ_TQ(16, true); else PQ_TQ(8, true); }
-  else       { if (W == 32) PQ_TQ(32, false); else if (W == 16) PQ_TQ(16, false); else PQ_TQ(8, false); }
+                     reinterpret_cast<float *>(as), M, K, krot, reinterpret_cast<float *>(rs))
+  if (rs) {   // int4 PTOK prologue: codes + token scale + plain row-sums in one launch
+    if (tiled) { if (W == 32) PQ_TQ(32, true, true); else if (W == 16) PQ_TQ(16, true, true); else PQ_TQ(8, true, true); }
+    else       { if (W == 32) PQ_TQ(32, false, true); else if (W == 16) PQ_TQ(16, false, true); else PQ_TQ(8, false, true); }
+  } else {
+    if (tiled) { if (W == 32) PQ_TQ(32, true, false); else if (W == 16) PQ_TQ(16, true, false); else PQ_TQ(8, true, false); }
+    else       { if (W == 32) PQ_TQ(32, false, false); else if (W == 16) PQ_TQ(16, false, false); else PQ_TQ(8, false, false); }
+  }
 #undef PQ_TQ
 }
 
@@ -389,7 +394,7 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
 namespace py = pybind11;
 PYBIND11_MODULE(radiance_paroquant_kernel, m) {
   m.def("launch_rotate_tokquant", &launch_rotate_tokquant,
-        "x, T, cs, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
+        "x, T, cs, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("rs") = 0);
   m.def("launch_add_rms_rot_tok", &launch_add_rms_rot_tok,
         "y, res, w, eps, T, cs, hs, ro, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("y"), py::arg("res"), py::arg("w"), py::arg("eps"), py::arg("T"), py::arg("cs"), py::arg("hs"), py::arg("ro"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
   m.def("launch_ew_rot_tok", &launch_ew_rot_tok,

@@ -595,6 +595,81 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
     printf("tokq: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
   }
 
+  if (what == "tokqrs" || what == "all") {
+    // int4 prefill prologue as ONE launch: pq_rotate_tokquant<W, TILED, false, true> (codes + token scale + plain
+    // row-sums) must be BYTE-identical to pass A (pq_rotate_quant2<true>) + pass C (pq_token_quant / _tiled).
+    int fails = 0;
+    std::mt19937 rng(9191u);
+    std::normal_distribution<float> nd(0.f, 0.8f);
+    std::uniform_real_distribution<float> ud(-3.1f, 3.1f);
+    for (const int K : {5120, 8704}) {
+      for (const int M : {40, 101, 600, 2048}) {
+        for (const int P : {1, 2, 3}) {
+          for (const int tiled : {0, 1}) {
+            const int krot = 8, G = K / PQ_GROUP, Mt = (M + 15) / 16;
+            const size_t abytes = tiled ? (size_t)P * Mt * 16 * K : (size_t)P * M * K;
+            unsigned short *dX, *dT; __half *dCS; unsigned char *dA1, *dA2; float *dASG, *dRS1, *dRS2, *dAS1, *dAS2; __bf16 *dXR;
+            HIP_CHECK(hipMalloc(&dX, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dT, (size_t)P * krot * (K / 2) * 8));
+            HIP_CHECK(hipMalloc(&dCS, (size_t)P * K * 2)); HIP_CHECK(hipMalloc(&dXR, (size_t)P * M * K * 2));
+            HIP_CHECK(hipMalloc(&dA1, abytes)); HIP_CHECK(hipMalloc(&dA2, abytes));
+            HIP_CHECK(hipMalloc(&dASG, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS1, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS2, (size_t)P * M * G * 4));
+            HIP_CHECK(hipMalloc(&dAS1, (size_t)P * M * 4)); HIP_CHECK(hipMalloc(&dAS2, (size_t)P * M * 4));
+            HIP_CHECK(hipMemset(dA1, 0, abytes)); HIP_CHECK(hipMemset(dA2, 0, abytes));
+            HIP_CHECK(hipMemset(dRS1, 0x7f, (size_t)P * M * G * 4)); HIP_CHECK(hipMemset(dRS2, 0x3f, (size_t)P * M * G * 4));
+            {
+              std::vector<unsigned short> Xh((size_t)M * K);
+              for (auto &v : Xh) { const float f = nd(rng); unsigned int u; memcpy(&u, &f, 4); v = (unsigned short)(u >> 16); }
+              HIP_CHECK(hipMemcpy(dX, Xh.data(), Xh.size() * 2, hipMemcpyHostToDevice));
+              std::vector<unsigned short> Tt((size_t)P * krot * (K / 2) * 4, 0); std::vector<int> perm(PQ_GROUP);
+              for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g) {
+                for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i; std::shuffle(perm.begin(), perm.end(), rng);
+                for (int t = 0; t < 64; ++t) { const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4; const float th = ud(rng); const __half c = __float2half(cosf(th)), sn = __float2half(sinf(th)); Tt[e] = (unsigned short)(perm[2 * t] | (perm[2 * t + 1] << 8)); memcpy(&Tt[e + 1], &c, 2); memcpy(&Tt[e + 2], &sn, 2); }
+              }
+              HIP_CHECK(hipMemcpy(dT, Tt.data(), Tt.size() * 2, hipMemcpyHostToDevice));
+              std::vector<__half> csh((size_t)P * K); for (auto &v : csh) v = __float2half(0.75f + 0.5f * (float)(rng() % 1000u) / 1000.f);
+              HIP_CHECK(hipMemcpy(dCS, csh.data(), csh.size() * 2, hipMemcpyHostToDevice));
+            }
+            const dim3 blk(PQ_ROT_WAVES * 32);
+            const dim3 gA(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P);
+            const dim3 gCt(Mt, P, pq_tq_zsplit(M)), gCr((M + PQ_ROT_WAVES - 1) / PQ_ROT_WAVES, P);
+            auto twopass = [&](int) {
+              hipLaunchKernelGGL(pq_rotate_quant2<true>, gA, blk, 0, 0, (const __bf16 *)dX, dT, dCS, (unsigned char *)dXR, dASG, dRS1, M, K, krot);
+              if (tiled) hipLaunchKernelGGL(pq_token_quant_tiled, gCt, blk, 0, 0, dXR, dASG, dA1, dAS1, dRS1, M, K);
+              else hipLaunchKernelGGL(pq_token_quant, gCr, blk, 0, 0, dXR, dASG, dA1, dAS1, dRS1, M, K);
+            };
+            auto fused8 = [&](int) {
+              if (tiled) hipLaunchKernelGGL((pq_rotate_tokquant<8, true, false, true>), dim3(M, P), dim3(256), (size_t)K * 2, 0, (const __bf16 *)dX, dT, dCS, dA2, dAS2, M, K, krot, dRS2);
+              else hipLaunchKernelGGL((pq_rotate_tokquant<8, false, false, true>), dim3(M, P), dim3(256), (size_t)K * 2, 0, (const __bf16 *)dX, dT, dCS, dA2, dAS2, M, K, krot, dRS2);
+            };
+            auto fused16 = [&](int) {
+              if (tiled) hipLaunchKernelGGL((pq_rotate_tokquant<16, true, false, true>), dim3(M, P), dim3(512), (size_t)K * 2, 0, (const __bf16 *)dX, dT, dCS, dA2, dAS2, M, K, krot, dRS2);
+              else hipLaunchKernelGGL((pq_rotate_tokquant<16, false, false, true>), dim3(M, P), dim3(512), (size_t)K * 2, 0, (const __bf16 *)dX, dT, dCS, dA2, dAS2, M, K, krot, dRS2);
+            };
+            size_t da = 0, ds = 0, dr = 0;
+            for (int wv = 0; wv < 2; ++wv) {
+              HIP_CHECK(hipMemset(dA2, 0, abytes));
+              twopass(0); if (wv == 0) fused8(0); else fused16(0); HIP_CHECK(hipDeviceSynchronize());
+              std::vector<unsigned char> a1(abytes), a2(abytes); std::vector<float> s1((size_t)P * M), s2(s1.size()), r1((size_t)P * M * G), r2(r1.size());
+              HIP_CHECK(hipMemcpy(a1.data(), dA1, abytes, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(a2.data(), dA2, abytes, hipMemcpyDeviceToHost));
+              HIP_CHECK(hipMemcpy(s1.data(), dAS1, s1.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(s2.data(), dAS2, s2.size() * 4, hipMemcpyDeviceToHost));
+              HIP_CHECK(hipMemcpy(r1.data(), dRS1, r1.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(r2.data(), dRS2, r2.size() * 4, hipMemcpyDeviceToHost));
+              if (tiled) { for (int pp = 0; pp < P; ++pp) for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k) { const size_t o = (size_t)pp * Mt * 16 * K + pq_tiled_off(m, k, K); da += a1[o] != a2[o]; } }
+              else for (size_t i = 0; i < a1.size(); ++i) da += a1[i] != a2[i];
+              for (size_t i = 0; i < s1.size(); ++i) ds += s1[i] != s2[i];
+              for (size_t i = 0; i < r1.size(); ++i) dr += memcmp(&r1[i], &r2[i], 4) != 0;
+            }
+            const int iters = M >= 2048 ? 20 : 100; double t2 = 1e30, tf8 = 1e30, tf16 = 1e30;
+            for (int rep = 0; rep < REPS; ++rep) { t2 = std::min(t2, time_us(twopass, iters, e0, e1)); tf8 = std::min(tf8, time_us(fused8, iters, e0, e1)); tf16 = std::min(tf16, time_us(fused16, iters, e0, e1)); }
+            const bool pass = da == 0 && ds == 0 && dr == 0; if (!pass) ++fails;
+            printf("  tokqrs K=%-5d M=%-5d P=%d %s code-diff=%zu scale-diff=%zu rs-diff=%zu  passA+C %8.1f us  fused w8 %8.1f w16 %8.1f us (best %.2fx) %s\n",
+                   K, M, P, tiled ? "tiled" : "row  ", da, ds, dr, t2, tf8, tf16, t2 / std::min(tf8, tf16), pass ? "OK" : "FAIL");
+            hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dXR); hipFree(dA1); hipFree(dA2); hipFree(dASG); hipFree(dRS1); hipFree(dRS2); hipFree(dAS1); hipFree(dAS2);
+          }
+        }
+      }
+    }
+    printf("tokqrs: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
+  }
   if (what == "tokqt" || what == "all") {
     // fused rotate + token quant writing the TILED layout == pass A + pq_token_quant_tiled (AT, AS byte-exact)
     int fails = 0;

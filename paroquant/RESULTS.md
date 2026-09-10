@@ -569,3 +569,34 @@ unit (0.92 util) OOMs on ~1,000-token chunks -- run the reference at 0.80 with 1
 prod's container keeps answering on :8080 (it also serves the alias `Qwen3.8`) for ~30 s after
 `systemctl stop`, so wait for the port to close before booting the reference or the collector reads
 a dying prod as the reference; chunking must match on both sides.
+
+## 2026-09-09 (late): int4 PARO gets the MXFP4-PARO lessons -- skinny gate GEMM (+3-4% step), fused prologue (byte-exact, prefill-neutral)
+
+Back-to-back on the `qwen_vllm_paro` unit (TP=2, SPEC=7, original drafter):
+
+| int4 PARO | ms/step @ ctx 25 / 8k / 32k | KV profile | GSM8K 500q | prefill 2k/8k/16k/32k/64k PP t/s |
+|---|---|---|---|---|
+| baseline (util 0.92, hipBLASLt gates, two-pass prologue) | 24.09 / 25.87 / 26.43 | 811,822 | 97.4-98.0 (rec.) | 3787 / 3643 / 3558 / 3487 / 3335 |
+| **+ `RADIANCE_SKINNY_GEMM=all`, `GPU_UTIL=0.95`, fused prologue (unit default now)** | **23.27 / 24.79 / 25.59** (-3.4 / -4.2 / -3.2%) | **854,369** (+5.2%) | **97.40** (487/500) | 3808 / 3646 / 3566 / 3495 / 3349 (+0.1-0.5%) |
+
+- Skinny split-K bf16 GEMM for the 48 GDN gate projections: the same 1.1 ms/step it gave MXFP4-PARO.
+  The launcher now keys the int4 compile-cache dir on the flag (`-sk` suffix), as the MXFP4 unit did
+  by hand. First boot on a fresh cache dir reported 3.6 GiB more "non-torch" memory per rank (KV
+  664k); every warm-cache boot since is normal (12.9 GiB consumed, KV 854-864k) -- a fresh-compile
+  transient, not a leak. Don't read KV off a first boot.
+- Fused prologue for the PTOK/A-tiled band: `pq_rotate_tokquant<W, TILED, IL, WRS=true>` now also emits
+  the int4 GEMM's plain code row-sums (`pq_tok_encode_row<..., RS>`), so pass A + pass C become one
+  launch with no bf16 round trip of the rotated row; `launch_rotate_tokquant(..., tiled, rs)`, loader
+  knob `RADIANCE_PQ_FUSED_TOKQ` (default 1, forwarded by the launcher). Harness gate `tokqrs`: 48
+  shapes (K 5120/8704, M 40-2048, P 1-3, row + tiled) byte-exact on codes, token scales and row-sums,
+  1.2-4x faster than the two-pass kernels (4x at M=40, ~1.25x at M=2048). Served: **+0.1-0.5% prefill**,
+  inside noise, in a paired same-build sweep (two-pass 3787/3643/3558/3487/3335 -> fused
+  3808/3646/3566/3495/3349). The int4 prefill is bound by the GEMM's zero-point fold (the 09-03 ledger:
+  16 VALU per tile-group), so a faster prologue does not move it. Kept on: byte-exact, one launch
+  fewer per site, and no `xr` scratch (the MXFP4 stack saw +5-9% from the same change because its GEMM
+  is 20% cheaper and its prologue was a larger share).
+- BetterBench decode single pass on the new build: 206.8 combined (int4's 09-03 record 226.2; the
+  same-build spread on this bench is ~10%, so neither number is a verdict).
+- Trap: the launcher forwards an explicit `-e RADIANCE_PQ_*` list; a new loader knob that is not
+  added there silently takes its code default inside the container. The first "fused vs two-pass"
+  sweep compared fused with fused (identical to 0.1%) before the env line existed.

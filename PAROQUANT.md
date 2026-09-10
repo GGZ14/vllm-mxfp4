@@ -366,6 +366,8 @@ and an output copy per partition. hipGraph hides CPU cost, not kernel count.
 | + fused TILED prologue for the A-tiled band (shipped) | 24.53 / 26.43 / 26.97 | -- | prefill +5-9%, see below |
 | + skinny split-K bf16 GEMM for the GDN gate projections (`RADIANCE_SKINNY_GEMM=all`, shipped) | **23.38 / 24.91 / 25.80** | 216.3 | 97.40 |
 
+The same two changes went back to the int4 PARO unit on 2026-09-09: skinny gate GEMM + `GPU_UTIL=0.95` took it from 24.09 / 25.87 / 26.43 to **23.27 / 24.79 / 25.59 ms/step** (KV 812k -> 854k, GSM8K 97.40); the fused single-launch prologue (`pq_rotate_tokquant<..., WRS>`, byte-exact incl. row-sums, harness `tokqrs`) is on by default but served prefill moved only +0.1-0.5%: int4 prefill is bound by the GEMM's zero-point fold, not the prologue.
+
 Each step is gated bit-identical to the path it replaced (`par_harness --bench2 tokq` and
 `tokstream`: 54 + 45 shapes, codes / scales / hs / residual byte-exact) and output-identical at the
 loader level (`test_mxfp4_loader.py`: stream tuple vs plain path `torch.equal` at every site and M).

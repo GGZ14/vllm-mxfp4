@@ -103,6 +103,7 @@ else
   MAXLEN=${MAXLEN:-262144}; MAXSEQS=${MAXSEQS:-8}
 fi
 GPU_UTIL=${GPU_UTIL:-0.92}
+MAX_LOGPROBS=${MAX_LOGPROBS:-20}   # --max-logprobs (vLLM default 20); raise, e.g. 256, only to collect prompt_logprobs for a KL-divergence run
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
 # also zeroes the cudagraph pad rows. The AutoRound int4 serve (same bf16-input linear contract)
 # has run it since 08-30; the merge hook it needs is installed with the merge itself left OFF
@@ -135,6 +136,7 @@ ROT_STREAM3=${RADIANCE_PQ_ROT_STREAM3:-0}
 CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && CACHE_SUF="$CACHE_SUF-rs"
 [ "$ROT_STREAM2" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs2"
 [ "$ROT_STREAM3" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs3"
+[ "${RADIANCE_SKINNY_GEMM:-1}" = all ] && CACHE_SUF="${CACHE_SUF}-sk"   # skinny in_proj_ba routing changes the compiled graph
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
@@ -158,14 +160,14 @@ MEM_ARGS=(); [ -n "$MEM_LIMIT" ] && MEM_ARGS=(--memory "$MEM_LIMIT")
 CAPTURE_MOUNT=(); if [ -n "$CAPTURE_DIR" ]; then mkdir -p "$CAPTURE_DIR"; CAPTURE_MOUNT=(-v "$CAPTURE_DIR:/capture:z"); fi
 
 if [ "$MODE" = eval ]; then
-  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS"
+  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-logprobs "$MAX_LOGPROBS"
               --max-num-batched-tokens 8192)
   # Per-rank quantized shapes: qkv, o, gate_up, down, in_proj(+merge), out_proj
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
   SPEC_ARGS=()
 else
   PROF_ARGS=(); [ "$PROFILE" = 1 ] && PROF_ARGS=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false); [ "$PROFILE" = 1 ] && mkdir -p "$CACHE/prof"
-  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-num-batched-tokens "$CHUNK"
+  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-logprobs "$MAX_LOGPROBS" --max-num-batched-tokens "$CHUNK"
               $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
@@ -212,6 +214,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_DECODE_NT="${RADIANCE_PQ_DECODE_NT:-1}" \
   -e RADIANCE_PQ_ATILED="${RADIANCE_PQ_ATILED:-1}" -e RADIANCE_PQ_AT_LBK="${RADIANCE_PQ_AT_LBK:-128}" \
   -e RADIANCE_PQ_AT_HOIST="${RADIANCE_PQ_AT_HOIST:-1}" -e RADIANCE_PQ_PTOK="${RADIANCE_PQ_PTOK:-1}" \
+  -e RADIANCE_PQ_FUSED_TOKQ="${RADIANCE_PQ_FUSED_TOKQ:-1}" \
   -e RADIANCE_PQ_ROT_STREAM="$ROT_STREAM" -e RADIANCE_PQ_ROT_STREAM2="$ROT_STREAM2" \
   -e RADIANCE_PQ_ROT_STREAM3="$ROT_STREAM3" -e RADIANCE_PQ_AR_CHECK="${RADIANCE_PQ_AR_CHECK:-0}" \
   -e RADIANCE_PQ_AR_FALLBACK="${RADIANCE_PQ_AR_FALLBACK:-0}" \

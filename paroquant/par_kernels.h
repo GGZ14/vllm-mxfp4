@@ -761,10 +761,13 @@ __device__ __forceinline__ void pq_tok_rotate_park2(
 // the row's codes into the fragment-tiled slab (arow = the partition's slab base, m = the row):
 // a lane's four codes are one aligned 4 B piece of an 8 B fragment chunk, so each wave store
 // scatters 32 x 4 B over 16 fragment lines that the 15 neighbouring rows' workgroups fill in.
-template <int W, bool TILED = false>
+// RS: also emit the int4 PTOK GEMM's plain code-domain row-sums per group (rs_out[g]): the same
+// per-lane sum + 32-lane xor tree as pq_token_quant / pq_token_quant_tiled, so byte-exact.
+template <int W, bool TILED = false, bool RS = false>
 __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, const __bf16 *s_row,
                                                   unsigned char *__restrict__ arow, float *__restrict__ as_out,
-                                                  int G, int wave, int lane, int tid, int m = 0, int K = 0) {
+                                                  int G, int wave, int lane, int tid, int m = 0, int K = 0,
+                                                  float *__restrict__ rs_out = nullptr) {
 #pragma unroll
   for (int off = 16; off >= 1; off >>= 1) wamax = fmaxf(wamax, __shfl_xor(wamax, off, 32));
   if (lane == 0) s_amax[wave] = wamax;
@@ -786,6 +789,12 @@ __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, co
                                 ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
     if constexpr (TILED) *(unsigned int *)(arow + pq_tiled_off(m, c, K)) = packed;
     else *(unsigned int *)(arow + c) = packed;
+    if constexpr (RS) {
+      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+      if (lane == 0) rs_out[g] = rs;
+    }
   }
 }
 
@@ -798,11 +807,13 @@ __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, co
 // path by construction: same fmaf chain and record order, amax taken on the fp32 rotated values,
 // encode on the bf16-rounded ones, and max_g(amax_g) * (1/448) == max_g(amax_g * (1/448))
 // exactly because multiplying by a positive constant is monotone. Gated in par_harness (tokq).
-template <int W = PQ_ROT_WAVES, bool TILED = false, bool IL = false>
+// WRS: also write RS [P, M, K/128] (the int4 PTOK GEMM's plain row-sums), making the int4 prefill
+// prologue this one launch instead of pass A + pass C (gated byte-exact: par_harness tokqrs).
+template <int W = PQ_ROT_WAVES, bool TILED = false, bool IL = false, bool WRS = false>
 __global__ __launch_bounds__(W * 32) void pq_rotate_tokquant(
     const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
     const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ AS,
-    int M, int K, int krot) {
+    int M, int K, int krot, float *__restrict__ RS = nullptr) {
   extern __shared__ __align__(16) unsigned char s_dyn[];
   __bf16 *s_row = (__bf16 *)s_dyn;                 // [K] rotated row, bf16-rounded as pass A stores it
   __shared__ float s_x[IL ? 2 * W : W][PQ_GROUP];
@@ -841,13 +852,14 @@ __global__ __launch_bounds__(W * 32) void pq_rotate_tokquant(
       pq_tok_rotate_park(nv, cs, rec, krot, s_x[wave], c0, s_row + (size_t)g * PQ_GROUP, wamax);
     }
   }
+  float *rs_row = WRS ? RS + ((size_t)p * M + m) * G : nullptr;
   if constexpr (TILED) {
     const int Mt = (M + 15) >> 4;
-    pq_tok_encode_row<W, true>(wamax, s_amax, s_row, A + (size_t)p * Mt * 16 * K, AS + (size_t)p * M + m,
-                               G, wave, lane, tid, m, K);
+    pq_tok_encode_row<W, true, WRS>(wamax, s_amax, s_row, A + (size_t)p * Mt * 16 * K, AS + (size_t)p * M + m,
+                                    G, wave, lane, tid, m, K, rs_row);
   } else {
-    pq_tok_encode_row<W, false>(wamax, s_amax, s_row, A + ((size_t)p * M + m) * K, AS + (size_t)p * M + m,
-                                G, wave, lane, tid);
+    pq_tok_encode_row<W, false, WRS>(wamax, s_amax, s_row, A + ((size_t)p * M + m) * K, AS + (size_t)p * M + m,
+                                     G, wave, lane, tid, m, K, rs_row);
   }
 }
 // residual add + Gemma RMSNorm + rotate + token quant. Grid (M, P). Out HS/RO [M, K] (p == 0),
