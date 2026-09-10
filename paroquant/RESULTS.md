@@ -600,3 +600,51 @@ Back-to-back on the `qwen_vllm_paro` unit (TP=2, SPEC=7, original drafter):
 - Trap: the launcher forwards an explicit `-e RADIANCE_PQ_*` list; a new loader knob that is not
   added there silently takes its code default inside the container. The first "fused vs two-pass"
   sweep compared fused with fused (identical to 0.1%) before the env line existed.
+
+## 2026-09-10: int5 W5A8 ParoQuant -- round-to-nearest checkpoint, kernel and first served numbers
+
+Why 5 bits: the int4 kernel feeds the fp8 WMMA the signed code (c - 8), exact in e4m3; with 5-bit codes
+(c - 16) runs -16..15 and every integer in that range is ALSO exact in e4m3, so the GEMM algebra, the
+zero-point fold, the per-token e4m3 activations, the rotation-stream producers and the split-K / A-tiled
+bands all carry over. Only the weight staging changes: the low nibbles stay in today's word layout and
+the fifth bit rides in a byte-per-(slot, lane) plane in the same fragment order (`pq_stage_w<..., BITS=5>`,
+`ar_unpack8_5`: four `v_perm` table selects per four codes). int6 would NOT have this property (codes to
++-32 are not exact in e4m3) and needs the int8 WMMA rewrite; measured 2026-09-10: int8 WMMA 342 TOPS =
+1.06x fp8's 322, dense int4 16x16x32 682 (needs A4).
+
+Checkpoint (`build_int5.py`, 51 s on one GPU): bf16 base x z-lab's trained rotations -> uniform
+asymmetric int5 g128 RTN (UniformAffineQuantizer's grid with n_bits=5), "int5-bitplane": qweight/qzeros
+= AWQ packing of the low nibbles (the int4 loader's layout), qweight_hi/qzeros_hi = [K, N/32] int32
+fifth-bit planes; 21 GB on disk (MXFP4-PARO 18, FP8 30). `convert_int5.py` writes the same layout from an
+optimize/finetune result dir; `requant.sh NBIT=5 FORMAT=int POW2=0`.
+
+Gates:
+- harness `int5`: 32-code LUT round trip exact; decode / prefill / A-tiled x {qkv, o_proj, gate_up,
+  down, in_proj, tiny2p} x M {1, 8, 40, 64, 200, 1024} all rel 1.65-1.71e-3 (the bf16 output floor,
+  same as int4); 5-bit vs 4-bit kernel time 1.20-1.26x at decode M<=8 (= the 1.235x byte ratio: purely
+  bandwidth-bound, no unpack penalty), 1.02-1.16x prefill/A-tiled (unpack VALU on a staging-bound kernel).
+- KL(bf16 || int5 RTN pseudo), top-256 (~full vocab), 96 x 500-char chunks, 3 corpora:
+  wikitext 0.0109 nats (top-1 94.7%), code 0.0097 (96.4%), served traffic 0.0074 (96.3%) --
+  vs PARO-MXFP4 0.048 / 90.0% on wikitext (1000-char chunks; re-collect prod at 500 to make it exact).
+  ~4.5x closer to bf16 than MXFP4 BEFORE any fine-tune.
+- served (TP=2, SPEC=7, original DFlash2 FP8 drafter, skinny, util 0.95): **26.07 / 27.69 / 28.49
+  ms/step** @ ctx 25 / 8k / 32k (projected ~25.9 / 28.3; MXFP4-PARO 23.38 / 24.91 / 25.80; int4 PARO
+  23.27 / 24.79 / 25.59), 114 / 90 / 115 tok/s, acc/draft 1.98 / 1.48 / 2.27 (ctx-25 acceptance above
+  int4's 1.61 and MXFP4-PARO's ~1.9: the drafter was trained on the bf16 target); KV **767,217** tokens
+  (projected ~760k; MXFP4-PARO 862k); prefill **3490 / 3339 / 3343 / 3271 / 3137** PP t/s @ 2k-64k (int4
+  PARO 3808 / 3646 / 3566 / 3495 / 3349: -8%, the wider unpack on the fold-bound kernel; MXFP4-PARO
+  4770 @ 2k); **GSM8K 97.80% (489/500)**, top of the band (FP8 / AMD MXFP4 97.8, int4 PARO and MXFP4-PARO
+  97.4-97.6).
+
+Traps: (1) a resident CHECKALL reference copy of the full codes doubled the weight footprint and the
+serve died at KV allocation -- the reference is now rebuilt from the kernel-layout tensors
+(`unpermute_wh`) on demand; (2) CHECKALL rel 0.00000 lines fire on the profiling pass (zero inputs) and
+are deduplicated per (N, K, M), so they prove the paths run, not their accuracy -- the harness gate and
+GSM8K are the evidence; (3) prompt-logprob collection on a 25.7 GiB fp16 model needs the KV cache capped
+explicitly (`--kv-cache-memory 1.5G`, eager, 512 batched tokens): utilization-sized KV leaves nothing
+for the whole-chunk fp32 log-softmax; (4) a KLD serve at max-num-seqs 1 makes GSM8K take hours -- run
+GSM8K on the real serve.
+
+Next: stage-2 fine-tune (`STAGE=finetune NBIT=5`, ~6 h, rotations frozen) -> `convert_int5.py` -> the
+same gates; then decide prod between MXFP4-PARO (speed, KV) and int5 (fidelity: ~8-bit-class KL at
+5.25 bits, -10% decode, -11% KV, -27% prefill vs MXFP4-PARO).

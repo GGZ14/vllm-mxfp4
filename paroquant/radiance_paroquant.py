@@ -144,13 +144,25 @@ def _e4m3_table(device):
     return _E4M3_TABLE[0]
 
 
-_CHECK_CODES: dict = {}     # int5 CHECKALL: qweight data_ptr -> full [N, K] codes (reference only)
+def unpermute_wh(whi: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Fragment-order fifth-bit plane [N, K/8] u8 -> [N, K] u8 (0/1), reference path only."""
+    nt, ks = N // 16, K // 16
+    hb = whi.view(nt, ks, 2, 16, 1).permute(0, 3, 1, 2, 4).contiguous().view(N, K // 8)
+    shifts = torch.arange(8, device=whi.device, dtype=torch.uint8)
+    return ((hb.unsqueeze(-1) >> shifts) & 1).reshape(N, K)
+
+
+def unpack_codes(qweight_row: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Row-layout [N, K/8] i32 (eight nibbles along K, low nibble = lowest k) -> [N, K] u8."""
+    w32 = qweight_row.view(torch.int32)
+    shifts = torch.arange(0, 32, 4, device=qweight_row.device, dtype=torch.int32)
+    return ((w32.unsqueeze(-1) >> shifts) & 0xF).reshape(N, K).to(torch.uint8)
 
 
 def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None, codes_full=None, zoff=8.0):
     """Dequantize to fp32 and matmul, mirroring the kernel algebra. Deliberately slow/obvious.
     Per-group mode: asg [P,M,G], rs = rowsum*asg. Per-token mode: as_tok [P,M], rs plain."""
-    device = qweight.device
+    device = a_codes.device
     G = K // GROUP
     sc = sz.view(G, N, 2)[..., 0].float()            # [G, N]
     zsc = sz.view(G, N, 2)[..., 1].float()
@@ -249,9 +261,10 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
             and (N, K, M) not in _checked:
         _checked.add((N, K, M))
         a_ref = untile_a(a_codes, P, M, K) if tiled else a_codes
-        if whi is not None:
+        if whi is not None:   # int5: full codes rebuilt from the kernel-layout tensors (no resident copy)
+            lo = unpack_codes(unpermute_w(qweight, N, K), N, K)
             ref = _exact_ref(a_ref, asg, rs, None, sz, N, K, pb1, pb2, as_tok=as_tok,
-                             codes_full=_CHECK_CODES.get(qweight.data_ptr()), zoff=16.0)
+                             codes_full=lo | (unpermute_wh(whi, N, K) << 4), zoff=16.0)
         else:
             w_ref = unpermute_w(qweight, N, K) if WPERM else qweight
             ref = _exact_ref(a_ref, asg, rs, w_ref, sz, N, K, pb1, pb2, as_tok=as_tok)
@@ -962,8 +975,7 @@ class ParoQuantLinearMethod(LinearMethodBase):
             hb = (hi.reshape(N, K // 8, 8).to(torch.int32) << torch.arange(8, device=device, dtype=torch.int32)).sum(-1).to(torch.uint8)
             nt, ks = N // 16, K // 16
             whi = (hb.view(nt, 16, ks, 2, 1).permute(0, 2, 3, 1, 4).contiguous().view(N, K // 8))
-            if CHECK_ALL is not None:
-                layer.pq_codes_ref = (codes | (hi << 4)).contiguous()    # [N, K] full codes (reference)
+            del hi, hb
         cw = codes.reshape(N, K // PACK, PACK).to(torch.int64)
         shifts = torch.arange(0, 32, 4, device=device, dtype=torch.int64)
         packed = (cw << shifts).sum(dim=-1)                              # exact: disjoint nibbles
@@ -1032,8 +1044,6 @@ class ParoQuantLinearMethod(LinearMethodBase):
             del layer.qweight_hi, layer.qzeros_hi
             layer.whi = torch.nn.Parameter(whi, requires_grad=False)
         layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
-        if bits == 5 and CHECK_ALL is not None:
-            _CHECK_CODES[layer.qweight.data_ptr()] = layer.pq_codes_ref
         layer.sz = torch.nn.Parameter(sz.contiguous(), requires_grad=False)
         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
