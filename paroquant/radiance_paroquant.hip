@@ -307,7 +307,10 @@ static void launch_ar_add_rms_rot(uintptr_t inp, uintptr_t peer_scratch, uintptr
 // plain row-sums. Prefill-class M only -- the decode band reads row-major A.
 static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as, uintptr_t rs,
                            uintptr_t c, int M, int N, int K, int pb1, int pb2,
-                           uintptr_t stream) {
+                           uintptr_t stream, uintptr_t whi = 0) {
+  // whi != 0: int5 weights (fifth-bit plane WH, fragment order); needs WPERM.
+  const auto *WH = reinterpret_cast<const unsigned char *>(whi);
+  if (whi && !wperm()) throw std::runtime_error("ParoQuant int5 needs RADIANCE_PQ_WPERM=1");
   if (K % PQ_GROUP) throw std::runtime_error("ParoQuant kernel: K must be a multiple of 128");
   const auto *A = reinterpret_cast<const unsigned char *>(a);
   const auto *W = reinterpret_cast<const unsigned int *>(w);
@@ -318,15 +321,16 @@ static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as,
   auto st = reinterpret_cast<hipStream_t>(stream);
   constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
   const dim3 grid((N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
-#define PQ_AT(WP_, LBK_, H_)                                                                     \
-  hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, WP_, LBK_, H_>), grid, block, 0, st, A, W,   \
-                     SZ, AS, RS, C, M, N, K, pb1, pb2)
-#define PQ_AT_LBK(WP_)                                                                           \
+#define PQ_AT(WP_, LBK_, H_, B_)                                                                 \
+  hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, WP_, LBK_, H_, 0, 0, B_>), grid, block, 0, st, \
+                     A, W, SZ, AS, RS, C, M, N, K, pb1, pb2, nullptr, nullptr, WH)
+#define PQ_AT_LBK(WP_, B_)                                                                       \
   do {                                                                                           \
-    if (at_lbk() == 64) { if (at_hoist()) PQ_AT(WP_, 64, true); else PQ_AT(WP_, 64, false); }    \
-    else                { if (at_hoist()) PQ_AT(WP_, 128, true); else PQ_AT(WP_, 128, false); }  \
+    if (at_lbk() == 64) { if (at_hoist()) PQ_AT(WP_, 64, true, B_); else PQ_AT(WP_, 64, false, B_); }    \
+    else                { if (at_hoist()) PQ_AT(WP_, 128, true, B_); else PQ_AT(WP_, 128, false, B_); }  \
   } while (0)
-  if (wperm()) PQ_AT_LBK(true); else PQ_AT_LBK(false);
+  if (whi) PQ_AT_LBK(true, 5);
+  else if (wperm()) PQ_AT_LBK(true, 4); else PQ_AT_LBK(false, 4);
 #undef PQ_AT_LBK
 #undef PQ_AT
 }
@@ -335,7 +339,11 @@ static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as,
 // ASG/RS [P, M, K/128] f32   C [M, N] bf16   pb1/pb2 partition boundary columns (INT_MAX unused)
 static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, uintptr_t rs,
                         uintptr_t c, int M, int N, int K, int pb1, int pb2, int ptok,
-                        uintptr_t stream) {
+                        uintptr_t stream, uintptr_t whi = 0) {
+  // whi != 0: int5 weights (fifth-bit plane WH); the 5-bit kernels are instantiated for the
+  // fragment-order layout only (WPERM), which the loader asserts for int5.
+  const auto *WH = reinterpret_cast<const unsigned char *>(whi);
+  if (whi && !wperm()) throw std::runtime_error("ParoQuant int5 needs RADIANCE_PQ_WPERM=1");
   if (K % PQ_GROUP)
     throw std::runtime_error("ParoQuant kernel: K must be a multiple of the 128 group size");
 
@@ -358,21 +366,22 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
       N <= PQ_DEC_MAX_N && (ks == 1 || have_scratch)) {
     const dim3 grid(nblk, 1, ks), block(PQ_DEC_DWN * 32);
     const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;    // smallest tile that covers M
-#define PQ_DEC(KS_, TM_, WP_, NT_)                                                              \
-    hipLaunchKernelGGL((pq_int4_fp8_gemm_decode<PQ_DEC_DWN, KS_, TM_, true, 0, WP_, NT_>), grid, \
-                       block, 0, st, A, W, SZ, ASG, RS, g_partial, g_cnt, C, M, N, K, pb1, pb2)
-#define PQ_DEC_TM(KS_, WP_, NT_)                                                                \
-    do { if (tm == 1) PQ_DEC(KS_, 1, WP_, NT_); else if (tm == 2) PQ_DEC(KS_, 2, WP_, NT_);      \
-         else if (tm == 3) PQ_DEC(KS_, 3, WP_, NT_); else if (tm == 4) PQ_DEC(KS_, 4, WP_, NT_); \
-         else if (tm == 5) PQ_DEC(KS_, 5, WP_, NT_); else if (tm == 6) PQ_DEC(KS_, 6, WP_, NT_); \
-         else if (tm == 7) PQ_DEC(KS_, 7, WP_, NT_); else PQ_DEC(KS_, 8, WP_, NT_); } while (0)
-#define PQ_DEC_KS(WP_, NT_)                                                                     \
-    do { if (ks == 1) PQ_DEC_TM(1, WP_, NT_); else if (ks == 2) PQ_DEC_TM(2, WP_, NT_);          \
-         else PQ_DEC_TM(4, WP_, NT_); } while (0)
+#define PQ_DEC(KS_, TM_, WP_, NT_, B_)                                                          \
+    hipLaunchKernelGGL((pq_int4_fp8_gemm_decode<PQ_DEC_DWN, KS_, TM_, true, 0, WP_, NT_, B_>), grid, \
+                       block, 0, st, A, W, SZ, ASG, RS, g_partial, g_cnt, C, M, N, K, pb1, pb2, WH)
+#define PQ_DEC_TM(KS_, WP_, NT_, B_)                                                            \
+    do { if (tm == 1) PQ_DEC(KS_, 1, WP_, NT_, B_); else if (tm == 2) PQ_DEC(KS_, 2, WP_, NT_, B_);      \
+         else if (tm == 3) PQ_DEC(KS_, 3, WP_, NT_, B_); else if (tm == 4) PQ_DEC(KS_, 4, WP_, NT_, B_); \
+         else if (tm == 5) PQ_DEC(KS_, 5, WP_, NT_, B_); else if (tm == 6) PQ_DEC(KS_, 6, WP_, NT_, B_); \
+         else if (tm == 7) PQ_DEC(KS_, 7, WP_, NT_, B_); else PQ_DEC(KS_, 8, WP_, NT_, B_); } while (0)
+#define PQ_DEC_KS(WP_, NT_, B_)                                                                 \
+    do { if (ks == 1) PQ_DEC_TM(1, WP_, NT_, B_); else if (ks == 2) PQ_DEC_TM(2, WP_, NT_, B_);  \
+         else PQ_DEC_TM(4, WP_, NT_, B_); } while (0)
     // Streaming loads pay only on the fragment-order layout (see pq_stage_w); the row layout
     // ignores the NT flag.
-    if (wperm()) { if (dec_nt()) PQ_DEC_KS(true, true); else PQ_DEC_KS(true, false); }
-    else PQ_DEC_KS(false, false);
+    if (whi) { if (dec_nt()) PQ_DEC_KS(true, true, 5); else PQ_DEC_KS(true, false, 5); }
+    else if (wperm()) { if (dec_nt()) PQ_DEC_KS(true, true, 4); else PQ_DEC_KS(true, false, 4); }
+    else PQ_DEC_KS(false, false, 4);
 #undef PQ_DEC_KS
 #undef PQ_DEC_TM
 #undef PQ_DEC
@@ -383,11 +392,12 @@ static void launch_gemm(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t asg, u
 
   constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
   const dim3 grid((N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
-#define PQ_PRE(PT_, WP_)                                                                        \
-  hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, PT_, WP_>), grid, block, 0, st, A,   \
-                     W, SZ, ASG, RS, C, M, N, K, pb1, pb2)
-  if (ptok) { if (wperm()) PQ_PRE(true, true); else PQ_PRE(true, false); }
-  else      { if (wperm()) PQ_PRE(false, true); else PQ_PRE(false, false); }
+#define PQ_PRE(PT_, WP_, B_)                                                                    \
+  hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, PT_, WP_, B_>), grid, block, 0, st,  \
+                     A, W, SZ, ASG, RS, C, M, N, K, pb1, pb2, WH)
+  if (whi)  { if (ptok) PQ_PRE(true, true, 5); else PQ_PRE(false, true, 5); }
+  else if (ptok) { if (wperm()) PQ_PRE(true, true, 4); else PQ_PRE(true, false, 4); }
+  else      { if (wperm()) PQ_PRE(false, true, 4); else PQ_PRE(false, false, 4); }
 #undef PQ_PRE
 }
 

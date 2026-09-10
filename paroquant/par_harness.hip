@@ -45,7 +45,9 @@ static const Shape SHAPES[] = {
 
 struct Buffers {
   int M, N, K, P, G;
-  std::vector<unsigned int> W;       // [N, K/8]
+  std::vector<unsigned int> W;       // [N, K/8] low nibbles
+  std::vector<unsigned char> WH;    // [N, K/8] fifth-bit plane (bits == 5 only; bit i <-> code 8j+i)
+  int bits = 4;
   std::vector<__half> SZ;           // [G, N, 2]
   std::vector<int> ZP;              // [G, N] raw zero points (reference only)
   std::vector<unsigned char> A;     // [P, M, K]
@@ -71,6 +73,42 @@ static void fill_weights(Buffers &b, std::mt19937 &rng) {
       b.SZ[((size_t)g * b.N + n) * 2 + 0] = __float2half(s);
       b.SZ[((size_t)g * b.N + n) * 2 + 1] = __float2half(s * (float)(zp - 8));
     }
+}
+
+// int5: codes and zero points in 0..31; the low nibble goes to W as for int4, the fifth bit to WH.
+static void fill_weights5(Buffers &b, std::mt19937 &rng) {
+  std::uniform_int_distribution<int> code(0, 31);
+  std::uniform_real_distribution<float> scl(0.002f, 0.05f);
+  const int kw = b.K / 8;
+  b.bits = 5;
+  b.W.assign((size_t)b.N * kw, 0u);
+  b.WH.assign((size_t)b.N * kw, 0);
+  for (int n = 0; n < b.N; ++n)
+    for (int k = 0; k < b.K; ++k) {
+      const int c = code(rng);
+      b.W[(size_t)n * kw + k / 8] |= ((unsigned int)(c & 15)) << (4 * (k % 8));
+      b.WH[(size_t)n * kw + k / 8] |= (unsigned char)((c >> 4) << (k % 8));
+    }
+  b.SZ.assign((size_t)b.G * b.N * 2, __float2half(0.f));
+  b.ZP.assign((size_t)b.G * b.N, 0);
+  for (int g = 0; g < b.G; ++g)
+    for (int n = 0; n < b.N; ++n) {
+      const float s = scl(rng);
+      const int zp = code(rng);
+      b.ZP[(size_t)g * b.N + n] = zp;
+      b.SZ[((size_t)g * b.N + n) * 2 + 0] = __float2half(s);
+      b.SZ[((size_t)g * b.N + n) * 2 + 1] = __float2half(s * (float)(zp - 16));
+    }
+}
+// Fragment-order fifth-bit plane: one byte per (n-tile, k-step, lane), same slot order as permute_w.
+static std::vector<unsigned char> permute_wh(const std::vector<unsigned char> &WH, int N, int K) {
+  const int kw = K / 8, ks = K / 16;
+  std::vector<unsigned char> P((size_t)N * kw, 0);
+  for (int n = 0; n < N; ++n)
+    for (int st = 0; st < ks; ++st)
+      for (int half = 0; half < 2; ++half)
+        P[((size_t)(n / 16) * ks + st) * 32 + half * 16 + (n % 16)] = WH[(size_t)n * kw + st * 2 + half];
+  return P;
 }
 
 static void fill_acts(Buffers &b, std::mt19937 &rng, bool subnormal_heavy = false,
@@ -130,9 +168,10 @@ static void ref_gemm2(const Buffers &b, int pb1, int pb2, std::vector<float> &C,
         const float zsc = __half2float(b.SZ[((size_t)g * b.N + n) * 2 + 1]);
         double dot = 0.0;
         for (int k = g * PQ_GROUP; k < (g + 1) * PQ_GROUP; ++k) {
-          const int code = (b.W[(size_t)n * kw + k / 8] >> (4 * (k % 8))) & 0xF;
+          int code = (b.W[(size_t)n * kw + k / 8] >> (4 * (k % 8))) & 0xF;
+          if (b.bits == 5) code |= ((b.WH[(size_t)n * kw + k / 8] >> (k % 8)) & 1) << 4;
           const float a = pq_e4m3_decode(b.A[(((size_t)p * b.M + m) * b.K) + k]);
-          dot += (double)a * (double)lut_val(code);
+          dot += (double)a * (double)(b.bits == 5 ? code - 16 : lut_val(code));
         }
         const double rsv = b.RS[((size_t)p * b.M + m) * b.G + g];
         if (ptok) acc += sc * dot - zsc * rsv;                     // As applied after the loop
@@ -240,11 +279,111 @@ static double time_us(F &&launch, int iters, hipEvent_t e0, hipEvent_t e1) {
   return ms * 1000.0 / iters;
 }
 
+__global__ void k_lut5_probe(unsigned char *out) {   // ar_unpack8_5 over every 5-bit code, 8 per word
+  const int c = threadIdx.x;                            // 0..31
+  if (c >= 32) return;
+  unsigned int wv = 0, hb = 0;
+  for (int i = 0; i < 8; ++i) { wv |= (unsigned int)(c & 15) << (4 * i); hb |= (unsigned int)(c >> 4) << i; }
+  const uint2_t u = ar_unpack8_5(wv, hb);
+  for (int i = 0; i < 4; ++i) { out[c * 8 + i] = (u[0] >> (8 * i)) & 0xFF; out[c * 8 + 4 + i] = (u[1] >> (8 * i)) & 0xFF; }
+}
+
+// int5 (W5A8) gate: 32-code LUT round trip, then decode / prefill / A-tiled kernels with BITS=5 vs the
+// double-precision reference (rel < 5e-3, the harness's GEMM bar), plus the 5-bit vs 4-bit kernel time
+// on the same shape (the unpack + fifth-plane cost).
+static void bench_int5(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
+  int fails = 0;
+  {
+    unsigned char *d; HIP_CHECK(hipMalloc(&d, 256));
+    hipLaunchKernelGGL(k_lut5_probe, dim3(1), dim3(32), 0, 0, d); HIP_CHECK(hipDeviceSynchronize());
+    unsigned char h[256]; HIP_CHECK(hipMemcpy(h, d, 256, hipMemcpyDeviceToHost)); hipFree(d);
+    int bad = 0;
+    for (int c = 0; c < 32; ++c) for (int i = 0; i < 8; ++i) if (pq_e4m3_decode(h[c * 8 + i]) != (float)(c - 16)) ++bad;
+    printf("int5 lut: %d/256 wrong %s\n", bad, bad ? "FAIL" : "OK"); if (bad) ++fails;
+  }
+  constexpr int DWN = 8, BND = DWN * 16, TN = 2, BNF_T = AR_WN * TN * 16;
+  for (const Shape &sh : SHAPES) {
+    if (std::string(sh.name) == "ragged") continue;      // fragment order needs whole tiles (as the loader)
+    Buffers b; b.N = sh.N; b.K = sh.K; b.P = sh.P; b.G = sh.K / PQ_GROUP;
+    fill_weights5(b, rng);
+    const std::vector<unsigned int> Wp = permute_w(b.W, b.N, b.K);
+    const std::vector<unsigned char> WHp = permute_wh(b.WH, b.N, b.K);
+    unsigned int *dW; unsigned char *dWH; __half *dSZ;
+    HIP_CHECK(hipMalloc(&dW, Wp.size() * 4)); HIP_CHECK(hipMalloc(&dWH, WHp.size())); HIP_CHECK(hipMalloc(&dSZ, b.SZ.size() * 2));
+    HIP_CHECK(hipMemcpy(dW, Wp.data(), Wp.size() * 4, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dWH, WHp.data(), WHp.size(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dSZ, b.SZ.data(), b.SZ.size() * 2, hipMemcpyHostToDevice));
+    const int nblk = (b.N + BND - 1) / BND;
+    auto check = [&](const char *tag, int M, __bf16 *dC, const std::vector<float> &ref, double t5, double t4) {
+      std::vector<unsigned short> Ch((size_t)M * b.N);
+      HIP_CHECK(hipMemcpy(Ch.data(), dC, Ch.size() * 2, hipMemcpyDeviceToHost));
+      double num = 0, den = 0;
+      for (size_t i = 0; i < Ch.size(); ++i) { const double c = bf16_to_f(Ch[i]), r = ref[i]; num += (c - r) * (c - r); den += r * r; }
+      const double rel = sqrt(num / (den > 0 ? den : 1)); const bool ok = rel < 5e-3; if (!ok) ++fails;
+      printf("  int5 %-7s %-8s N=%-5d K=%-5d P=%d M=%-4d rel %.2e  5-bit %8.2f us  4-bit %8.2f us (%.2fx) %s\n",
+             tag, sh.name, b.N, b.K, b.P, M, rel, t5, t4, t5 / t4, ok ? "OK" : "FAIL");
+    };
+    // decode band (per-group ASG/RS), split-K per the launcher's rule
+    for (const int M : {1, 8, 40, 64}) {
+      b.M = M; fill_acts(b, rng, false, false);
+      std::vector<float> ref; ref_gemm2(b, sh.pb1, sh.pb2, ref, false);
+      unsigned char *dA; float *dASG, *dRS, *dP; int *dCnt; __bf16 *dC;
+      HIP_CHECK(hipMalloc(&dA, b.A.size())); HIP_CHECK(hipMalloc(&dASG, b.ASG.size() * 4)); HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4));
+      HIP_CHECK(hipMalloc(&dP, (size_t)4 * M * b.N * 4)); HIP_CHECK(hipMalloc(&dCnt, nblk * 4)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+      HIP_CHECK(hipMemcpy(dA, b.A.data(), b.A.size(), hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dASG, b.ASG.data(), b.ASG.size() * 4, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemset(dCnt, 0, nblk * 4));
+      int ks = (nblk >= 128) ? 1 : (nblk >= 64) ? 2 : 4; if (M > 48 && ks > 1) ks >>= 1;
+      const int tm = (M + DEC_MTILE - 1) / DEC_MTILE;
+      const dim3 grid(nblk, 1, ks), block(DWN * 32);
+#define I5_DEC(KS_, TM_, B_) hipLaunchKernelGGL((pq_int4_fp8_gemm_decode<DWN, KS_, TM_, true, 0, true, true, B_>), grid, block, 0, 0, dA, dW, dSZ, dASG, dRS, dP, dCnt, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH)
+#define I5_DEC_TM(KS_, B_) do { if (tm == 1) I5_DEC(KS_, 1, B_); else if (tm == 2) I5_DEC(KS_, 2, B_); else if (tm == 3) I5_DEC(KS_, 3, B_); else I5_DEC(KS_, 4, B_); } while (0)
+      auto L5 = [&](int) { if (ks == 1) I5_DEC_TM(1, 5); else if (ks == 2) I5_DEC_TM(2, 5); else I5_DEC_TM(4, 5); };
+      auto L4 = [&](int) { if (ks == 1) I5_DEC_TM(1, 4); else if (ks == 2) I5_DEC_TM(2, 4); else I5_DEC_TM(4, 4); };
+#undef I5_DEC_TM
+#undef I5_DEC
+      L5(0); HIP_CHECK(hipDeviceSynchronize());
+      double t5 = 1e30, t4 = 1e30;
+      for (int rep = 0; rep < 3; ++rep) { t5 = std::min(t5, time_us(L5, 50, e0, e1)); t4 = std::min(t4, time_us(L4, 50, e0, e1)); }
+      L5(0); HIP_CHECK(hipDeviceSynchronize());        // the checked output is the 5-bit kernel's
+      check("decode", M, dC, ref, t5, t4);
+      hipFree(dA); hipFree(dASG); hipFree(dRS); hipFree(dP); hipFree(dCnt); hipFree(dC);
+    }
+    // per-token prefill (row A) and A-tiled bands
+    for (const int M : {200, 1024}) {
+      b.M = M; fill_acts(b, rng, false, true);
+      std::vector<float> ref; ref_gemm2(b, sh.pb1, sh.pb2, ref, true);
+      const std::vector<unsigned char> At = tile_a(b.A, b.P, M, b.K);
+      unsigned char *dA, *dAT; float *dAS, *dRS; __bf16 *dC;
+      HIP_CHECK(hipMalloc(&dA, b.A.size())); HIP_CHECK(hipMalloc(&dAT, At.size()));
+      HIP_CHECK(hipMalloc(&dAS, b.AS.size() * 4)); HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+      HIP_CHECK(hipMemcpy(dA, b.A.data(), b.A.size(), hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dAT, At.data(), At.size(), hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dAS, b.AS.data(), b.AS.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+      const dim3 grid((b.N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
+      auto P5 = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, true, true, 5>), grid, block, 0, 0, dA, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+      auto P4 = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, true, true, 4>), grid, block, 0, 0, dA, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+      auto T5 = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 0, 5>), grid, block, 0, 0, dAT, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, nullptr, nullptr, dWH); };
+      auto T4 = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 0, 4>), grid, block, 0, 0, dAT, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, nullptr, nullptr, dWH); };
+      double t5 = 1e30, t4 = 1e30;
+      for (int rep = 0; rep < 3; ++rep) { t5 = std::min(t5, time_us(P5, 10, e0, e1)); t4 = std::min(t4, time_us(P4, 10, e0, e1)); }
+      P5(0); HIP_CHECK(hipDeviceSynchronize()); check("prefill", M, dC, ref, t5, t4);
+      t5 = t4 = 1e30;
+      for (int rep = 0; rep < 3; ++rep) { t5 = std::min(t5, time_us(T5, 10, e0, e1)); t4 = std::min(t4, time_us(T4, 10, e0, e1)); }
+      T5(0); HIP_CHECK(hipDeviceSynchronize()); check("atiled", M, dC, ref, t5, t4);
+      hipFree(dA); hipFree(dAT); hipFree(dAS); hipFree(dRS); hipFree(dC);
+    }
+    hipFree(dW); hipFree(dWH); hipFree(dSZ);
+  }
+  printf("int5: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
+}
+
 static void bench2(std::mt19937 &rng, const std::string &what) {
   hipEvent_t e0, e1;
   HIP_CHECK(hipEventCreate(&e0));
   HIP_CHECK(hipEventCreate(&e1));
   const int REPS = 4;
+  if (what == "int5") { bench_int5(rng, e0, e1); return; }
   const char *only = getenv("PQ_SHAPE");
   for (const Shape &sh : SHAPES) {
     if (std::string(sh.name) == "ragged" || std::string(sh.name) == "tiny2p") continue;

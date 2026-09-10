@@ -94,6 +94,37 @@ __device__ __forceinline__ uint2_t ar_unpack8(unsigned int wv) {
                  __builtin_amdgcn_perm(bo, be, 0x07030602u)};
 }
 
+// (c - 16) unpack for 5-bit codes (int5 W5A8): every integer in [-16, 15] is exact in e4m3, so the
+// fp8 WMMA + zero-point fold algebra is unchanged; only the table doubles. c in 0..7 -> -16..-9,
+// 8..15 -> -8..-1 (= AR_NEG_*), 16..23 -> 0..7 (= AR_POS_*), 24..31 -> 8..15. Gated by the 32-value
+// round trip in par_harness (int5 gate).
+#define AR5_LO_LO 0xD5D6D7D8u   // -16 -15 -14 -13
+#define AR5_LO_HI 0xD1D2D3D4u   // -12 -11 -10 -9
+#define AR5_HI_LO 0x53525150u   //   8   9  10  11
+#define AR5_HI_HI 0x57565554u   //  12  13  14  15
+__device__ __forceinline__ unsigned int ar_lut5(unsigned int c4) {   // four 5-bit codes, one per byte
+  const unsigned int sel = c4 & 0x07070707u;
+  const unsigned int m3 = __builtin_amdgcn_perm(0u, 0x0000FF00u, (c4 & 0x08080808u) >> 3);
+  const unsigned int m4 = __builtin_amdgcn_perm(0u, 0x0000FF00u, (c4 & 0x10101010u) >> 4);
+  const unsigned int t0 = __builtin_amdgcn_perm(AR5_LO_HI, AR5_LO_LO, sel);
+  const unsigned int t1 = __builtin_amdgcn_perm(AR_NEG_HI, AR_NEG_LO, sel);
+  const unsigned int t2 = __builtin_amdgcn_perm(AR_POS_HI, AR_POS_LO, sel);
+  const unsigned int t3 = __builtin_amdgcn_perm(AR5_HI_HI, AR5_HI_LO, sel);
+  const unsigned int lo = (t1 & m3) | (t0 & ~m3);
+  const unsigned int hi = (t3 & m3) | (t2 & ~m3);
+  return (hi & m4) | (lo & ~m4);
+}
+// hb holds the eight fifth bits of a word's codes (bit i <-> nibble i, i.e. k = base + i).
+__device__ __forceinline__ unsigned int pq_spread4(unsigned int x) {   // bits 0,2,4,6 -> bit 4 of bytes 0..3
+  return ((x & 1u) << 4) | ((x & 4u) << 10) | ((x & 16u) << 16) | ((x & 64u) << 22);
+}
+__device__ __forceinline__ uint2_t ar_unpack8_5(unsigned int wv, unsigned int hb) {
+  const unsigned int be = ar_lut5((wv & 0x0F0F0F0Fu) | pq_spread4(hb));               // k = 0,2,4,6
+  const unsigned int bo = ar_lut5(((wv >> 4) & 0x0F0F0F0Fu) | pq_spread4(hb >> 1));   // k = 1,3,5,7
+  return uint2_t{__builtin_amdgcn_perm(bo, be, 0x05010400u),
+                 __builtin_amdgcn_perm(bo, be, 0x07030602u)};
+}
+
 // ---------------------------------------------------------------- weight staging (both layouts)
 //
 // Two weight layouts, ONE sW tile. Row layout (WPERM=false) is the loader's [N, K/8] u32, eight
@@ -115,10 +146,13 @@ static __device__ __forceinline__ T pq_ld_w(const T *p) {
 }
 
 template <int ROWS, int LBK, int STR, int NTHREADS, bool WPERM, bool NT, int ABLATE = 0,
-          int WSLOT_OVR = 0>
+          int WSLOT_OVR = 0, int BITS = 4>
 __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
                                            const unsigned int *__restrict__ W, int n0, int N,
-                                           int K, int k0, int tid) {
+                                           int K, int k0, int tid,
+                                           const unsigned char *__restrict__ WH = nullptr) {
+  // BITS == 5: WH is the fifth-bit plane, one byte per (slot, lane) in fragment order / one byte per
+  // 8 codes in row layout; loaded alongside the nibble word(s) and unpacked by ar_unpack8_5.
   if constexpr (WPERM) {
     constexpr int KSTEPS_T = LBK / 16, NTILES_T = ROWS / 16;
     constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
@@ -143,10 +177,18 @@ __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
         const uint2_t v = pq_ld_w<NT>((const uint2_t *)src);
         wq[0] = v[0]; wq[1] = v[1];
       }
+      unsigned int hq = 0;
+      if constexpr (BITS == 5) {
+        const unsigned char *srch = &WH[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec];
+        if constexpr (WSLOTS == 4) hq = pq_ld_w<NT>((const unsigned int *)srch);
+        else hq = pq_ld_w<NT>((const unsigned short *)srch);
+      }
 #pragma unroll
       for (int q = 0; q < WSLOTS; ++q) {
         if constexpr (ABLATE & 1)
           *(uint2_t *)(&sW[(r + q) * STR + kloc]) = uint2_t{wq[q], wq[q]};
+        else if constexpr (BITS == 5)
+          *(uint2_t *)(&sW[(r + q) * STR + kloc]) = ar_unpack8_5(wq[q], (hq >> (8 * q)) & 0xFFu);
         else
           *(uint2_t *)(&sW[(r + q) * STR + kloc]) = ar_unpack8(wq[q]);
       }
@@ -164,6 +206,10 @@ __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
       if constexpr (ABLATE & 1) {
         *(uint2_t *)(&sW[r * STR + c * 16]) = uint2_t{wv[0], wv[0]};
         *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
+      } else if constexpr (BITS == 5) {
+        const unsigned int hb = pq_ld_w<NT>((const unsigned short *)(WH + (size_t)gc * kw + k0 / 8 + c * 2));
+        *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8_5(wv[0], hb & 0xFFu);
+        *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8_5(wv[1], (hb >> 8) & 0xFFu);
       } else {
         *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8(wv[0]);
         *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8(wv[1]);
@@ -1137,12 +1183,13 @@ __global__ __launch_bounds__(256) void pq_skinny_bf16(
 //     (the activation scale is per group now, so it HAS to fold per slab).
 //   * A/ASG/RS are indexed through the block's partition (pb1/pb2 boundaries).
 template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0, bool WPERM = false,
-          bool NT = false>
+          bool NT = false, int BITS = 4>
 __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
     const float *__restrict__ RS, float *__restrict__ P, int *__restrict__ cnt,
-    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2) {
+    __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2,
+    const unsigned char *__restrict__ WH = nullptr) {
   constexpr int DBK = PQ_GROUP;            // one scale group per slab, by construction
   constexpr int BND = DWN * 16;
   constexpr int DASTR = DBK + DEC_PAD, DWSTR = DBK + DEC_PAD;
@@ -1207,7 +1254,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
         *(uint4_t *)(&sA[r * DASTR + c]) = *(const uint4_t *)(A + (size_t)rc * K + k0 + c);
       }
     }
-    pq_stage_w<BND, DBK, DWSTR, DNTHREADS, WPERM, NT, ABLATE>(sW, W, n0, N, K, k0, tid);
+    pq_stage_w<BND, DBK, DWSTR, DNTHREADS, WPERM, NT, ABLATE, 0, BITS>(sW, W, n0, N, K, k0, tid, WH);
     __syncthreads();
 
     if constexpr (IMAJOR) {
@@ -1349,12 +1396,12 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
 // collapses to AutoRound's single FMA per slab; the zero-point correction stays one FMA per
 // element per group against PLAIN code row-sums, and As multiplies once in the epilogue. The
 // per-group variant (PTOK=false) remains for the decode-band fallthrough and the harness.
-template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false, bool WPERM = false>
+template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false, bool WPERM = false, int BITS = 4>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
     const float *__restrict__ RS, __bf16 *__restrict__ C, int M, int N, int K, int pb1,
-    int pb2) {
+    int pb2, const unsigned char *__restrict__ WH = nullptr) {
   constexpr int BNF_T = AR_WN * TN * 16;
   __shared__ unsigned char sA[AR_BMF * AR_ASTR];
   __shared__ unsigned char sW[BNF_T * AR_ASTR];
@@ -1432,8 +1479,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
       const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
       *(uint4_t *)(&sA[r * AR_ASTR + c]) = *(const uint4_t *)(Ab + (rc * K + c));
     }
-    pq_stage_w<BNF_T, AR_BK, AR_ASTR, AR_NTHREADS, WPERM, false, ABLATE>(sW, W, n0, N, K, k0,
-                                                                          tid);
+    pq_stage_w<BNF_T, AR_BK, AR_ASTR, AR_NTHREADS, WPERM, false, ABLATE, 0, BITS>(sW, W, n0, N, K, k0,
+                                                                              tid, WH);
     __syncthreads();
 
     if constexpr (IMAJOR) {
@@ -1686,7 +1733,7 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
 // main stream -- and the loop keeps only the scale FMA (8 VALU per tile-group instead of 16,
 // which the ablation prices at ~10%). fp16 row-sums: |rs| <= 448*128 < 65504, 11-bit mantissa,
 // the correction's rounding lands ~1e-4 relative, under the bf16 output floor.
-template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0>
+template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0, int BITS = 4>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT,   // [P, Mt*16, K] fragment-tiled e4m3
     const unsigned int *__restrict__ W, const __half *__restrict__ SZ,
@@ -1694,7 +1741,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     const float *__restrict__ RS,           // [P, M, K/128] plain code row-sums
     __bf16 *__restrict__ C, int M, int N, int K, int pb1, int pb2,
     const __half *__restrict__ RSH = nullptr,   // ZPE: [P, Mt*Gp*16] fp16 row-sum fragments
-    const __half *__restrict__ ZSH = nullptr) { // ZPE: [N, Gp] fp16 zero-scales
+    const __half *__restrict__ ZSH = nullptr,   // ZPE: [N, Gp] fp16 zero-scales
+    const unsigned char *__restrict__ WH = nullptr) {   // BITS == 5: fifth-bit plane
   static_assert(LBK == 64 || LBK == 128, "slab is one group or half a group");
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + AR_PAD;
@@ -1766,8 +1814,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
       const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
       s_rs[r] = RS[(size_t)rc * G + g];
     }
-    pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR>(sW, W, n0, N, K, k0,
-                                                                          tid);
+    pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR, BITS>(sW, W, n0, N, K, k0,
+                                                                                 tid, WH);
     __syncthreads();
 
     int2_t wfa[WHOIST ? NS : 1][TN];
