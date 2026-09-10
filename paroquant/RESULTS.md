@@ -645,6 +645,12 @@ explicitly (`--kv-cache-memory 1.5G`, eager, 512 batched tokens): utilization-si
 for the whole-chunk fp32 log-softmax; (4) a KLD serve at max-num-seqs 1 makes GSM8K take hours -- run
 GSM8K on the real serve.
 
-Next: stage-2 fine-tune (`STAGE=finetune NBIT=5`, ~6 h, rotations frozen) -> `convert_int5.py` -> the
-same gates; then decide prod between MXFP4-PARO (speed, KV) and int5 (fidelity: ~8-bit-class KL at
-5.25 bits, -10% decode, -11% KV, -27% prefill vs MXFP4-PARO).
+Next: stage-2 fine-tune (`STAGE=finetune NBIT=5`, rotations frozen; started 13:37, ~8.5 min/layer)
+-> `convert_int5.py` -> the same gates. Then two prefill experiments on the same pipeline, in order:
+(1) an E2M2 "MXFP5" RTN pseudo checkpoint + KLD (no kernel; decides whether porting the fifth-bit plane
+into the MXFP4 kernel's zero-VALU loop is worth ~2 days: expected prefill 4300-4500 vs int5's 3490);
+(2) int5 + pow2 group scales (`POW2=1`) + the zero-point epilogue (the ZPE ablation, ABL bit 4: RSH/ZSH
+operands, rank-G epilogue WMMA) -- keeps the uniform 32-level grid and the zero point, removes both loop
+FMAs, trades only scale precision; cheaper than a new format if (1) reads poorly. Then the prod
+decision between MXFP4-PARO (speed, KV) and int5 (fidelity: ~8-bit-class KL at 5.25 bits, -10% decode,
+-11% KV, -27% prefill vs MXFP4-PARO).
