@@ -364,6 +364,7 @@ and an output copy per partition. hipGraph hides CPU cost, not kernel count.
 | + single-launch merged GEMM (partition select in-kernel) | **24.53 / 25.89 / 26.80** | 203.4 | 97.40 |
 | + scale slabs dropped, `GPU_UTIL=0.95` (shipped) | 24.71 / 25.98 / 26.96 | -- | KV 862k tokens |
 | + fused TILED prologue for the A-tiled band (shipped) | 24.53 / 26.43 / 26.97 | -- | prefill +5-9%, see below |
+| + skinny split-K bf16 GEMM for the GDN gate projections (`RADIANCE_SKINNY_GEMM=all`, shipped) | **23.38 / 24.91 / 25.80** | 216.3 | 97.40 |
 
 Each step is gated bit-identical to the path it replaced (`par_harness --bench2 tokq` and
 `tokstream`: 54 + 45 shapes, codes / scales / hs / residual byte-exact) and output-identical at the
@@ -422,3 +423,25 @@ with fragment order off and the decode band disabled; two gate scripts must neve
 
 The full change-by-change log, including the prefill ablation ledger and the SPEC re-sweep, is in
 [paroquant/RESULTS.md](paroquant/RESULTS.md).
+
+### Distribution-level quality: KL divergence against the FP8 serve (2026-09-09)
+
+Per-position top-20 prompt logprobs from both serves over the same text (`~/pibench-local/kld.py`;
+the OpenAI API exposes at most the server's `--max-logprobs`, 20 on both launchers, and 20 is also
+prod's `top_k`, so this is the support the sampler draws from). KL(FP8 || PARO-MXFP4) over the
+reference's top-K, both renormalized; a lower bound where the candidate's list did not cover the
+reference token (coverage column). The reference is the FP8 unit (`Qwen/Qwen3.8-27B-FP8`, fp8 KV),
+so the number contains the FP8 serve's own deviation from bf16 too.
+
+| corpus | positions | top-5 KL | top-10 KL | top-20 KL (coverage) | top-1 agreement |
+|---|--:|--:|--:|--:|--:|
+| wikitext-2 | 11,165 | 0.0422 nats | 0.0492 | 0.0573 (87.9%) | 90.53% |
+| code test set | 14,153 | 0.0420 | 0.0482 | 0.0541 (83.4%) | 92.67% |
+| served traffic (target's own chat/code answers) | 12,100 | 0.0339 | 0.0387 | 0.0435 (87.2%) | 91.93% |
+
+That is the ordinary 4-bit band (llama.cpp reports ~0.02-0.05 mean KLD for Q4_K_M against fp16
+and ~0.001-0.003 for Q8), and it is consistent with the task-level results (GSM8K 97.40-97.60 vs FP8's
+97.8, inside binomial noise). The prompt-logprob path materializes full-vocabulary logits for the whole
+chunk, which is why the FP8 reference at 0.92 memory utilization OOMs above ~600 prompt tokens; it
+was collected from a 0.80-utilization copy of its launcher with 1,500-character chunks, and the
+chunking must be identical on both sides because positions are compared pairwise.

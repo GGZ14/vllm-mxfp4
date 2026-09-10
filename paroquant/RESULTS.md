@@ -501,3 +501,71 @@ step); (2) MXFP4 weights for the drafter via a quantize-aware loop round (-0.65 
 (3) fuse the 24-launch uncaptured precompute/selector glue into 2-3 kernels (~-0.25 ms);
 (4) the NCCL call in the sampler path onto the r4d one-shot AR (-0.1 ms); (5) in-graph glue of the
 drafter's five layers (~0.3 ms, needs the graph's kernels visible: rocprof rather than kineto).
+
+## 2026-09-09: skinny bf16 GEMM for the GDN gate projections (RADIANCE_SKINNY_GEMM=all is now prod)
+
+`pq_skinny_bf16` (par_kernels.h; launcher `launch_skinny_bf16`): split-K over K/256 slices, one
+WG per (n-tile, k-slice), X staged in LDS once per WG, fp32 partials, the last-arriving block reduces
+(counter per output tile). Harness gate `skinny` (`--bench2 skinny`): bit-exact vs the fp32
+reference within bf16 rounding, 6.5 us/call in-graph for [48,5120] (hipBLASLt: 29 us). The launcher
+routes it through `radiance_gemm.py` (copied into the container) as the fallback for libr4d builds
+that lack `gemm_bf16_nt_m64` (rx5/rx6); `patch_skinny_gemm.py` is applied at launch. Shapes routed:
+target `in_proj_ba` N=48/96 (48 calls/step) and the drafter's hidden_projection [256,5120] and
+kernel_projection [1280,5120]. Traps hit: the first version streamed X from L2 per k-slice and was
+slower than hipBLASLt (LDS staging fixed it); the launcher applied neither the patch nor the module
+copy on the first serve, so the first "A/B" measured nothing.
+
+Prod A/B (MXFP4-PARO, tiled prologue, old drafter, SPEC=7, TP=2, GSM8K 97.40 after):
+
+| | int4 PARO | MXFP4-PARO before | **skinny (prod now)** |
+|---|--:|--:|--:|
+| ms/step @ ctx 25 / 8k / 32k | 24.19 / 25.74 / 26.70 | 24.47 / 26.00 / 26.78 | **23.38 / 24.91 / 25.80** |
+| single-stream tok/s @ 25 / 8k / 32k | 105-114 | 116 / 109 / 101 | **120 / 112 / 118** |
+| BetterBench decode single pass, combined | 226.2 | 207.5 | **216.3** (full pass 194.9; same-build spread ~10%) |
+
+The step is now 3.4% under int4 PARO at ctx 25; the residual combined-throughput gap to int4 is
+tokens per update (acceptance), which is the drafter's, not the kernel's.
+
+## 2026-09-09 (evening): drafter loop closed -- the fine-tunes LOSE on held-out traffic; original drafter stays
+
+Loop round 1 (`loop2.sh` rule: promote on decode-bench acc/draft >= best x1.03 and proxy not worse):
+proxy 2.181 -> 2.234, served acc/draft 1.881 vs 1.862 (+1.0%, below the bar), BetterBench single pass
+232.5 vs 216.8 (inside the ~10% same-build spread). Not promoted; the loop was stopped there as agreed.
+
+Why the earlier "+11-17% acceptance" did not hold: bench_decode_ctx samples at temperature 0.7 AND
+cut its long-context prefix at a time-seeded random offset, so no two runs saw the same text (now
+`BENCH_TEMP` / `BENCH_SEED` knobs). A greedy, seeded 5-prompt A/B put all four drafters within 2%
+(orig 1.999 / paro 1.964 / paro2s300 1.982 / paro-r1 2.001 mean acc/draft) with +-0.3 per-prompt
+swings: the target's argmax path still diverges between drafters after a few hundred tokens.
+
+The decisive measurement (`paroquant/drafter/eval_drafter.py`): 160 never-trained-on prompts drawn
+round-robin from all 37 pool sources (`~/drafter_ft/heldout160.jsonl`), single stream, prod sampling
+(temperature 0.7, seed per prompt, max_tokens 512), spec-decode counters read before/after, ~76k
+completion tokens per drafter:
+
+| drafter | acc/draft | tok/update | tok/s |
+|---|--:|--:|--:|
+| tcclaviger FP8 (original) | **3.022** | 4.022 | **163.8** |
+| paro (round 1, 2,400 prompts) | 2.991 | 3.991 | 163.1 |
+| paro2s300 (wide mix, paused at step 300) | 2.962 | 3.962 | 161.6 |
+| paro-r1 (loop round 1) | 2.937 | 3.937 | 160.4 |
+
+Acceptance falls monotonically with more self-distillation. Per source the fine-tunes win where the
+training mix was dense (gsm8k +5%, self_oss +9%, reason_arc +6%) and lose on the broad sources
+(ultrachat, oasst-style chat, Go, JavaScript, codealpaca, shell: -8 to -10%); paro-r1 wins 12 of 37
+sources. The held-out prefix-expected proxy tracked the captured (in-distribution) prompts and could
+not see this. Verdict: the original drafter is prod (`DRAFTER` default), the loop and its drop-ins
+are removed, the fine-tuned exports stay on disk unused. Lesson: judge a drafter on >=50k held-out
+tokens across the served mix at the served sampling settings; a 3-prompt stochastic bench and a
+BetterBench single pass both flatter whichever candidate you ran last.
+
+## 2026-09-09 (evening): KL divergence, PARO-MXFP4 prod vs the FP8 serve
+
+`kld.py` top-20 prompt logprobs, KL(FP8 || PARO-MXFP4) renormalized over the reference's top-K, three
+corpora: wikitext-2 0.042 / 0.049 / 0.057 nats (top-5/10/20), top-1 agreement 90.5%; code 0.042 /
+0.048 / 0.054, 92.7%; served traffic (the target's own answers) 0.034 / 0.039 / 0.044, 91.9%. Full
+table in PAROQUANT.md. Traps: prompt_logprobs allocates whole-chunk full-vocab logits, so the FP8
+unit (0.92 util) OOMs on ~1,000-token chunks -- run the reference at 0.80 with 1,500-char chunks;
+prod's container keeps answering on :8080 (it also serves the alias `Qwen3.8`) for ~30 s after
+`systemctl stop`, so wait for the port to close before booting the reference or the collector reads
+a dying prod as the reference; chunking must match on both sides.
