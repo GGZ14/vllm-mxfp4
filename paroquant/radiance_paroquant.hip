@@ -138,6 +138,27 @@ static void launch_rotate_tokquant(uintptr_t x, uintptr_t t, uintptr_t cs, uintp
 }
 
 // Per-token stream producers (paroquant_mxfp4 consumer). Out A [P, M, K] codes, AS [P, M].
+// Per-group fused producer (PG A-tiled band): A [P, M, K] row or [P, Mt*16, K] tiled, ASG/RS [P, M, K/128].
+static void launch_rotate_groupquant(uintptr_t x, uintptr_t t, uintptr_t cs, uintptr_t a, uintptr_t asg,
+                                     uintptr_t rs, int M, int K, int P, int krot, uintptr_t stream,
+                                     int tiled = 0, int i8 = 0) {
+  if (K % PQ_GROUP) throw std::runtime_error("ParoQuant: K must be a multiple of 128");
+  if (krot < 1 || krot > PQ_KROT_MAX) throw std::runtime_error("ParoQuant: krot out of range");
+  const dim3 grid(M, P);
+  const int W = pq_tok_waves(M, K);
+#define PQ_GQ(W_, T_, I_)                                                                        \
+  hipLaunchKernelGGL((pq_rotate_groupquant<W_, T_, I_>), grid, dim3(W_ * 32), 0,                \
+                     reinterpret_cast<hipStream_t>(stream),                                      \
+                     reinterpret_cast<const __bf16 *>(x), reinterpret_cast<const unsigned short *>(t), \
+                     reinterpret_cast<const __half *>(cs), reinterpret_cast<unsigned char *>(a),  \
+                     reinterpret_cast<float *>(asg), reinterpret_cast<float *>(rs), M, K, krot)
+#define PQ_GQ_W(T_, I_) do { if (W == 32) PQ_GQ(32, T_, I_); else if (W == 16) PQ_GQ(16, T_, I_); else PQ_GQ(8, T_, I_); } while (0)
+  if (i8) { if (tiled) PQ_GQ_W(true, true); else PQ_GQ_W(false, true); }
+  else    { if (tiled) PQ_GQ_W(true, false); else PQ_GQ_W(false, false); }
+#undef PQ_GQ_W
+#undef PQ_GQ
+}
+
 static void launch_add_rms_rot_tok(uintptr_t y, uintptr_t res, uintptr_t w, double eps, uintptr_t t,
                                    uintptr_t cs, uintptr_t hs, uintptr_t ro, uintptr_t a,
                                    uintptr_t as, int M, int K, int P, int krot, uintptr_t stream,
@@ -322,7 +343,8 @@ static void launch_ar_add_rms_rot(uintptr_t inp, uintptr_t peer_scratch, uintptr
 // plain row-sums. Prefill-class M only -- the decode band reads row-major A.
 static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as, uintptr_t rs,
                            uintptr_t c, int M, int N, int K, int pb1, int pb2,
-                           uintptr_t stream, uintptr_t whi = 0, int i8 = 0) {
+                           uintptr_t stream, uintptr_t whi = 0, int i8 = 0, int pg = 0) {
+  // pg != 0: per-GROUP activation scales (as = ASG [P, M, K/128], rs = rowsum*asg), no epilogue scale.
   // whi != 0: int5 weights (fifth-bit plane WH, fragment order); needs WPERM.
   // i8 != 0: int8 activations on the iu8 WMMA (I8 mode; A/AS/RS from the int8 producers).
   const auto *WH = reinterpret_cast<const unsigned char *>(whi);
@@ -337,17 +359,22 @@ static void launch_gemm_at(uintptr_t a, uintptr_t w, uintptr_t sz, uintptr_t as,
   auto st = reinterpret_cast<hipStream_t>(stream);
   constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
   const dim3 grid((N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
-#define PQ_AT(WP_, LBK_, H_, B_, I_)                                                             \
-  hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, WP_, LBK_, H_, 0, 0, B_, I_>), grid, block, 0, st, \
+#define PQ_AT(WP_, LBK_, H_, B_, I_, P_)                                                         \
+  hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, WP_, LBK_, H_, 0, 0, B_, I_, P_>), grid, block, 0, st, \
                      A, W, SZ, AS, RS, C, M, N, K, pb1, pb2, nullptr, nullptr, WH)
-#define PQ_AT_LBK(WP_, B_, I_)                                                                   \
+#define PQ_AT_LBK(WP_, B_, I_, P_)                                                               \
   do {                                                                                           \
-    if (at_lbk() == 64) { if (at_hoist()) PQ_AT(WP_, 64, true, B_, I_); else PQ_AT(WP_, 64, false, B_, I_); }    \
-    else                { if (at_hoist()) PQ_AT(WP_, 128, true, B_, I_); else PQ_AT(WP_, 128, false, B_, I_); }  \
+    if (at_lbk() == 64) { if (at_hoist()) PQ_AT(WP_, 64, true, B_, I_, P_); else PQ_AT(WP_, 64, false, B_, I_, P_); }    \
+    else                { if (at_hoist()) PQ_AT(WP_, 128, true, B_, I_, P_); else PQ_AT(WP_, 128, false, B_, I_, P_); }  \
   } while (0)
-  if (i8) { if (whi) PQ_AT_LBK(true, 5, true); else PQ_AT_LBK(true, 4, true); }
-  else if (whi) PQ_AT_LBK(true, 5, false);
-  else if (wperm()) PQ_AT_LBK(true, 4, false); else PQ_AT_LBK(false, 4, false);
+  if (pg) {
+    if (!wperm()) throw std::runtime_error("ParoQuant PG needs RADIANCE_PQ_WPERM=1");
+    if (i8) { if (whi) PQ_AT_LBK(true, 5, true, true); else PQ_AT_LBK(true, 4, true, true); }
+    else    { if (whi) PQ_AT_LBK(true, 5, false, true); else PQ_AT_LBK(true, 4, false, true); }
+  }
+  else if (i8) { if (whi) PQ_AT_LBK(true, 5, true, false); else PQ_AT_LBK(true, 4, true, false); }
+  else if (whi) PQ_AT_LBK(true, 5, false, false);
+  else if (wperm()) PQ_AT_LBK(true, 4, false, false); else PQ_AT_LBK(false, 4, false, false);
 #undef PQ_AT_LBK
 #undef PQ_AT
 }
@@ -427,6 +454,9 @@ namespace py = pybind11;
 PYBIND11_MODULE(radiance_paroquant_kernel, m) {
   m.def("launch_rotate_tokquant", &launch_rotate_tokquant,
         "x, T, cs, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("rs") = 0, py::arg("i8") = 0);
+  m.def("launch_rotate_groupquant", &launch_rotate_groupquant,
+        "x, T, cs, a, asg, rs, M, K, P, krot, stream, tiled, i8 (per-group fused producer for the PG A-tiled band)",
+        py::arg("x"), py::arg("T"), py::arg("cs"), py::arg("a"), py::arg("asg"), py::arg("rs"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0, py::arg("i8") = 0);
   m.def("launch_add_rms_rot_tok", &launch_add_rms_rot_tok,
         "y, res, w, eps, T, cs, hs, ro, a, as, M, K, P, krot, stream, tiled (tiled=1 writes the fragment-tiled A the A-tiled GEMM reads)", py::arg("y"), py::arg("res"), py::arg("w"), py::arg("eps"), py::arg("T"), py::arg("cs"), py::arg("hs"), py::arg("ro"), py::arg("a"), py::arg("as"), py::arg("M"), py::arg("K"), py::arg("P"), py::arg("krot"), py::arg("stream"), py::arg("tiled") = 0);
   m.def("launch_ew_rot_tok", &launch_ew_rot_tok,

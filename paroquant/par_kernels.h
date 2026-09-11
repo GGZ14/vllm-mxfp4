@@ -966,6 +966,57 @@ __global__ __launch_bounds__(W * 32) void pq_rotate_tokquant(
   }
 }
 // residual add + Gemma RMSNorm + rotate + token quant. Grid (M, P). Out HS/RO [M, K] (p == 0),
+// Per-GROUP fused producer for the PG A-tiled band: rotate + per-group quant, codes in the fragment-tiled
+// layout (TILED) or row-major, ASG [P, M, K/128] and RS = rowsum*asg (the decode-band convention). One
+// workgroup per (row, partition), waves over groups; the group is wave-local so there is no token-wide
+// reduction. Encodes the fp32 rotated values (as pq_rotate_quant2 does), so it is byte-exact against
+// pass A mode 0 (gated: par_harness pg).
+template <int W = PQ_ROT_WAVES, bool TILED = false, bool I8 = false>
+__global__ __launch_bounds__(W * 32) void pq_rotate_groupquant(
+    const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
+    const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ ASG,
+    float *__restrict__ RS, int M, int K, int krot) {
+  __shared__ float s_x[W][PQ_GROUP];
+  __shared__ __bf16 s_park[W][PQ_GROUP];
+  const int m = blockIdx.x, p = blockIdx.y;
+  const int G = K / PQ_GROUP;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int c0 = lane * 4;
+  const __bf16 *__restrict__ xrow = X + (size_t)m * K;
+  const int Mt = (M + 15) >> 4;
+  unsigned char *__restrict__ arow = TILED ? A + (size_t)p * Mt * 16 * K : A + ((size_t)p * M + m) * K;
+  for (int g = wave; g < G; g += W) {
+    unsigned long long rec[PQ_KROT_MAX][2];
+    float cs[4], nv[4];
+    pq_load_group(T, CS, p, g, K, krot, lane, rec, cs);
+    const uint2_t xv = *(const uint2_t *)(xrow + (size_t)g * PQ_GROUP + c0);
+    nv[0] = __uint_as_float(xv[0] << 16); nv[1] = __uint_as_float(xv[0] & 0xFFFF0000u);
+    nv[2] = __uint_as_float(xv[1] << 16); nv[3] = __uint_as_float(xv[1] & 0xFFFF0000u);
+    float wamax = 0.f;
+    pq_tok_rotate_park(nv, cs, rec, krot, s_x[wave], c0, s_park[wave], wamax);
+    const float v0 = s_x[wave][c0], v1 = s_x[wave][c0 + 1], v2 = s_x[wave][c0 + 2], v3 = s_x[wave][c0 + 3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float scale = pq_qscale<I8>(amax);
+    const float inv = 1.f / scale;
+    float rs = 0.f;
+    const unsigned char b0 = pq_qenc<I8>(v0 * inv, rs), b1 = pq_qenc<I8>(v1 * inv, rs);
+    const unsigned char b2 = pq_qenc<I8>(v2 * inv, rs), b3 = pq_qenc<I8>(v3 * inv, rs);
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
+    const unsigned int packed = (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
+    const int c = g * PQ_GROUP + c0;
+    if constexpr (TILED) *(unsigned int *)(arow + pq_tiled_off(m, c, K)) = packed;
+    else *(unsigned int *)(arow + c) = packed;
+    if (lane == 0) {
+      ASG[((size_t)p * M + m) * G + g] = scale;
+      RS[((size_t)p * M + m) * G + g] = rs * scale;
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+  }
+}
+
 // A [P, M, K], AS [P, M]. == pq_add_rms_rot<false> + pq_rotate_tokquant, bit-exact.
 template <int W, bool TILED = false, bool IL = false>
 __global__ __launch_bounds__(W * 32) void pq_add_rms_rot_tok(
@@ -1793,8 +1844,11 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
 // main stream -- and the loop keeps only the scale FMA (8 VALU per tile-group instead of 16,
 // which the ablation prices at ~10%). fp16 row-sums: |rs| <= 448*128 < 65504, 11-bit mantissa,
 // the correction's rounding lands ~1e-4 relative, under the bf16 output floor.
+// PG: per-GROUP activation scales on the A-tiled band -- AS is ASG [P, M, K/128], RS carries rowsum*asg,
+// the fold multiplies the slab product by asg[m, g] (staged per slab like the row-sums) and the epilogue
+// applies no per-token scale. The tiled A layout is unchanged.
 template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0, int BITS = 4,
-          bool I8 = false>
+          bool I8 = false, bool PG = false>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT,   // [P, Mt*16, K] fragment-tiled e4m3
     const unsigned int *__restrict__ W, const __half *__restrict__ SZ,
@@ -1810,6 +1864,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
   constexpr int BNF_T = AR_WN * TN * 16;
   __shared__ unsigned char sW[BNF_T * LWSTR];
   __shared__ float s_rs[AR_BMF];
+  __shared__ float s_asg[PG ? AR_BMF : 1];
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / AR_WN, wn = wave % AR_WN;
@@ -1822,7 +1877,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
   const int prt = (n0 >= pb1 ? 1 : 0) + (n0 >= pb2 ? 1 : 0);
   const int G = K / PQ_GROUP;
   AT += (size_t)prt * Mt * 16 * K;
-  AS += (size_t)prt * M;
+  if constexpr (PG) AS += (size_t)prt * M * G; else AS += (size_t)prt * M;
   RS += (size_t)prt * M * G;
 
   // Wave-uniform tile bases (SGPR) + one per-lane offset; tile-granular clamp, never predicate.
@@ -1874,6 +1929,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
       const int r = tid;
       const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
       s_rs[r] = RS[(size_t)rc * G + g];
+      if constexpr (PG) s_asg[r] = AS[(size_t)rc * G + g];
     }
     pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR, BITS, I8>(sW, W, n0, N, K, k0,
                                                                                  tid, WH);
@@ -1937,6 +1993,14 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
           for (int e = 0; e < 8; ++e) acc[i][j][e] += (float)t[j][e];
         continue;
       }
+      float av[8];
+      if constexpr (PG) {
+        const float4 a4l = *(const float4 *)&s_asg[mlb], a4h = *(const float4 *)&s_asg[mlb + 4];
+        av[0] = a4l.x; av[1] = a4l.y; av[2] = a4l.z; av[3] = a4l.w; av[4] = a4h.x; av[5] = a4h.y; av[6] = a4h.z; av[7] = a4h.w;
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) av[e] = 1.f;
+      }
       if (second && (ABL & 4) == 0) {
         const float4 r4l = *(const float4 *)&s_rs[mlb], r4h = *(const float4 *)&s_rs[mlb + 4];
         const float rv[8] = {r4l.x, r4l.y, r4l.z, r4l.w, r4h.x, r4h.y, r4h.z, r4h.w};
@@ -1944,12 +2008,12 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
         for (int j = 0; j < TN; ++j)
 #pragma unroll
           for (int e = 0; e < 8; ++e)
-            acc[i][j][e] = fmaf(sc[j], (float)t[j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
+            acc[i][j][e] = fmaf(sc[j], av[e] * (float)t[j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
       } else {
 #pragma unroll
         for (int j = 0; j < TN; ++j)
 #pragma unroll
-          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], (float)t[j][e], acc[i][j][e]);
+          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], av[e] * (float)t[j][e], acc[i][j][e]);
       }
     }
     __syncthreads();
@@ -2008,7 +2072,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
             const int r = i * 16 + kb8 + e;
-            Cb[r * N + ncol[j]] = (__bf16)(acc[i][j][e] * Asb[r]);
+            if constexpr (PG) Cb[r * N + ncol[j]] = (__bf16)acc[i][j][e];
+            else Cb[r * N + ncol[j]] = (__bf16)(acc[i][j][e] * Asb[r]);
           }
       return;
     }
@@ -2020,7 +2085,10 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const int m = m0 + wm * AR_TM * 16 + i * 16 + kb8 + e;
-        if (m < M && ncol[j] < N) C[(size_t)m * N + ncol[j]] = (__bf16)(acc[i][j][e] * AS[m]);
+        if (m < M && ncol[j] < N) {
+          if constexpr (PG) C[(size_t)m * N + ncol[j]] = (__bf16)acc[i][j][e];
+          else C[(size_t)m * N + ncol[j]] = (__bf16)(acc[i][j][e] * AS[m]);
+        }
       }
 }
 

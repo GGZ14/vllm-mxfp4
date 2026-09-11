@@ -89,6 +89,9 @@ FUSED_TOKQ = os.environ.get("RADIANCE_PQ_FUSED_TOKQ", "1") == "1"
 # instead of e4m3 on the fp8 WMMA. Same weights, same SZ; the producers and GEMMs switch together.
 I8 = os.environ.get("RADIANCE_PQ_I8", "0") == "1"
 I8_FLAG = 1 if I8 else 0
+# PG: per-GROUP activation scales above the decode band too, on the A-tiled band (pq_rotate_groupquant
+# producer + pq_int4_fp8_gemm_atiled<PG>). Without ATILED it falls back to the row-major per-group path.
+PG = os.environ.get("RADIANCE_PQ_PG", "0") == "1"
 # Weight layout: fragment order (one 32-lane u32 slot per (n-tile, k-step)) rather than the
 # loader's [N, K/8]. The kernels read RADIANCE_PQ_WPERM themselves; this flag and theirs MUST
 # agree or the weight is read as garbage. Fragment order is what makes the decode kernel's
@@ -212,7 +215,8 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
     _ensure_scratch(x.device)
     stream = torch.cuda.current_stream().cuda_stream
     whi_p = whi.data_ptr() if whi is not None else 0       # int5: fifth-bit plane
-    ptok = PTOK_ENABLED and M > DECODE_MAX_M
+    pg_tiled = PG and ATILED_ENABLED and M > DECODE_MAX_M
+    ptok = PTOK_ENABLED and M > DECODE_MAX_M and not PG
     tiled = ptok and ATILED_ENABLED
     as_tok = None
     out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
@@ -230,6 +234,13 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
         asg = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
         rs = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
     if use_pre:
+        gemm_scale = asg
+    elif pg_tiled:
+        # per-group scales on the tiled band: one fused launch (rotate + per-group quant + tiled write)
+        Mt = (M + 15) // 16
+        a_codes = torch.empty((P, Mt * 16 * K), device=x.device, dtype=torch.uint8)
+        _ext.launch_rotate_groupquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), a_codes.data_ptr(),
+                                      asg.data_ptr(), rs.data_ptr(), M, K, P, krot, stream, 1, I8_FLAG)
         gemm_scale = asg
     elif ptok:
         # Prefill: pass A (rotate -> bf16 scratch + per-group scales), pass C (token scale +
@@ -258,10 +269,10 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
                                  a_codes.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P,
                                  krot, 0, stream, I8_FLAG)
         gemm_scale = asg
-    if tiled:
+    if tiled or pg_tiled:
         _ext.launch_gemm_at(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                             gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K,
-                            pb1, pb2, stream, whi_p, I8_FLAG)
+                            pb1, pb2, stream, whi_p, I8_FLAG, 1 if pg_tiled else 0)
     else:
         _ext.launch_gemm(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                          gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K, pb1,
@@ -269,7 +280,7 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
     if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
             and (N, K, M) not in _checked:
         _checked.add((N, K, M))
-        a_ref = untile_a(a_codes, P, M, K) if tiled else a_codes
+        a_ref = untile_a(a_codes, P, M, K) if (tiled or pg_tiled) else a_codes
         if whi is not None:   # int5: full codes rebuilt from the kernel-layout tensors (no resident copy)
             lo = unpack_codes(unpermute_w(qweight, N, K), N, K)
             ref = _exact_ref(a_ref, asg, rs, None, sz, N, K, pb1, pb2, as_tok=as_tok,
@@ -280,7 +291,7 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
         num = (out.float() - ref.float()).pow(2).sum().sqrt()
         den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
         sys.stderr.write(f"[radiance.paroquant] CHECKALL N={N} K={K} M={M} P={P} "
-                         f"path={'tiled' if tiled else 'ptok' if ptok else 'decode'}"
+                         f"path={'pg-tiled' if pg_tiled else 'tiled' if tiled else 'ptok' if ptok else 'decode'}"
                          f"{'+pre' if use_pre else ''} "
                          f"rel={float(num / den):.5f}\n")
     return out
