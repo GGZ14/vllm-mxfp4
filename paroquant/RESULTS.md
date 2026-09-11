@@ -705,3 +705,23 @@ decode band (M <= 64); above it the tuple is allocated and untouched -> garbage 
 top-1 0.09%, acc/draft 0.000 at 8k ctx, gibberish on an 8k prompt) while ctx-25 decode looked fine.
 `_linear_impl` now uses the tuple only when M <= DECODE_MAX_M. The harness int5 gate now also covers
 the per-group prefill variant at 4 and 5 bits (rel 1.66e-3, PASS): the kernel was never wrong.
+
+## 2026-09-11: I8 mode -- int8 activations on the iu8 WMMA (W5A8-int8); per-token int8 LOSES to e4m3
+
+Built as a mode of the same kernels (`I8` template flag): weight codes go to `v_wmma_i32_16x16x16_iu8` as
+the signed integer (c - 16) via a perm-mask unpack (no e4m3 table), slab products accumulate in int32 and
+convert once per fold, the fold algebra and SZ layout are unchanged, and every activation producer has an
+int8 variant (scale amax/127, round + clamp +-127, integer row-sums). `RADIANCE_PQ_I8=1` selects it end to
+end; cache dir suffix `-i8`. Harness gate `i8`: all bands x shapes rel 1.66e-3 (bf16 floor), int8 kernels
+0.87-1.03x the fp8 time (the int8 unpack is cheaper than the four-table e4m3 select); producers exact vs a
+CPU int8 reference, fused == two-pass.
+
+Served (fine-tuned int5, TP=2, SPEC=7): decode 25.89 / 27.59 / 28.42 ms/step (fp8-A: 26.29 / 27.90 / 28.71),
+prefill 3644 / 3535 / 3604 / 3547 / 3380 (fp8-A: 3569 / 3493 / 3520 / 3441 / 3298), GSM8K 98.00 (490/500).
+But KL(bf16 || served), top-256: wiki 0.0334 / code 0.0314 / served 0.0273 vs e4m3 per-token 0.0274 /
+0.0246 / 0.0224 -- **per-token int8 is 15-28% WORSE than per-token e4m3.** One uniform 127-level grid per
+5120-wide token spends its levels on the row's largest channel and flattens the bulk; e4m3 keeps relative
+precision for the small values. The rotations soften the outlier channels but do not remove them. The decode
+band already runs per-group int8; this KLD is a prefill (per-token path). Next: the same KLD with per-group
+int8 everywhere (`PTOK=0`, no A-tiled band, -19% prefill) -- decides whether an A-tiled band with per-group
+activation scales is the remaining piece or whether int8 activations are not the lever at all.
