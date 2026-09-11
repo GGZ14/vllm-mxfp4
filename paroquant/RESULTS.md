@@ -776,3 +776,26 @@ parity (25.9 ms/step), prefill at int5's ~3550-3650.
 Method notes: the bf16 base on 0.9.3 OOMs on prompt logprobs past ~120 chunks at 0.97 util (only wikitext
 collected) -- collect corpora in separate boots or cap KV explicitly; `MAXSEQS=1` under prod mode trips
 vLLM's static-shape compile ("Expected exactly one compiled range_entry"), eval mode (eager) avoids it.
+
+## 2026-09-11 (evening): per-group int8 on the A-tiled band -- the prod candidate
+
+`RADIANCE_PQ_I8=1 RADIANCE_PQ_PG=1`: `pq_rotate_groupquant` (rotate + per-group int8 quant + tiled write, one
+launch, byte-exact vs pass A) feeds `pq_int4_fp8_gemm_atiled<..., PG>` (asg[m,g] staged per slab and folded,
+no epilogue scale); decode band unchanged (per-group int8 already). Harness `pg`: PASS, band 1.09-1.17x the
+per-token band (the fold multiply), producer exact.
+
+Served, fine-tuned int5, TP=2, SPEC=7, same-stack reference (bf16 base on 0.9.3):
+
+| int5 FT variant | KL wiki top-5 / top-256 | top-1 | ms/step @25/8k/32k | prefill 2k/8k/16k/32k/64k | GSM8K |
+|---|---|---|---|---|---|
+| e4m3 per-token (int5 default) | 0.0088 / 0.0126 | 94.3 | 26.29 / 27.90 / 28.71 | 3569 / 3493 / 3520 / 3441 / 3298 | 97.40 |
+| int8 per-token (I8) | -- (worse cross-stack) | -- | 25.89 / 27.59 / 28.42 | 3644 / 3535 / 3604 / 3547 / 3380 | 98.00 |
+| int8 per-group, row-major (I8 PTOK=0) | 0.0066 / 0.0098 | 95.0 | 25.86 / 27.85 | ~2900 (-19%) | -- |
+| **int8 per-group, A-tiled (I8 PG)** | **0.0067 / 0.0097** | **95.2** | 26.01 / 27.35 / 28.16 | **3328 / 3214 / 3267 / 3211 / 3077** | 97.20 |
+
+The tiled per-group band keeps the best fidelity (0.0097, top-1 95.2%: below the RTN weights-only 0.0126 and
+23% under the e4m3 per-token path) at -9% prefill vs per-token int8 instead of -19%, decode at parity, KV 767k
+(prod cap). Row-major vs tiled per-group differ by KL 0.004 -- two bf16-correct kernels' rounding through 64
+layers; anything under ~0.005 between variants is implementation noise on this measurement. Remaining prefill
+lever for this configuration: pow2 weight scales folded at staging + the zero-point epilogue, which removes
+the two weight-side FMAs and leaves only the activation-scale FMA (back to the per-token band's cost).
