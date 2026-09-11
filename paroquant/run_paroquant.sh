@@ -195,7 +195,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_STEP_TRACE="${RADIANCE_STEP_TRACE:-0}" \
   -e RADIANCE_DFLASH_CAPTURE_DIR="${CAPTURE_DIR:+/capture}" "${CAPTURE_MOUNT[@]}" \
   -e RADIANCE_PRESHUFFLE=1 -e RADIANCE_FUSE_RMS_QUANT=1 \
-  -e R4D_ATTN_FP8=3 \
+  -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_GDN_FUSED_UPDATE="$GDN_FUSED" -e RADIANCE_GDN_MERGE_INPROJ=0 \
   -e RADIANCE_GDN_FUSED_MAX_ITEMS="${RADIANCE_GDN_FUSED_MAX_ITEMS:-32}" \
   -e RADIANCE_DYNAMIC_WIDTH=1 -e RADIANCE_DYNW_ALPHA=0.35 -e RADIANCE_DYNW_MARGIN=2 \
@@ -296,7 +296,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   "$MODEL" \
   --served-model-name $SERVED_NAMES \
   --host 0.0.0.0 --port "$PORT" \
-  --kv-cache-dtype fp8 \
+  --kv-cache-dtype "${KV_DTYPE:-fp8}" \
   --tensor-parallel-size "$TP" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --attention-backend R4D \

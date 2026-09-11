@@ -725,3 +725,23 @@ precision for the small values. The rotations soften the outlier channels but do
 band already runs per-group int8; this KLD is a prefill (per-token path). Next: the same KLD with per-group
 int8 everywhere (`PTOK=0`, no A-tiled band, -19% prefill) -- decides whether an A-tiled band with per-group
 activation scales is the remaining piece or whether int8 activations are not the lever at all.
+
+## 2026-09-11: where the served-vs-weights-only gap is NOT (int5 FT, served KL top-256, wikitext)
+
+| variant | wiki | code | served | top-1 wiki |
+|---|---|---|---|---|
+| e4m3 per-token (default) | 0.0274 | 0.0246 | 0.0224 | 92.2 |
+| e4m3 per-group (PTOK=0) | 0.0259 | -- | -- | 92.2 |
+| int8 per-token (I8) | 0.0334 | 0.0314 | 0.0273 | 91.3 |
+| int8 per-group (I8, PTOK=0) | 0.0251 | 0.0234 | 0.0217 | 92.4 |
+| e4m3 per-token + bf16 attention + bf16 KV | 0.0266 | 0.0251 | 0.0227 | 92.4 |
+| weights only (RTN pseudo, 0.5.8 stock stack) | 0.0109 | 0.0097 | 0.0074 | 94.7 |
+
+Activation element and granularity move the served KL by <10% either way (int8 per-token is worse: one
+127-level grid per 5120-wide token flattens the bulk); bf16 attention + bf16 KV move it 3% (fp8 KV cache and
+fp8 attention stay -- 2x KV for nothing measurable). Decode 25.9-26.4 ms/step across all of them. The ~0.014
+between every served variant and the weights-only pseudo is therefore not the linears' activation quant and
+not attention. Next diagnostic: the pseudo checkpoint served on the 0.9.3 stack (prod attention/KV) --
+if it reads ~0.025 the gap is the serving stack's numerics vs the 0.5.8 reference (a cross-image
+measurement artifact), if ~0.011 it is something in the W5A8 GEMM path. Launcher now takes
+`R4D_ATTN_FP8` (default 3) and `KV_DTYPE` (default fp8) as env.
