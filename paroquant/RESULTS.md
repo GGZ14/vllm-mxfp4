@@ -799,3 +799,13 @@ The tiled per-group band keeps the best fidelity (0.0097, top-1 95.2%: below the
 layers; anything under ~0.005 between variants is implementation noise on this measurement. Remaining prefill
 lever for this configuration: pow2 weight scales folded at staging + the zero-point epilogue, which removes
 the two weight-side FMAs and leaves only the activation-scale FMA (back to the per-token band's cost).
+
+## 2026-09-11 (evening): pow2 group scales -- REJECTED (2.8x the KL); E2M2 skipped on the same grounds
+
+`build_int5.py POW2=1` (z-lab's pow2 projection of the fp16 group scale, zero point from the unprojected
+scale), RTN pseudo served on the 0.9.3 stack, same-stack KL wikitext top-5 / top-256 / top-1: **0.0238 /
+0.0348 / 90.8%** vs plain fp16 scales 0.0087 / 0.0126 / 94.6%. Rounding a group-128 scale to a power of two
+costs up to a factor of two in step size -- most of a bit of the grid -- and the fidelity was the point. The
+pow2 + zero-point-epilogue zero-VALU loop is therefore not a path for int5; the per-group fold's 9% prefill
+stays. E2M2 "MXFP5" (pow2 block-32 scales + a float grid) is the same mechanism on a coarser grid and is
+expected in MXFP4's class; not run.

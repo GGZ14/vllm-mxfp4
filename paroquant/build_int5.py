@@ -21,7 +21,9 @@ from safetensors.torch import save_file
 sys.path.insert(0, "/src")
 from paroquant.kernels.cuda import scaled_pairwise_rotation
 from paroquant.optim.quantizer import _calc_scales_and_zero_points
+from paroquant.optim.quant import pow2_project
 from paroquant.cli.convert import _pack_awq
+POW2 = os.environ.get("POW2", "0") == "1"      # power-of-two group scales (z-lab's PARO_POW2_SCALES projection)
 
 BITS, QMAX, GS, dev = 5, 31, 128, "cuda"
 BASE, PARO = Path("/models/Qwen3.8-27B-bf16"), Path("/models/Qwen3.8-27B-PARO")
@@ -62,6 +64,7 @@ for si, shard in enumerate(shards):
                 w_rot = rot(w * cs_opt, pairs, theta)
                 scale, zpf = _calc_scales_and_zero_points(w_rot, GS, 0, QMAX)      # [N*G, 1]
                 scale = scale.clamp(min=1e-5, max=1e5)
+                if POW2: scale = pow2_project(scale)              # zero point from the unprojected scale, as z-lab does
                 zero = torch.clamp(-torch.round(zpf), 0, QMAX)
                 codes = torch.clamp(torch.round(w_rot.reshape(-1, GS) / scale) + zero, 0, QMAX)
                 w_rot_q = ((codes - zero) * scale).reshape(N, K)
@@ -102,7 +105,7 @@ for out, wmap in outs:
         if fn.suffix in (".json", ".jinja", ".txt") and fn.name != "model.safetensors.index.json":
             shutil.copy(fn, out / fn.name)
 qc = dict(cfg["quantization_config"]); qc.update({"quant_method": "paroquant", "bits": BITS, "group_size": GS,
-        "format": "int5-bitplane", "rotations": "z-lab/Qwen3.8-27B-PARO", "codes": "rtn"})
+        "format": "int5-bitplane", "rotations": "z-lab/Qwen3.8-27B-PARO", "codes": "rtn", "pow2_scales": POW2})
 cfg_r = dict(cfg); cfg_r["quantization_config"] = qc
 json.dump(cfg_r, open(OUT_REAL / "config.json", "w"), indent=2)
 if WRITE_PSEUDO:
