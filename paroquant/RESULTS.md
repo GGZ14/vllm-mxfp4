@@ -654,3 +654,29 @@ operands, rank-G epilogue WMMA) -- keeps the uniform 32-level grid and the zero 
 FMAs, trades only scale precision; cheaper than a new format if (1) reads poorly. Then the prod
 decision between MXFP4-PARO (speed, KV) and int5 (fidelity: ~8-bit-class KL at 5.25 bits, -10% decode,
 -11% KV, -27% prefill vs MXFP4-PARO).
+
+## 2026-09-11: int5 stage-2 fine-tune -- served-path KL, and the activation quant is now the floor
+
+Fine-tune ran locally, incrementally: base re-saved as fp16 safetensors (`to_fp16.py`) so the optimizer's
+`from_pretrained(dtype=fp16)` maps it from the page cache (0.8 GiB resident after load, verified) instead of
+materializing 55 GB in RAM; each finished block's weights are dropped by the optimizer. 512 samples x 2 epochs,
+rotations frozen, 9.5 min/layer on one R9700 (GPU-bound; RAM 34-48 GB, swap ~0), one random GPU stall at
+layer 42 overnight (resumed per layer: replay ~1.6 min/layer, layer 42 then passed). Traps on the way:
+systemd-oomd is socket-activated (stop the .socket too), zram swap adds pressure, a 512-sample run with the
+bf16 base thrashes 60 GB RAM, `paroquant.cli.convert` instantiates an AWQ module class whose buffers do not
+fit the bit-plane layout -> `convert_int5.py` is now a standalone shard writer over `_quantize_layer`.
+
+Served (TP=2, SPEC=7, DFlash2, MAX_LOGPROBS=256 for the KLD collection, which also shrinks the KV profile
+to ~550k on these boots -- prod without the cap keeps 767k):
+
+| int5, served path (W5A8, prefill = per-token A scales) | ms/step @25/8k/32k | GSM8K | KL top-256 wiki / code / served | top-1 |
+|---|---|---|---|---|
+| RTN | 26.53 / 28.27 / 28.79 | 97.80 | 0.0317 / 0.0262 / 0.0248 | 91.5 / 93.8 / 93.4 |
+| **fine-tuned** | 26.29 / 27.90 / 28.71 | 97.40 | **0.0274 / 0.0246 / 0.0224** | **92.2 / 94.3 / 93.5** |
+| PARO-MXFP4 prod (1000-char chunks) | 23.38 / 24.91 / 25.80 | 97.40 | 0.048 / 0.054(top-20) / 0.044(top-20) | 90.0 / 92.7 / 91.9 |
+
+The fine-tune is worth 7-14% of served KL. The bigger number: the RTN *pseudo* path (weights only, no
+activation quant) measured 0.0109 / 0.0097 / 0.0074, so ~0.02 nats of the served 0.027-0.032 is the per-token
+e4m3 activation quantization, not the 5-bit weights. Prompt logprobs are a prefill, which runs the per-token
+(PTOK) activation-scale path; the decode band already uses per-group scales. Next measurement: the same KLD
+with `RADIANCE_PQ_PTOK=0` (per-group everywhere, ~7% prefill cost).
