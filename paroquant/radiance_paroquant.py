@@ -85,6 +85,10 @@ ATILED_ENABLED = os.environ.get("RADIANCE_PQ_ATILED", "1") == "1"
 # Fused prefill prologue: pass A + pass C as one launch (pq_rotate_tokquant with row-sums), byte-exact
 # (par_harness tokqrs). 0 = the two-pass path.
 FUSED_TOKQ = os.environ.get("RADIANCE_PQ_FUSED_TOKQ", "1") == "1"
+# I8: int8 activations (per-group / per-token scale amax/127, integer row-sums) on the iu8 WMMA
+# instead of e4m3 on the fp8 WMMA. Same weights, same SZ; the producers and GEMMs switch together.
+I8 = os.environ.get("RADIANCE_PQ_I8", "0") == "1"
+I8_FLAG = 1 if I8 else 0
 # Weight layout: fragment order (one 32-lane u32 slot per (n-tile, k-step)) rather than the
 # loader's [N, K/8]. The kernels read RADIANCE_PQ_WPERM themselves; this flag and theirs MUST
 # agree or the weight is read as garbage. Fragment order is what makes the decode kernel's
@@ -167,7 +171,8 @@ def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None, codes
     sc = sz.view(G, N, 2)[..., 0].float()            # [G, N]
     zsc = sz.view(G, N, 2)[..., 1].float()
     P, M = a_codes.shape[0], a_codes.shape[1]
-    aval = _e4m3_table(device)[a_codes.view(torch.uint8).long()]     # [P, M, K] f32
+    if I8: aval = a_codes.view(torch.int8).float()                     # [P, M, K] int8 -> f32
+    else: aval = _e4m3_table(device)[a_codes.view(torch.uint8).long()]  # [P, M, K] e4m3 -> f32
     out = torch.zeros((M, N), dtype=torch.float64, device=device)
     bounds = [0, min(pb1, N), min(pb2, N), N]
     CHUNK = 512      # n-columns at a time: the ref must not OOM a 0.92-util worker
@@ -239,28 +244,28 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
             # one launch: rotate -> token amax -> encode (+ tiled layout) + plain row-sums
             _ext.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
                                         a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot,
-                                        stream, 1 if tiled else 0, rs.data_ptr())
+                                        stream, 1 if tiled else 0, rs.data_ptr(), I8_FLAG)
         else:
             xr = torch.empty((P, M, K), device=x.device, dtype=torch.bfloat16)
             _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
-                                     asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
+                                     asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream, I8_FLAG)
             _ext.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
                                     as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream,
-                                    1 if tiled else 0)
+                                    1 if tiled else 0, I8_FLAG)
         gemm_scale = as_tok
     else:
         _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
                                  a_codes.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P,
-                                 krot, 0, stream)
+                                 krot, 0, stream, I8_FLAG)
         gemm_scale = asg
     if tiled:
         _ext.launch_gemm_at(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                             gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K,
-                            pb1, pb2, stream, whi_p)
+                            pb1, pb2, stream, whi_p, I8_FLAG)
     else:
         _ext.launch_gemm(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                          gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K, pb1,
-                         pb2, 1 if ptok else 0, stream, whi_p)
+                         pb2, 1 if ptok else 0, stream, whi_p, I8_FLAG)
     if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
             and (N, K, M) not in _checked:
         _checked.add((N, K, M))
@@ -339,7 +344,7 @@ def pq_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
     _ext.launch_add_rms_rot(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                             rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
                             a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
-                            1 if fused else 0, torch.cuda.current_stream().cuda_stream)
+                            1 if fused else 0, torch.cuda.current_stream().cuda_stream, I8_FLAG)
     return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
 
 
@@ -384,7 +389,7 @@ def pq_ew_rot(mode: int, x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, eps:
     _ext.launch_ew_rot(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
                        rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
                        asg.data_ptr(), rs.data_ptr(), M, N, rec.shape[1], 1 if fused else 0,
-                       torch.cuda.current_stream().cuda_stream)
+                       torch.cuda.current_stream().cuda_stream, I8_FLAG)
     return hs, a, asg, rs
 
 
@@ -534,7 +539,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
                                    weight.data_ptr(), float(eps), rec.data_ptr(), cs.data_ptr(),
                                    hs.data_ptr(), ro.data_ptr(), a.data_ptr(), asg.data_ptr(),
                                    rs.data_ptr(), M, K, P, rec.shape[1], _AR["drain"], _AR["acq"],
-                                   stream)
+                                   stream, I8_FLAG)
         if AR_CHECK and _AR.get("checks", 0) < AR_CHECK:
             # RADIANCE_PQ_AR_CHECK=N: for the first N decode-band calls also run the unfused
             # path (vLLM all-reduce + plain kernel) on the same inputs and report the divergence
@@ -547,7 +552,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
             _ext.launch_add_rms_rot(yr.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                                     rec.data_ptr(), cs.data_ptr(), hs2.data_ptr(), ro2.data_ptr(),
                                     a2.data_ptr(), asg2.data_ptr(), rs2.data_ptr(), M, K, P,
-                                    rec.shape[1], 1, stream)
+                                    rec.shape[1], 1, stream, I8_FLAG)
             torch.cuda.synchronize()
             rows_bad = int((ro != ro2).view(M, -1).any(dim=1).sum())
             sys.stderr.write(f"[radiance.paroquant] AR_CHECK call {_AR['checks']} M={M} K={K} P={P}: "
@@ -560,7 +565,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
     _ext.launch_add_rms_rot(yr.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                             rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
                             a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
-                            1 if M <= DECODE_MAX_M else 0, stream)
+                            1 if M <= DECODE_MAX_M else 0, stream, I8_FLAG)
     return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
 
 
@@ -1083,7 +1088,7 @@ class ParoQuantLinearMethod(LinearMethodBase):
 
 
 if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
-    sys.stderr.write("[radiance.paroquant] registered (int4/int5 g128 asym + rotations, W4A8, "
+    sys.stderr.write(f"[radiance.paroquant] registered (int4/int5 g128 asym + rotations, W{{4,5}}A8-{'int8' if I8 else 'e4m3'}, "
                      f"gfx1201; weight layout {'FRAGMENT ORDER' if WPERM else 'row'}, "
                      f"prefill {'A-tiled' if ATILED_ENABLED else 'row'}, decode band M<="
                      f"{DECODE_MAX_M}, rot stream {'on' if ROT_STREAM else 'off'})\n")

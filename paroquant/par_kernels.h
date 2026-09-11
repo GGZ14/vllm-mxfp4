@@ -53,6 +53,7 @@
 #include <cstring>
 
 typedef float floatx8 __attribute__((ext_vector_type(8)));
+typedef int intx8 __attribute__((ext_vector_type(8)));
 typedef int int2_t __attribute__((ext_vector_type(2)));
 typedef unsigned int uint2_t __attribute__((ext_vector_type(2)));
 typedef unsigned int uint4_t __attribute__((ext_vector_type(4)));
@@ -125,6 +126,38 @@ __device__ __forceinline__ uint2_t ar_unpack8_5(unsigned int wv, unsigned int hb
                  __builtin_amdgcn_perm(bo, be, 0x07030602u)};
 }
 
+// ---------------------------------------------------------------- int8 (I8) mode
+// W*A8-int8: activations are per-group / per-token INT8 (scale amax/127, integer row-sums) and the
+// weight codes go to the iu8 WMMA as the signed integer (c - 2^(BITS-1)) -- exact, no e4m3 table.
+// The fold algebra is unchanged: SZ still carries {sc, sc*(zp - 2^(BITS-1))} and RS the (scaled)
+// row-sum, only now RS is a sum of integers. The slab product accumulates in int32 (|a| <= 127,
+// |w| <= 16, 128 k: < 2^18) and is converted to float once per fold.
+template <int BITS>
+__device__ __forceinline__ unsigned int pq_i8_codes4(unsigned int c4) {   // four codes -> four int8
+  if constexpr (BITS == 5) {
+    const unsigned int m = __builtin_amdgcn_perm(0u, 0x0000FF00u, ((c4 & 0x10101010u) ^ 0x10101010u) >> 4);
+    return (c4 & 0x0F0F0F0Fu) | (m & 0xF0F0F0F0u);        // c - 16
+  } else {
+    const unsigned int m = __builtin_amdgcn_perm(0u, 0x0000FF00u, ((c4 & 0x08080808u) ^ 0x08080808u) >> 3);
+    return (c4 & 0x07070707u) | (m & 0xF8F8F8F8u);        // c - 8
+  }
+}
+template <int BITS>
+__device__ __forceinline__ uint2_t ar_unpack8_i8(unsigned int wv, unsigned int hb) {
+  unsigned int be = wv & 0x0F0F0F0Fu, bo = (wv >> 4) & 0x0F0F0F0Fu;
+  if constexpr (BITS == 5) { be |= pq_spread4(hb); bo |= pq_spread4(hb >> 1); }
+  be = pq_i8_codes4<BITS>(be); bo = pq_i8_codes4<BITS>(bo);
+  return uint2_t{__builtin_amdgcn_perm(bo, be, 0x05010400u), __builtin_amdgcn_perm(bo, be, 0x07030602u)};
+}
+template <bool I8> struct pq_acc { using T = floatx8; };
+template <> struct pq_acc<true> { using T = intx8; };
+template <bool I8>
+__device__ __forceinline__ typename pq_acc<I8>::T pq_wmma(const int2_t &a, const int2_t &b,
+                                                          typename pq_acc<I8>::T c) {
+  if constexpr (I8) return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+  else return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
+}
+
 // ---------------------------------------------------------------- weight staging (both layouts)
 //
 // Two weight layouts, ONE sW tile. Row layout (WPERM=false) is the loader's [N, K/8] u32, eight
@@ -146,7 +179,7 @@ static __device__ __forceinline__ T pq_ld_w(const T *p) {
 }
 
 template <int ROWS, int LBK, int STR, int NTHREADS, bool WPERM, bool NT, int ABLATE = 0,
-          int WSLOT_OVR = 0, int BITS = 4>
+          int WSLOT_OVR = 0, int BITS = 4, bool I8 = false>
 __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
                                            const unsigned int *__restrict__ W, int n0, int N,
                                            int K, int k0, int tid,
@@ -187,6 +220,8 @@ __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
       for (int q = 0; q < WSLOTS; ++q) {
         if constexpr (ABLATE & 1)
           *(uint2_t *)(&sW[(r + q) * STR + kloc]) = uint2_t{wq[q], wq[q]};
+        else if constexpr (I8)
+          *(uint2_t *)(&sW[(r + q) * STR + kloc]) = ar_unpack8_i8<BITS>(wq[q], (hq >> (8 * q)) & 0xFFu);
         else if constexpr (BITS == 5)
           *(uint2_t *)(&sW[(r + q) * STR + kloc]) = ar_unpack8_5(wq[q], (hq >> (8 * q)) & 0xFFu);
         else
@@ -206,10 +241,16 @@ __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
       if constexpr (ABLATE & 1) {
         *(uint2_t *)(&sW[r * STR + c * 16]) = uint2_t{wv[0], wv[0]};
         *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = uint2_t{wv[1], wv[1]};
-      } else if constexpr (BITS == 5) {
-        const unsigned int hb = pq_ld_w<NT>((const unsigned short *)(WH + (size_t)gc * kw + k0 / 8 + c * 2));
-        *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8_5(wv[0], hb & 0xFFu);
-        *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8_5(wv[1], (hb >> 8) & 0xFFu);
+      } else if constexpr (I8 || BITS == 5) {
+        unsigned int hb = 0;
+        if constexpr (BITS == 5) hb = pq_ld_w<NT>((const unsigned short *)(WH + (size_t)gc * kw + k0 / 8 + c * 2));
+        if constexpr (I8) {
+          *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8_i8<BITS>(wv[0], hb & 0xFFu);
+          *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8_i8<BITS>(wv[1], (hb >> 8) & 0xFFu);
+        } else {
+          *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8_5(wv[0], hb & 0xFFu);
+          *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8_5(wv[1], (hb >> 8) & 0xFFu);
+        }
       } else {
         *(uint2_t *)(&sW[r * STR + c * 16]) = ar_unpack8(wv[0]);
         *(uint2_t *)(&sW[r * STR + c * 16 + 8]) = ar_unpack8(wv[1]);
@@ -252,6 +293,21 @@ __host__ __device__ __forceinline__ unsigned char pq_e4m3_encode(float v) {
   if (q >= 16.f) { q = 8.f; ++E; }                // mantissa carry
   if (E > 15 || (E == 15 && q > 14.f)) return sign | 0x7E;   // saturate (0xF6 is 448; 0xF7 NaN)
   return sign | (unsigned char)((E << 3) | ((int)q - 8));
+}
+
+// Activation quantizer element: e4m3 (scale amax/448, code-domain row-sum of the decoded values) or,
+// under I8, int8 (scale amax/127, row-sum of the integer codes). Both keep RS in the "value" domain
+// the fold expects (RS * asg per group, or plain per token).
+template <bool I8> __device__ __forceinline__ float pq_qscale(float amax) {
+  return fmaxf(amax * (I8 ? (1.f / 127.f) : (1.f / 448.f)), 1e-10f);
+}
+template <bool I8> __device__ __forceinline__ unsigned char pq_qenc(float v, float &rs) {
+  if constexpr (I8) {
+    int q = __float2int_rn(v); q = max(-127, min(127, q)); rs += (float)q;
+    return (unsigned char)(signed char)q;
+  } else {
+    const unsigned char b = pq_e4m3_encode(v); rs += pq_e4m3_decode(b); return b;
+  }
 }
 
 // ------------------------------------------------------------------ fused rotate+quant prologue
@@ -383,7 +439,7 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant(
 // latency chain (40 x P blocks on 64 CUs), so the two removed round trips are the win; at
 // prefill the LDS op count is the win. Arithmetic is identical (same fmaf on the same disjoint
 // pairs) -> bit-exact against v1, gated in par_harness.
-template <bool ROTOUT = false>
+template <bool ROTOUT = false, bool I8 = false>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
     const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
     const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ ASG,
@@ -445,7 +501,7 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1)
       amax = fmaxf(amax, __shfl_xor(amax, off, 32));
-    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float scale = pq_qscale<I8>(amax);
     const float inv = 1.f / scale;
 
     if constexpr (ROTOUT) {
@@ -455,9 +511,9 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
       continue;
     }
 
-    const unsigned char b0 = pq_e4m3_encode(v0 * inv), b1 = pq_e4m3_encode(v1 * inv);
-    const unsigned char b2 = pq_e4m3_encode(v2 * inv), b3 = pq_e4m3_encode(v3 * inv);
-    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+    float rs = 0.f;
+    const unsigned char b0 = pq_qenc<I8>(v0 * inv, rs), b1 = pq_qenc<I8>(v1 * inv, rs);
+    const unsigned char b2 = pq_qenc<I8>(v2 * inv, rs), b3 = pq_qenc<I8>(v3 * inv, rs);
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1)
       rs += __shfl_xor(rs, off, 32);
@@ -507,7 +563,7 @@ __device__ __forceinline__ void pq_load_group(const unsigned short *__restrict__
   cs[3] = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
 }
 
-template <bool ROT>
+template <bool ROT, bool I8 = false>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
     const __bf16 *__restrict__ Y, const __bf16 *__restrict__ RES,
     const __bf16 *__restrict__ Wn, float eps,
@@ -645,11 +701,11 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_add_rms_rot(
     float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
-    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float scale = pq_qscale<I8>(amax);
     const float qi = 1.f / scale;
-    const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
-    const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
-    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+    float rs = 0.f;
+    const unsigned char b0 = pq_qenc<I8>(v0 * qi, rs), b1 = pq_qenc<I8>(v1 * qi, rs);
+    const unsigned char b2 = pq_qenc<I8>(v2 * qi, rs), b3 = pq_qenc<I8>(v3 * qi, rs);
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
     *(unsigned int *)(A + ((size_t)p * M + m) * K + kb) =
@@ -668,6 +724,7 @@ static inline int pq_rot_gpw(int M) { return M <= 40 ? 1 : 2; }
 // scale As = max_g ASG (they are amax/448, so their max IS the token amax/448), encodes the
 // rotated row against it, and writes plain code-domain row-sums per group (the PTOK GEMM applies
 // As once in its epilogue, so RS must NOT carry a scale here).
+template <bool I8 = false>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant(
     const __bf16 *__restrict__ XR,          // [P, M, K] rotated values (pass A)
     const float *__restrict__ ASG,          // [P, M, K/128] per-group scales (pass A)
@@ -696,11 +753,11 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant(
     const int c0 = g * PQ_GROUP + lane * 4;
     const float v0 = (float)xr[c0] * inv, v1 = (float)xr[c0 + 1] * inv;
     const float v2 = (float)xr[c0 + 2] * inv, v3 = (float)xr[c0 + 3] * inv;
-    const unsigned char b0 = pq_e4m3_encode(v0), b1 = pq_e4m3_encode(v1);
-    const unsigned char b2 = pq_e4m3_encode(v2), b3 = pq_e4m3_encode(v3);
+    float rs = 0.f;
+    const unsigned char b0 = pq_qenc<I8>(v0, rs), b1 = pq_qenc<I8>(v1, rs);
+    const unsigned char b2 = pq_qenc<I8>(v2, rs), b3 = pq_qenc<I8>(v3, rs);
     *(unsigned int *)(ar + c0) = (unsigned int)b0 | ((unsigned int)b1 << 8) |
                                  ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
-    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
     if (lane == 0) RS[((size_t)p * M + m) * G + g] = rs;
@@ -809,7 +866,7 @@ __device__ __forceinline__ void pq_tok_rotate_park2(
 // scatters 32 x 4 B over 16 fragment lines that the 15 neighbouring rows' workgroups fill in.
 // RS: also emit the int4 PTOK GEMM's plain code-domain row-sums per group (rs_out[g]): the same
 // per-lane sum + 32-lane xor tree as pq_token_quant / pq_token_quant_tiled, so byte-exact.
-template <int W, bool TILED = false, bool RS = false>
+template <int W, bool TILED = false, bool RS = false, bool I8 = false>
 __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, const __bf16 *s_row,
                                                   unsigned char *__restrict__ arow, float *__restrict__ as_out,
                                                   int G, int wave, int lane, int tid, int m = 0, int K = 0,
@@ -821,7 +878,7 @@ __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, co
   float amax = 0.f;
 #pragma unroll
   for (int w = 0; w < W; ++w) amax = fmaxf(amax, s_amax[w]);
-  const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+  const float scale = pq_qscale<I8>(amax);
   const float inv = 1.f / scale;
   if (tid == 0) *as_out = scale;
   const int c0 = lane * 4;
@@ -829,14 +886,14 @@ __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, co
     const int c = g * PQ_GROUP + c0;
     const float u0 = (float)s_row[c] * inv, u1 = (float)s_row[c + 1] * inv;
     const float u2 = (float)s_row[c + 2] * inv, u3 = (float)s_row[c + 3] * inv;
-    const unsigned char b0 = pq_e4m3_encode(u0), b1 = pq_e4m3_encode(u1);
-    const unsigned char b2 = pq_e4m3_encode(u2), b3 = pq_e4m3_encode(u3);
+    float rs = 0.f;
+    const unsigned char b0 = pq_qenc<I8>(u0, rs), b1 = pq_qenc<I8>(u1, rs);
+    const unsigned char b2 = pq_qenc<I8>(u2, rs), b3 = pq_qenc<I8>(u3, rs);
     const unsigned int packed = (unsigned int)b0 | ((unsigned int)b1 << 8) |
                                 ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
     if constexpr (TILED) *(unsigned int *)(arow + pq_tiled_off(m, c, K)) = packed;
     else *(unsigned int *)(arow + c) = packed;
     if constexpr (RS) {
-      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
 #pragma unroll
       for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
       if (lane == 0) rs_out[g] = rs;
@@ -855,7 +912,7 @@ __device__ __forceinline__ void pq_tok_encode_row(float wamax, float *s_amax, co
 // exactly because multiplying by a positive constant is monotone. Gated in par_harness (tokq).
 // WRS: also write RS [P, M, K/128] (the int4 PTOK GEMM's plain row-sums), making the int4 prefill
 // prologue this one launch instead of pass A + pass C (gated byte-exact: par_harness tokqrs).
-template <int W = PQ_ROT_WAVES, bool TILED = false, bool IL = false, bool WRS = false>
+template <int W = PQ_ROT_WAVES, bool TILED = false, bool IL = false, bool WRS = false, bool I8 = false>
 __global__ __launch_bounds__(W * 32) void pq_rotate_tokquant(
     const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
     const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ AS,
@@ -901,10 +958,10 @@ __global__ __launch_bounds__(W * 32) void pq_rotate_tokquant(
   float *rs_row = WRS ? RS + ((size_t)p * M + m) * G : nullptr;
   if constexpr (TILED) {
     const int Mt = (M + 15) >> 4;
-    pq_tok_encode_row<W, true, WRS>(wamax, s_amax, s_row, A + (size_t)p * Mt * 16 * K, AS + (size_t)p * M + m,
+    pq_tok_encode_row<W, true, WRS, I8>(wamax, s_amax, s_row, A + (size_t)p * Mt * 16 * K, AS + (size_t)p * M + m,
                                     G, wave, lane, tid, m, K, rs_row);
   } else {
-    pq_tok_encode_row<W, false, WRS>(wamax, s_amax, s_row, A + ((size_t)p * M + m) * K, AS + (size_t)p * M + m,
+    pq_tok_encode_row<W, false, WRS, I8>(wamax, s_amax, s_row, A + ((size_t)p * M + m) * K, AS + (size_t)p * M + m,
                                      G, wave, lane, tid, m, K, rs_row);
   }
 }
@@ -1183,7 +1240,7 @@ __global__ __launch_bounds__(256) void pq_skinny_bf16(
 //     (the activation scale is per group now, so it HAS to fold per slab).
 //   * A/ASG/RS are indexed through the block's partition (pb1/pb2 boundaries).
 template <int DWN, int DKS, int DTM, bool IMAJOR = true, int ABLATE = 0, bool WPERM = false,
-          bool NT = false, int BITS = 4>
+          bool NT = false, int BITS = 4, bool I8 = false>
 __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
@@ -1254,15 +1311,15 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
         *(uint4_t *)(&sA[r * DASTR + c]) = *(const uint4_t *)(A + (size_t)rc * K + k0 + c);
       }
     }
-    pq_stage_w<BND, DBK, DWSTR, DNTHREADS, WPERM, NT, ABLATE, 0, BITS>(sW, W, n0, N, K, k0, tid, WH);
+    pq_stage_w<BND, DBK, DWSTR, DNTHREADS, WPERM, NT, ABLATE, 0, BITS, I8>(sW, W, n0, N, K, k0, tid, WH);
     __syncthreads();
 
     if constexpr (IMAJOR) {
 #pragma unroll
       for (int i = 0; i < DTM; ++i) {
-        floatx8 t;
+        typename pq_acc<I8>::T t;
 #pragma unroll
-        for (int e = 0; e < 8; ++e) t[e] = 0.f;
+        for (int e = 0; e < 8; ++e) t[e] = 0;
 #pragma unroll
         for (int step = 0; step < DBK / 16; ++step) {
           const int kk = step * 16 + kb8;
@@ -1271,7 +1328,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
           af[0] = *(const int *)pa; af[1] = *(const int *)(pa + 4);
           const unsigned char *pw = &sW[(wave * 16 + col) * DWSTR + kk];
           wf[0] = *(const int *)pw; wf[1] = *(const int *)(pw + 4);
-          t = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wf, t);
+          t = pq_wmma<I8>(af, wf, t);
         }
         // Rows i*16+kb8 .. +7 are contiguous, so asg/rsa come in as two b128 LDS reads per
         // M-fragment instead of one b32 per element. RS carries rowsum*asg (prologue), so the
@@ -1283,19 +1340,19 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
         const float rv[8] = {r4l.x, r4l.y, r4l.z, r4l.w, r4h.x, r4h.y, r4h.z, r4h.w};
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-          if constexpr (ABLATE & 2) acc[i][e] += t[e];
-          else acc[i][e] = fmaf(sc, av[e] * t[e], fmaf(-zsc, rv[e], acc[i][e]));
+          if constexpr (ABLATE & 2) acc[i][e] += (float)t[e];
+          else acc[i][e] = fmaf(sc, av[e] * (float)t[e], fmaf(-zsc, rv[e], acc[i][e]));
         }
       }
       __syncthreads();
       continue;
     }
 
-    floatx8 gt[DTM];
+    typename pq_acc<I8>::T gt[DTM];
 #pragma unroll
     for (int i = 0; i < DTM; ++i)
 #pragma unroll
-      for (int e = 0; e < 8; ++e) gt[i][e] = 0.f;
+      for (int e = 0; e < 8; ++e) gt[i][e] = 0;
 
 #pragma unroll
     for (int step = 0; step < DBK / 16; ++step) {
@@ -1312,7 +1369,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
       wf[1] = *(const int *)(pw + 4);
 #pragma unroll
       for (int i = 0; i < DTM; ++i)
-        gt[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, gt[i]);
+        gt[i] = pq_wmma<I8>(af[i], wf, gt[i]);
     }
 
 #pragma unroll
@@ -1320,7 +1377,7 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const int ml = i * 16 + kb8 + e;
-        acc[i][e] = fmaf(sc, s_asg[ml] * gt[i][e], fmaf(-zsc, s_rs[ml], acc[i][e]));
+        acc[i][e] = fmaf(sc, s_asg[ml] * (float)gt[i][e], fmaf(-zsc, s_rs[ml], acc[i][e]));
       }
 
     __syncthreads();
@@ -1396,7 +1453,8 @@ __global__ __launch_bounds__(DWN * 32) void pq_int4_fp8_gemm_decode(
 // collapses to AutoRound's single FMA per slab; the zero-point correction stays one FMA per
 // element per group against PLAIN code row-sums, and As multiplies once in the epilogue. The
 // per-group variant (PTOK=false) remains for the decode-band fallthrough and the harness.
-template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false, bool WPERM = false, int BITS = 4>
+template <int TN, bool IMAJOR, int ABLATE = 0, bool PTOK = false, bool WPERM = false, int BITS = 4,
+          bool I8 = false>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
     const unsigned char *__restrict__ A, const unsigned int *__restrict__ W,
     const __half *__restrict__ SZ, const float *__restrict__ ASG,
@@ -1422,7 +1480,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
   else ASG += (size_t)prt * M * G;
   RS += (size_t)prt * M * G;
 
-  floatx8 acc[AR_TM][TN], tmp[IMAJOR ? 1 : AR_TM][TN];
+  floatx8 acc[AR_TM][TN];
+  typename pq_acc<I8>::T tmp[IMAJOR ? 1 : AR_TM][TN];
 #pragma unroll
   for (int i = 0; i < AR_TM; ++i)
 #pragma unroll
@@ -1435,7 +1494,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
 #pragma unroll
       for (int j = 0; j < TN; ++j)
 #pragma unroll
-        for (int e = 0; e < 8; ++e) tmp[i][j][e] = 0.f;
+        for (int e = 0; e < 8; ++e) tmp[i][j][e] = 0;
 
   int ncol[TN];
 #pragma unroll
@@ -1479,7 +1538,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
       const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
       *(uint4_t *)(&sA[r * AR_ASTR + c]) = *(const uint4_t *)(Ab + (rc * K + c));
     }
-    pq_stage_w<BNF_T, AR_BK, AR_ASTR, AR_NTHREADS, WPERM, false, ABLATE, 0, BITS>(sW, W, n0, N, K, k0,
+    pq_stage_w<BNF_T, AR_BK, AR_ASTR, AR_NTHREADS, WPERM, false, ABLATE, 0, BITS, I8>(sW, W, n0, N, K, k0,
                                                                               tid, WH);
     __syncthreads();
 
@@ -1495,11 +1554,11 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
         }
 #pragma unroll
       for (int i = 0; i < AR_TM; ++i) {
-        floatx8 t[TN];
+        typename pq_acc<I8>::T t[TN];
 #pragma unroll
         for (int j = 0; j < TN; ++j)
 #pragma unroll
-          for (int e = 0; e < 8; ++e) t[j][e] = 0.f;
+          for (int e = 0; e < 8; ++e) t[j][e] = 0;
 #pragma unroll
         for (int step = 0; step < AR_BK / 16; ++step) {
           int2_t af;
@@ -1509,7 +1568,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
           __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
           for (int j = 0; j < TN; ++j)
-            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wfa[step][j], t[j]);
+            t[j] = pq_wmma<I8>(af, wfa[step][j], t[j]);
         }
         // asg/rsa for this M-fragment's 8 contiguous rows: two b128 LDS reads each, hoisted out
         // of the per-element fold. Fold cost: 2 VALU per element per slab for the scale, plus
@@ -1520,7 +1579,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
 #pragma unroll
           for (int j = 0; j < TN; ++j)
 #pragma unroll
-            for (int e = 0; e < 8; ++e) acc[i][j][e] += sc[j] * t[j][e];
+            for (int e = 0; e < 8; ++e) acc[i][j][e] += sc[j] * (float)t[j][e];
           continue;
         }
         const int mlb = wm * AR_TM * 16 + i * 16 + kb8;
@@ -1529,7 +1588,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
 #pragma unroll
           for (int j = 0; j < TN; ++j)
 #pragma unroll
-            for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], t[j][e], acc[i][j][e]);
+            for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], (float)t[j][e], acc[i][j][e]);
         } else {
           const float4 a4l = *(const float4 *)&s_asg[mlb],
                        a4h = *(const float4 *)&s_asg[mlb + 4];
@@ -1538,7 +1597,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
           for (int j = 0; j < TN; ++j)
 #pragma unroll
             for (int e = 0; e < 8; ++e)
-              acc[i][j][e] = fmaf(sc[j], av[e] * t[j][e], acc[i][j][e]);
+              acc[i][j][e] = fmaf(sc[j], av[e] * (float)t[j][e], acc[i][j][e]);
         }
         if (second) {
           const float4 r4l = *(const float4 *)&s_rs[mlb], r4h = *(const float4 *)&s_rs[mlb + 4];
@@ -1573,7 +1632,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
       for (int i = 0; i < AR_TM; ++i)
 #pragma unroll
         for (int j = 0; j < TN; ++j)
-          tmp[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf[j], tmp[i][j]);
+          tmp[i][j] = pq_wmma<I8>(af[i], wf[j], tmp[i][j]);
     }
     __syncthreads();
 
@@ -1597,8 +1656,8 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_prefill(
         for (int j = 0; j < TN; ++j)
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
-            acc[i][j][e] = fmaf(sc[j], av[e] * tmp[i][j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
-            tmp[i][j][e] = 0.f;
+            acc[i][j][e] = fmaf(sc[j], av[e] * (float)tmp[i][j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
+            tmp[i][j][e] = 0;
           }
       }
     }
@@ -1655,6 +1714,7 @@ static inline int pq_tq_zsplit(int M) {
   int z = 512 / (Mt > 0 ? Mt : 1);
   return z < 1 ? 1 : (z > 4 ? 4 : z);
 }
+template <bool I8 = false>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
     const __bf16 *__restrict__ XR,          // [P, M, K] rotated values (pass A)
     const float *__restrict__ ASG,          // [P, M, K/128] per-group scales (pass A)
@@ -1702,11 +1762,11 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
       const uint2_t xv = *(const uint2_t *)(XR + ((size_t)p * M + mr) * K + (size_t)g * PQ_GROUP + c0);
       const float v0 = __uint_as_float(xv[0] << 16) * inv, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * inv;
       const float v2 = __uint_as_float(xv[1] << 16) * inv, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * inv;
-      const unsigned char b0 = pq_e4m3_encode(v0), b1 = pq_e4m3_encode(v1);
-      const unsigned char b2 = pq_e4m3_encode(v2), b3 = pq_e4m3_encode(v3);
+      float rs = 0.f;
+      const unsigned char b0 = pq_qenc<I8>(v0, rs), b1 = pq_qenc<I8>(v1, rs);
+      const unsigned char b2 = pq_qenc<I8>(v2, rs), b3 = pq_qenc<I8>(v3, rs);
       *(unsigned int *)(tile + r * PQ_TQ_STR + c0) =
           (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) | ((unsigned int)b3 << 24);
-      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
 #pragma unroll
       for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
       if (lane == 0 && m < M) RS[((size_t)p * M + m) * G + g] = rs;
@@ -1733,7 +1793,8 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_token_quant_tiled(
 // main stream -- and the loop keeps only the scale FMA (8 VALU per tile-group instead of 16,
 // which the ablation prices at ~10%). fp16 row-sums: |rs| <= 448*128 < 65504, 11-bit mantissa,
 // the correction's rounding lands ~1e-4 relative, under the bf16 output floor.
-template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0, int BITS = 4>
+template <int TN, bool WPERM, int LBK, bool WHOIST = true, int WSLOT_OVR = 0, int ABL = 0, int BITS = 4,
+          bool I8 = false>
 __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT,   // [P, Mt*16, K] fragment-tiled e4m3
     const unsigned int *__restrict__ W, const __half *__restrict__ SZ,
@@ -1814,7 +1875,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
       const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
       s_rs[r] = RS[(size_t)rc * G + g];
     }
-    pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR, BITS>(sW, W, n0, N, K, k0,
+    pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR, BITS, I8>(sW, W, n0, N, K, k0,
                                                                                  tid, WH);
     __syncthreads();
 
@@ -1843,18 +1904,18 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     }
 #pragma unroll
     for (int i = 0; i < AR_TM; ++i) {
-      floatx8 t[TN];
+      typename pq_acc<I8>::T t[TN];
 #pragma unroll
       for (int j = 0; j < TN; ++j)
 #pragma unroll
-        for (int e = 0; e < 8; ++e) t[j][e] = 0.f;
+        for (int e = 0; e < 8; ++e) t[j][e] = 0;
 #pragma unroll
       for (int st = 0; st < NS; ++st) {
         if constexpr (WHOIST) {
           __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
           for (int j = 0; j < TN; ++j)
-            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wfa[st][j], t[j]);
+            t[j] = pq_wmma<I8>(af[i][st], wfa[st][j], t[j]);
         } else {
           int2_t wf[TN];
 #pragma unroll
@@ -1865,7 +1926,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
           __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
           for (int j = 0; j < TN; ++j)
-            t[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][st], wf[j], t[j]);
+            t[j] = pq_wmma<I8>(af[i][st], wf[j], t[j]);
         }
       }
       const int mlb = wm * AR_TM * 16 + i * 16 + kb8;
@@ -1873,7 +1934,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
 #pragma unroll
         for (int j = 0; j < TN; ++j)
 #pragma unroll
-          for (int e = 0; e < 8; ++e) acc[i][j][e] += t[j][e];
+          for (int e = 0; e < 8; ++e) acc[i][j][e] += (float)t[j][e];
         continue;
       }
       if (second && (ABL & 4) == 0) {
@@ -1883,12 +1944,12 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
         for (int j = 0; j < TN; ++j)
 #pragma unroll
           for (int e = 0; e < 8; ++e)
-            acc[i][j][e] = fmaf(sc[j], t[j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
+            acc[i][j][e] = fmaf(sc[j], (float)t[j][e], fmaf(-zsc[j], rv[e], acc[i][j][e]));
       } else {
 #pragma unroll
         for (int j = 0; j < TN; ++j)
 #pragma unroll
-          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], t[j][e], acc[i][j][e]);
+          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf(sc[j], (float)t[j][e], acc[i][j][e]);
       }
     }
     __syncthreads();
@@ -1975,7 +2036,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
 // (the ppm-level expf-vs-torch differences are the same class as those kernels). hs (bf16) is
 // always written -- the prefill-size fallthrough (ROT=false) and the tuple's hs both need it.
 // Grid (M, ceil(G / (8*gpw)), 1); single partition (all three consumers are P=1).
-template <int MODE, bool ROT>
+template <int MODE, bool ROT, bool I8 = false>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ew_rot(
     const __bf16 *__restrict__ X, const __bf16 *__restrict__ Y, long ys,
     const __bf16 *__restrict__ Wn, float eps,
@@ -2079,11 +2140,11 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_ew_rot(
     float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
-    const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+    const float scale = pq_qscale<I8>(amax);
     const float qi = 1.f / scale;
-    const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
-    const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
-    float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+    float rs = 0.f;
+    const unsigned char b0 = pq_qenc<I8>(v0 * qi, rs), b1 = pq_qenc<I8>(v1 * qi, rs);
+    const unsigned char b2 = pq_qenc<I8>(v2 * qi, rs), b3 = pq_qenc<I8>(v3 * qi, rs);
 #pragma unroll
     for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
     *(unsigned int *)(A + (size_t)m * N + kb) =
@@ -2123,6 +2184,7 @@ __device__ __forceinline__ unsigned int pq_load_sys_acq(const unsigned int *p) {
 #define PQ_AR_SPIN_MAX 4000000000ULL
 #define PQ_AR_WAVES 16
 
+template <bool I8 = false>
 __global__ __launch_bounds__(PQ_AR_WAVES * 32) void pq_ar_add_rms_rot(
     const uint4_t *__restrict__ in4,        // my partial [M, K] bf16 as 16 B words
     uint4_t *peer_base, const uint4_t *my_base, int slot_stride16,
@@ -2242,11 +2304,11 @@ __global__ __launch_bounds__(PQ_AR_WAVES * 32) void pq_ar_add_rms_rot(
       float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
 #pragma unroll
       for (int off = 16; off >= 1; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
-      const float scale = fmaxf(amax * (1.f / 448.f), 1e-10f);
+      const float scale = pq_qscale<I8>(amax);
       const float qi = 1.f / scale;
-      const unsigned char b0 = pq_e4m3_encode(v0 * qi), b1 = pq_e4m3_encode(v1 * qi);
-      const unsigned char b2 = pq_e4m3_encode(v2 * qi), b3 = pq_e4m3_encode(v3 * qi);
-      float rs = pq_e4m3_decode(b0) + pq_e4m3_decode(b1) + pq_e4m3_decode(b2) + pq_e4m3_decode(b3);
+      float rs = 0.f;
+      const unsigned char b0 = pq_qenc<I8>(v0 * qi, rs), b1 = pq_qenc<I8>(v1 * qi, rs);
+      const unsigned char b2 = pq_qenc<I8>(v2 * qi, rs), b3 = pq_qenc<I8>(v3 * qi, rs);
 #pragma unroll
       for (int off = 16; off >= 1; off >>= 1) rs += __shfl_xor(rs, off, 32);
       *(unsigned int *)(A + ((size_t)p * M + m) * K + kb) =

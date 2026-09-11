@@ -48,6 +48,7 @@ struct Buffers {
   std::vector<unsigned int> W;       // [N, K/8] low nibbles
   std::vector<unsigned char> WH;    // [N, K/8] fifth-bit plane (bits == 5 only; bit i <-> code 8j+i)
   int bits = 4;
+  bool i8 = false;                  // activations are int8 codes (two's complement) instead of e4m3
   std::vector<__half> SZ;           // [G, N, 2]
   std::vector<int> ZP;              // [G, N] raw zero points (reference only)
   std::vector<unsigned char> A;     // [P, M, K]
@@ -111,6 +112,37 @@ static std::vector<unsigned char> permute_wh(const std::vector<unsigned char> &W
   return P;
 }
 
+// int8 activations: per-group scale amax/127 (per-token = max over the row's groups), codes
+// clamp(round(v/scale), -127, 127) as two's-complement bytes, row-sums of the INTEGER codes
+// (times the group scale in per-group mode, as the decode-band producers store it).
+static void fill_acts_i8(Buffers &b, std::mt19937 &rng, bool ptok) {
+  std::normal_distribution<float> gauss(0.f, 1.f);
+  std::uniform_real_distribution<float> mag(0.05f, 4.f);
+  b.i8 = true;
+  b.A.assign((size_t)b.P * b.M * b.K, 0); b.ASG.assign((size_t)b.P * b.M * b.G, 0.f);
+  b.RS.assign((size_t)b.P * b.M * b.G, 0.f); b.AS.assign((size_t)b.P * b.M, 0.f);
+  for (int p = 0; p < b.P; ++p)
+    for (int m = 0; m < b.M; ++m) {
+      std::vector<float> v((size_t)b.G * PQ_GROUP); std::vector<float> gs(b.G);
+      for (int g = 0; g < b.G; ++g) {
+        float amax = 0.f; const float span = mag(rng);
+        for (int c = 0; c < PQ_GROUP; ++c) { float &x = v[(size_t)g * PQ_GROUP + c]; x = gauss(rng) * span; amax = std::max(amax, fabsf(x)); }
+        gs[g] = std::max(amax / 127.f, 1e-10f);
+      }
+      float astok = 1e-10f; for (int g = 0; g < b.G; ++g) astok = std::max(astok, gs[g]);
+      b.AS[(size_t)p * b.M + m] = astok;
+      for (int g = 0; g < b.G; ++g) {
+        const float scale = ptok ? astok : gs[g]; float rs = 0.f;
+        for (int c = 0; c < PQ_GROUP; ++c) {
+          int q = (int)lrintf(v[(size_t)g * PQ_GROUP + c] / scale); q = std::max(-127, std::min(127, q));
+          b.A[(((size_t)p * b.M + m) * b.K) + g * PQ_GROUP + c] = (unsigned char)(signed char)q; rs += (float)q;
+        }
+        b.ASG[((size_t)p * b.M + m) * b.G + g] = gs[g];
+        b.RS[((size_t)p * b.M + m) * b.G + g] = ptok ? rs : rs * gs[g];
+      }
+    }
+}
+
 static void fill_acts(Buffers &b, std::mt19937 &rng, bool subnormal_heavy = false,
                       bool ptok = false) {
   std::normal_distribution<float> gauss(0.f, 1.f);
@@ -170,7 +202,8 @@ static void ref_gemm2(const Buffers &b, int pb1, int pb2, std::vector<float> &C,
         for (int k = g * PQ_GROUP; k < (g + 1) * PQ_GROUP; ++k) {
           int code = (b.W[(size_t)n * kw + k / 8] >> (4 * (k % 8))) & 0xF;
           if (b.bits == 5) code |= ((b.WH[(size_t)n * kw + k / 8] >> (k % 8)) & 1) << 4;
-          const float a = pq_e4m3_decode(b.A[(((size_t)p * b.M + m) * b.K) + k]);
+          const unsigned char ab = b.A[(((size_t)p * b.M + m) * b.K) + k];
+          const float a = b.i8 ? (float)(signed char)ab : pq_e4m3_decode(ab);
           dot += (double)a * (double)(b.bits == 5 ? code - 16 : lut_val(code));
         }
         const double rsv = b.RS[((size_t)p * b.M + m) * b.G + g];
@@ -291,6 +324,155 @@ __global__ void k_lut5_probe(unsigned char *out) {   // ar_unpack8_5 over every 
 // int5 (W5A8) gate: 32-code LUT round trip, then decode / prefill / A-tiled kernels with BITS=5 vs the
 // double-precision reference (rel < 5e-3, the harness's GEMM bar), plus the 5-bit vs 4-bit kernel time
 // on the same shape (the unpack + fifth-plane cost).
+__global__ void k_i8_probe(unsigned char *out) {   // ar_unpack8_i8<5> over every 5-bit code
+  const int c = threadIdx.x; if (c >= 32) return;
+  unsigned int wv = 0, hb = 0;
+  for (int i = 0; i < 8; ++i) { wv |= (unsigned int)(c & 15) << (4 * i); hb |= (unsigned int)(c >> 4) << i; }
+  const uint2_t u = ar_unpack8_i8<5>(wv, hb);
+  for (int i = 0; i < 4; ++i) { out[c * 8 + i] = (u[0] >> (8 * i)) & 0xFF; out[c * 8 + 4 + i] = (u[1] >> (8 * i)) & 0xFF; }
+}
+
+// I8 gate (W5A8-int8): code probe, then decode / prefill (per-token + per-group) / A-tiled with int8
+// activations on the iu8 WMMA vs the double reference, with the fp8-activation int5 kernel time beside it.
+static void bench_i8(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
+  int fails = 0;
+  {
+    unsigned char *d; HIP_CHECK(hipMalloc(&d, 256));
+    hipLaunchKernelGGL(k_i8_probe, dim3(1), dim3(32), 0, 0, d); HIP_CHECK(hipDeviceSynchronize());
+    unsigned char h[256]; HIP_CHECK(hipMemcpy(h, d, 256, hipMemcpyDeviceToHost)); hipFree(d);
+    int bad = 0; for (int c = 0; c < 32; ++c) for (int i = 0; i < 8; ++i) if ((signed char)h[c * 8 + i] != c - 16) ++bad;
+    printf("i8 codes: %d/256 wrong %s\n", bad, bad ? "FAIL" : "OK"); if (bad) ++fails;
+  }
+  constexpr int DWN = 8, BND = DWN * 16, TN = 2, BNF_T = AR_WN * TN * 16;
+  for (const Shape &sh : SHAPES) {
+    if (std::string(sh.name) == "ragged") continue;
+    Buffers b; b.N = sh.N; b.K = sh.K; b.P = sh.P; b.G = sh.K / PQ_GROUP;
+    fill_weights5(b, rng);
+    const std::vector<unsigned int> Wp = permute_w(b.W, b.N, b.K);
+    const std::vector<unsigned char> WHp = permute_wh(b.WH, b.N, b.K);
+    unsigned int *dW; unsigned char *dWH; __half *dSZ;
+    HIP_CHECK(hipMalloc(&dW, Wp.size() * 4)); HIP_CHECK(hipMalloc(&dWH, WHp.size())); HIP_CHECK(hipMalloc(&dSZ, b.SZ.size() * 2));
+    HIP_CHECK(hipMemcpy(dW, Wp.data(), Wp.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dWH, WHp.data(), WHp.size(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dSZ, b.SZ.data(), b.SZ.size() * 2, hipMemcpyHostToDevice));
+    const int nblk = (b.N + BND - 1) / BND;
+    auto check = [&](const char *tag, int M, __bf16 *dC, const std::vector<float> &ref, double ti, double tf) {
+      std::vector<unsigned short> Ch((size_t)M * b.N); HIP_CHECK(hipMemcpy(Ch.data(), dC, Ch.size() * 2, hipMemcpyDeviceToHost));
+      double num = 0, den = 0; for (size_t i = 0; i < Ch.size(); ++i) { const double c = bf16_to_f(Ch[i]), r = ref[i]; num += (c - r) * (c - r); den += r * r; }
+      const double rel = sqrt(num / (den > 0 ? den : 1)); const bool ok = rel < 5e-3; if (!ok) ++fails;
+      printf("  i8 %-8s %-8s N=%-5d K=%-5d P=%d M=%-4d rel %.2e  int8 %8.2f us  fp8 %8.2f us (%.2fx) %s\n",
+             tag, sh.name, b.N, b.K, b.P, M, rel, ti, tf, ti / tf, ok ? "OK" : "FAIL");
+    };
+    for (const int M : {1, 8, 40, 64}) {     // decode band, per-group
+      b.M = M; fill_acts_i8(b, rng, false);
+      std::vector<float> ref; ref_gemm2(b, sh.pb1, sh.pb2, ref, false);
+      unsigned char *dA; float *dASG, *dRS, *dP; int *dCnt; __bf16 *dC;
+      HIP_CHECK(hipMalloc(&dA, b.A.size())); HIP_CHECK(hipMalloc(&dASG, b.ASG.size() * 4)); HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4));
+      HIP_CHECK(hipMalloc(&dP, (size_t)4 * M * b.N * 4)); HIP_CHECK(hipMalloc(&dCnt, nblk * 4)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+      HIP_CHECK(hipMemcpy(dA, b.A.data(), b.A.size(), hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dASG, b.ASG.data(), b.ASG.size() * 4, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemset(dCnt, 0, nblk * 4));
+      int ks = (nblk >= 128) ? 1 : (nblk >= 64) ? 2 : 4; if (M > 48 && ks > 1) ks >>= 1;
+      const int tm = (M + DEC_MTILE - 1) / DEC_MTILE; const dim3 grid(nblk, 1, ks), block(DWN * 32);
+#define I8_DEC(KS_, TM_, I_) hipLaunchKernelGGL((pq_int4_fp8_gemm_decode<DWN, KS_, TM_, true, 0, true, true, 5, I_>), grid, block, 0, 0, dA, dW, dSZ, dASG, dRS, dP, dCnt, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH)
+#define I8_DEC_TM(KS_, I_) do { if (tm == 1) I8_DEC(KS_, 1, I_); else if (tm == 2) I8_DEC(KS_, 2, I_); else if (tm == 3) I8_DEC(KS_, 3, I_); else I8_DEC(KS_, 4, I_); } while (0)
+      auto Li = [&](int) { if (ks == 1) I8_DEC_TM(1, true); else if (ks == 2) I8_DEC_TM(2, true); else I8_DEC_TM(4, true); };
+      auto Lf = [&](int) { if (ks == 1) I8_DEC_TM(1, false); else if (ks == 2) I8_DEC_TM(2, false); else I8_DEC_TM(4, false); };
+#undef I8_DEC_TM
+#undef I8_DEC
+      double ti = 1e30, tf = 1e30;
+      for (int rep = 0; rep < 3; ++rep) { ti = std::min(ti, time_us(Li, 50, e0, e1)); tf = std::min(tf, time_us(Lf, 50, e0, e1)); }
+      Li(0); HIP_CHECK(hipDeviceSynchronize()); check("decode", M, dC, ref, ti, tf);
+      hipFree(dA); hipFree(dASG); hipFree(dRS); hipFree(dP); hipFree(dCnt); hipFree(dC);
+    }
+    for (const int M : {200, 1024}) {        // per-token prefill (row + A-tiled) and per-group prefill
+      b.M = M; fill_acts_i8(b, rng, true);
+      std::vector<float> ref; ref_gemm2(b, sh.pb1, sh.pb2, ref, true);
+      const std::vector<unsigned char> At = tile_a(b.A, b.P, M, b.K);
+      unsigned char *dA, *dAT; float *dAS, *dRS; __bf16 *dC;
+      HIP_CHECK(hipMalloc(&dA, b.A.size())); HIP_CHECK(hipMalloc(&dAT, At.size())); HIP_CHECK(hipMalloc(&dAS, b.AS.size() * 4)); HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+      HIP_CHECK(hipMemcpy(dA, b.A.data(), b.A.size(), hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dAT, At.data(), At.size(), hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(dAS, b.AS.data(), b.AS.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+      const dim3 grid((b.N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
+      auto Pi = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, true, true, 5, true>), grid, block, 0, 0, dA, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+      auto Pf = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, true, true, 5, false>), grid, block, 0, 0, dA, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+      auto Ti = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 0, 5, true>), grid, block, 0, 0, dAT, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, nullptr, nullptr, dWH); };
+      auto Tf = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, 0, 5, false>), grid, block, 0, 0, dAT, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, nullptr, nullptr, dWH); };
+      double ti = 1e30, tf = 1e30;
+      for (int rep = 0; rep < 3; ++rep) { ti = std::min(ti, time_us(Pi, 10, e0, e1)); tf = std::min(tf, time_us(Pf, 10, e0, e1)); }
+      Pi(0); HIP_CHECK(hipDeviceSynchronize()); check("prefill", M, dC, ref, ti, tf);
+      ti = tf = 1e30;
+      for (int rep = 0; rep < 3; ++rep) { ti = std::min(ti, time_us(Ti, 10, e0, e1)); tf = std::min(tf, time_us(Tf, 10, e0, e1)); }
+      Ti(0); HIP_CHECK(hipDeviceSynchronize()); check("atiled", M, dC, ref, ti, tf);
+      // per-group prefill
+      fill_acts_i8(b, rng, false); ref_gemm2(b, sh.pb1, sh.pb2, ref, false);
+      float *dASG; HIP_CHECK(hipMalloc(&dASG, b.ASG.size() * 4));
+      HIP_CHECK(hipMemcpy(dA, b.A.data(), b.A.size(), hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dASG, b.ASG.data(), b.ASG.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+      auto Gi = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, false, true, 5, true>), grid, block, 0, 0, dA, dW, dSZ, dASG, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+      Gi(0); HIP_CHECK(hipDeviceSynchronize()); check("pg-pre", M, dC, ref, 0.0, 1.0);
+      hipFree(dASG); hipFree(dA); hipFree(dAT); hipFree(dAS); hipFree(dRS); hipFree(dC);
+    }
+    hipFree(dW); hipFree(dWH); hipFree(dSZ);
+  }
+  // --- producers under I8 ---
+  {
+    const int M = 40, K = 5120, P = 2, krot = 8, G = K / PQ_GROUP;
+    std::mt19937 prng(777u); std::normal_distribution<float> nd(0.f, 0.8f); std::uniform_real_distribution<float> ud(-3.1f, 3.1f);
+    std::vector<unsigned short> X((size_t)M * K), T((size_t)P * krot * (K / 2) * 4, 0); std::vector<__half> CS((size_t)P * K);
+    for (auto &v : X) { const float f = nd(prng); unsigned int u; memcpy(&u, &f, 4); v = (unsigned short)(u >> 16); }
+    std::vector<int> perm(PQ_GROUP);
+    for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g) {
+      for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i; std::shuffle(perm.begin(), perm.end(), prng);
+      for (int t = 0; t < 64; ++t) { const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4; const float th = ud(prng); const __half c = __float2half(cosf(th)), sn = __float2half(sinf(th)); T[e] = (unsigned short)(perm[2 * t] | (perm[2 * t + 1] << 8)); memcpy(&T[e + 1], &c, 2); memcpy(&T[e + 2], &sn, 2); }
+    }
+    for (auto &v : CS) v = __float2half(0.75f + 0.5f * (float)(prng() % 1000u) / 1000.f);
+    // CPU reference (same op order as the kernel), int8 quant
+    std::vector<unsigned char> refA((size_t)P * M * K); std::vector<float> refASG((size_t)P * M * G), refRS((size_t)P * M * G);
+    for (int p = 0; p < P; ++p) for (int m = 0; m < M; ++m) for (int g = 0; g < G; ++g) {
+      float v[PQ_GROUP];
+      for (int c = 0; c < PQ_GROUP; ++c) v[c] = bf16_to_f(X[(size_t)m * K + g * PQ_GROUP + c]) * __half2float(CS[(size_t)p * K + g * PQ_GROUP + c]);
+      for (int r = 0; r < krot; ++r) { float nv[PQ_GROUP]; memcpy(nv, v, sizeof(v));
+        for (int t = 0; t < 64; ++t) { const unsigned short *rec = &T[(((size_t)p * krot + r) * (K / 2) + (size_t)g * 64 + t) * 4]; const int i = rec[0] & 0xFF, j = rec[0] >> 8; __half ch, sh; memcpy(&ch, rec + 1, 2); memcpy(&sh, rec + 2, 2); const float c = __half2float(ch), sn = __half2float(sh); nv[i] = fmaf(c, v[i], sn * v[j]); nv[j] = fmaf(c, v[j], -sn * v[i]); }
+        memcpy(v, nv, sizeof(v)); }
+      float amax = 0.f; for (int c = 0; c < PQ_GROUP; ++c) amax = std::max(amax, fabsf(v[c]));
+      const float scale = std::max(amax * (1.f / 127.f), 1e-10f), inv = 1.f / scale; float rs = 0.f;
+      for (int c = 0; c < PQ_GROUP; ++c) { int q = (int)lrintf(v[c] * inv); q = std::max(-127, std::min(127, q)); refA[(((size_t)p * M + m) * K) + g * PQ_GROUP + c] = (unsigned char)(signed char)q; rs += (float)q; }
+      refASG[((size_t)p * M + m) * G + g] = scale; refRS[((size_t)p * M + m) * G + g] = rs * scale;
+    }
+    unsigned short *dX, *dT; __half *dCS; unsigned char *dA, *dA2, *dXR; float *dASG, *dRS, *dAS, *dRS2, *dASGp;
+    HIP_CHECK(hipMalloc(&dX, X.size() * 2)); HIP_CHECK(hipMalloc(&dT, T.size() * 2)); HIP_CHECK(hipMalloc(&dCS, CS.size() * 2));
+    HIP_CHECK(hipMalloc(&dA, refA.size())); HIP_CHECK(hipMalloc(&dA2, refA.size())); HIP_CHECK(hipMalloc(&dXR, refA.size() * 2));
+    HIP_CHECK(hipMalloc(&dASG, refASG.size() * 4)); HIP_CHECK(hipMalloc(&dASGp, refASG.size() * 4)); HIP_CHECK(hipMalloc(&dRS, refRS.size() * 4)); HIP_CHECK(hipMalloc(&dRS2, refRS.size() * 4)); HIP_CHECK(hipMalloc(&dAS, (size_t)P * M * 4));
+    HIP_CHECK(hipMemcpy(dX, X.data(), X.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dT, T.data(), T.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dCS, CS.data(), CS.size() * 2, hipMemcpyHostToDevice));
+    const dim3 gA(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P), blk(PQ_ROT_WAVES * 32);
+    hipLaunchKernelGGL((pq_rotate_quant2<false, true>), gA, blk, 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot);
+    HIP_CHECK(hipDeviceSynchronize());
+    std::vector<unsigned char> gA2(refA.size()); std::vector<float> gASG(refASG.size()), gRS(refRS.size());
+    HIP_CHECK(hipMemcpy(gA2.data(), dA, gA2.size(), hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(gASG.data(), dASG, gASG.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(gRS.data(), dRS, gRS.size() * 4, hipMemcpyDeviceToHost));
+    size_t codebad = 0; for (size_t i = 0; i < gA2.size(); ++i) if (gA2[i] != refA[i]) ++codebad;
+    float srel = 0.f, rrel = 0.f;
+    for (size_t i = 0; i < gASG.size(); ++i) { srel = std::max(srel, fabsf(gASG[i] - refASG[i]) / std::max(fabsf(refASG[i]), 1e-12f)); rrel = std::max(rrel, fabsf(gRS[i] - refRS[i]) / std::max(fabsf(refRS[i]), 1e-3f)); }
+    const bool ok = codebad * 500 < gA2.size() && srel < 1e-5f && rrel < 1e-4f; if (!ok) ++fails;
+    printf("  i8 rotquant M=%d code-mismatch=%zu/%zu asg-rel=%.2e rs-rel=%.2e %s\n", M, codebad, gA2.size(), srel, rrel, ok ? "OK" : "FAIL");
+    // per-token: fused tokquant<I8, WRS> vs pass A<ROTOUT, I8> + pass C<I8>, byte-exact codes / AS / RS
+    hipLaunchKernelGGL((pq_rotate_quant2<true, true>), gA, blk, 0, 0, (const __bf16 *)dX, dT, dCS, (unsigned char *)dXR, dASGp, dRS, M, K, krot);
+    hipLaunchKernelGGL(pq_token_quant<true>, dim3((M + PQ_ROT_WAVES - 1) / PQ_ROT_WAVES, P), blk, 0, 0, (const __bf16 *)dXR, dASGp, dA, dAS, dRS, M, K);
+    float *dAS2; HIP_CHECK(hipMalloc(&dAS2, (size_t)P * M * 4));
+    hipLaunchKernelGGL((pq_rotate_tokquant<16, false, false, true, true>), dim3(M, P), dim3(512), (size_t)K * 2, 0, (const __bf16 *)dX, dT, dCS, dA2, dAS2, M, K, krot, dRS2);
+    HIP_CHECK(hipDeviceSynchronize());
+    std::vector<unsigned char> a1(refA.size()), a2(refA.size()); std::vector<float> s1((size_t)P * M), s2(s1.size()), r1(refRS.size()), r2(refRS.size());
+    HIP_CHECK(hipMemcpy(a1.data(), dA, a1.size(), hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(a2.data(), dA2, a2.size(), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(s1.data(), dAS, s1.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(s2.data(), dAS2, s2.size() * 4, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(r1.data(), dRS, r1.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(r2.data(), dRS2, r2.size() * 4, hipMemcpyDeviceToHost));
+    size_t da = 0, ds = 0, dr = 0;
+    for (size_t i = 0; i < a1.size(); ++i) da += a1[i] != a2[i];
+    for (size_t i = 0; i < s1.size(); ++i) ds += s1[i] != s2[i];
+    for (size_t i = 0; i < r1.size(); ++i) dr += memcmp(&r1[i], &r2[i], 4) != 0;
+    const bool ok2 = da == 0 && ds == 0 && dr == 0; if (!ok2) ++fails;
+    printf("  i8 tokquant M=%d code-diff=%zu scale-diff=%zu rs-diff=%zu (fused vs pass A + pass C) %s\n", M, da, ds, dr, ok2 ? "OK" : "FAIL");
+    hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dA); hipFree(dA2); hipFree(dXR); hipFree(dASG); hipFree(dASGp); hipFree(dRS); hipFree(dRS2); hipFree(dAS); hipFree(dAS2);
+  }
+  printf("i8: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
+}
+
 static void bench_int5(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
   int fails = 0;
   {
@@ -406,6 +588,7 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
   HIP_CHECK(hipEventCreate(&e1));
   const int REPS = 4;
   if (what == "int5") { bench_int5(rng, e0, e1); return; }
+  if (what == "i8") { bench_i8(rng, e0, e1); return; }
   const char *only = getenv("PQ_SHAPE");
   for (const Shape &sh : SHAPES) {
     if (std::string(sh.name) == "ragged" || std::string(sh.name) == "tiny2p") continue;
