@@ -444,6 +444,22 @@ Weights-only (no activation quant) the int5 checkpoint is at 0.011 nats; the res
 activation element, a floor shared by every W*A8 build here. Per-group activation scales recover 6% of
 it for 19% of prefill (off). Details and the PTOK=0 loader fix: paroquant/RESULTS.md 2026-09-10/11.
 
+### Same-stack fidelity ranking (2026-09-11)
+
+Reference = the bf16 base served on this stack (eval mode, small context); cross-image references carry
+a ~0.02-nat offset (the two images' bf16 outputs differ by that much), so only same-stack numbers are
+comparable. Wikitext, 96 x 500-char chunks, top-256 support:
+
+| served build | KL | top-1 | ms/step @ctx25 | prefill @2k | KV |
+|---|---|---|---|---|---|
+| MXFP4-PARO (prod) | 0.042 | 90.3% | 23.3 | 4770 | 862k |
+| int4 PARO | 0.029 | 91.5% | 23.5 | 3808 | 854k |
+| int5 fine-tuned, e4m3 per-token | 0.013 | 94.3% | 26.3 | 3569 | 767k |
+| int5 fine-tuned, int8 per-group tiled (`RADIANCE_PQ_I8=1 RADIANCE_PQ_PG=1`) | **0.0097** | **95.2%** | 26.0 | 3328 | 767k |
+
+GSM8K is identical within noise on every row. Details, the I8 mode and the per-group tiled band:
+paroquant/RESULTS.md 2026-09-11.
+
 ### Distribution-level quality: KL divergence against the FP8 serve (2026-09-09)
 
 Per-position top-20 prompt logprobs from both serves over the same text (`~/pibench-local/kld.py`;

@@ -809,3 +809,17 @@ costs up to a factor of two in step size -- most of a bit of the grid -- and the
 pow2 + zero-point-epilogue zero-VALU loop is therefore not a path for int5; the per-group fold's 9% prefill
 stays. E2M2 "MXFP5" (pow2 block-32 scales + a float grid) is the same mechanism on a coarser grid and is
 expected in MXFP4's class; not run.
+
+## 2026-09-11 (night): the three builds on ONE reference (bf16 base served on the same 0.9.3 stack), wikitext
+
+| served build | KL top-5 / top-256 | top-1 | ms/step @25 | prefill @2k | KV |
+|---|---|---|---|---|---|
+| MXFP4-PARO (prod) | 0.0296 / 0.0419 | 90.3% | 23.3 | 4770 | 862k |
+| int4 PARO | 0.0195 / 0.0285 | 91.5% | 23.5 | 3808 | 854k |
+| int5 RTN, e4m3 per-token | 0.0110 / 0.0155 | 93.8% | 26.1 | 3490 | 767k |
+| int5 FT, e4m3 per-token | 0.0088 / 0.0126 | 94.3% | 26.3 | 3569 | 767k |
+| **int5 FT, int8 per-group (I8 PG)** | **0.0067 / 0.0097** | **95.2%** | 26.0 | 3328 | 767k |
+
+fp16 group scale (int4 PARO vs MXFP4-PARO): -32% KL; fifth bit: 0.0285 -> 0.0155; fine-tune: -> 0.0126;
+per-group int8 activations: -> 0.0097. GSM8K identical within noise on every row (97.2-98.0). Decode
+25.9-26.3 for every int5 variant (weight stream), MXFP4-PARO / int4 PARO 23.3-23.5.
