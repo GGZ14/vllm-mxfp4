@@ -745,3 +745,34 @@ not attention. Next diagnostic: the pseudo checkpoint served on the 0.9.3 stack 
 if it reads ~0.025 the gap is the serving stack's numerics vs the 0.5.8 reference (a cross-image
 measurement artifact), if ~0.011 it is something in the W5A8 GEMM path. Launcher now takes
 `R4D_ATTN_FP8` (default 3) and `KV_DTYPE` (default fp8) as env.
+
+## 2026-09-11 (late): SAME-STACK reference -- the served floor was the cross-image offset; int8 per-group wins
+
+Serving the RTN pseudo checkpoint (fp16 weights, no W5A8 path) on the 0.9.3 stack read 0.0288 vs the 0.5.8
+bf16 reference, against 0.0109 for the same weights on the 0.5.8 stack: ~0.018 nats of every "served" KL was
+the serving stack's numerics (R4D attention, fused GDN/norm kernels, fp8 KV, chunked prefill) relative to a
+reference collected on another image, not quantization. The bf16 base served on 0.9.3 (`MODE=eval MAXLEN=8192
+CHUNK=1024 MAXSEQS=1 GPU_UTIL=0.97`, eager) is the right reference; the two stacks' bf16 outputs differ by
+KL 0.0198 (top-1 93.4%) -- more than the quantization itself.
+
+Same-stack KL(bf16@0.9.3 || candidate), wikitext, 96 x 500-char chunks, top-256 / top-1:
+
+| candidate | KL | top-1 |
+|---|---|---|
+| int5 RTN pseudo (weights only) | 0.0126 | 94.6% |
+| int5 RTN served (W5A8 e4m3) | 0.0155 | 93.8% |
+| int5 FT served (W5A8 e4m3 per-token, prod default) | 0.0126 | 94.3% |
+| int5 FT served, bf16 attention + bf16 KV | 0.0119 | 94.5% |
+| **int5 FT served, int8 per-group activations (I8 + PTOK=0)** | **0.0098** | **95.0%** |
+
+So: the W5A8 e4m3 activation path costs ~0.002 nats, not 0.015; the fine-tune is worth ~0.003; int8 PER-GROUP
+activations (7 uniform bits per 128 channels) beat e4m3 per-token by 22% and land below the weights-only RTN
+number -- per-TOKEN int8 was the wrong granularity, not the wrong format. fp8 KV / fp8 attention cost 0.0007.
+Remaining kernel piece: an A-tiled prefill band with per-group activation scales, so the per-group int8 path
+runs at tiled speed (the row-major per-group kernel is -19% prefill); the decode band is per-group int8
+already. Then int8 per-group everywhere is the prod candidate: 8-bit-class fidelity at 5.25 bits, decode at
+parity (25.9 ms/step), prefill at int5's ~3550-3650.
+
+Method notes: the bf16 base on 0.9.3 OOMs on prompt logprobs past ~120 chunks at 0.97 util (only wikitext
+collected) -- collect corpora in separate boots or cap KV explicitly; `MAXSEQS=1` under prod mode trips
+vLLM's static-shape compile ("Expected exactly one compiled range_entry"), eval mode (eager) avoids it.
