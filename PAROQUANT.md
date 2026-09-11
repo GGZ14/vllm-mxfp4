@@ -426,6 +426,24 @@ with fragment order off and the decode band disabled; two gate scripts must neve
 The full change-by-change log, including the prefill ablation ledger and the SPEC re-sweep, is in
 [paroquant/RESULTS.md](paroquant/RESULTS.md).
 
+### int5 W5A8 (2026-09-10/11)
+
+Five-bit codes are exact in e4m3 as `(c - 16)`, so int5 rides the int4 kernel with a fifth-bit plane
+(`pq_stage_w<..., BITS=5>`, `ar_unpack8_5`); checkpoint layout "int5-bitplane" (`build_int5.py`,
+`convert_int5.py`, `requant.sh NBIT=5`). Fine-tune runs incrementally on this box from an fp16 base
+(`to_fp16.py`: memory-mapped load, no swap) at ~9.5 min/layer.
+
+| served, TP=2, SPEC=7 | ms/step @ctx25 / 8k / 32k | KV | prefill @2k / 64k | GSM8K | KL vs bf16 (wiki, top-256) | top-1 |
+|---|---|---|---|---|---|---|
+| PARO-MXFP4 (prod) | 23.38 / 24.91 / 25.80 | 862k | 4770 / 4273 | 97.40 | 0.048 | 90.0% |
+| int4 PARO | 23.27 / 24.79 / 25.59 | 854k | 3808 / 3349 | 97.40 | -- | -- |
+| int5 RTN | 26.07 / 27.69 / 28.49 | 767k | 3490 / 3137 | 97.80 | 0.032 | 91.5% |
+| **int5 fine-tuned** | 26.29 / 27.90 / 28.71 | 767k | 3569 / 3298 | 97.40 | **0.027** | **92.2%** |
+
+Weights-only (no activation quant) the int5 checkpoint is at 0.011 nats; the rest is the e4m3
+activation element, a floor shared by every W*A8 build here. Per-group activation scales recover 6% of
+it for 19% of prefill (off). Details and the PTOK=0 loader fix: paroquant/RESULTS.md 2026-09-10/11.
+
 ### Distribution-level quality: KL divergence against the FP8 serve (2026-09-09)
 
 Per-position top-20 prompt logprobs from both serves over the same text (`~/pibench-local/kld.py`;

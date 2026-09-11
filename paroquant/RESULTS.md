@@ -680,3 +680,28 @@ activation quant) measured 0.0109 / 0.0097 / 0.0074, so ~0.02 nats of the served
 e4m3 activation quantization, not the 5-bit weights. Prompt logprobs are a prefill, which runs the per-token
 (PTOK) activation-scale path; the decode band already uses per-group scales. Next measurement: the same KLD
 with `RADIANCE_PQ_PTOK=0` (per-group everywhere, ~7% prefill cost).
+
+## 2026-09-11: activation-scale granularity on int5 -- per-group A scales are NOT the lever (and a latent PTOK=0 bug)
+
+`RADIANCE_PQ_PTOK=0` (per-group e4m3 activation scales at every M) on the fine-tuned int5, served path:
+
+| int5 FT, served | KL top-256 wiki / code / served | top-1 wiki | prefill 2k/8k/16k/32k/64k PP t/s | GSM8K |
+|---|---|---|---|---|
+| per-token A scales (default) | 0.0274 / 0.0246 / 0.0224 | 92.2 | 3569 / 3493 / 3520 / 3441 / 3298 | 97.40 |
+| per-group A scales (PTOK=0) | 0.0259 / -- / -- | 92.2 | **2904 / 2802 / 2843 / 2800 / 2697 (-19%)** | 97.20 |
+| weights only (RTN pseudo) | 0.0109 / 0.0097 / 0.0074 | 94.7 | -- | -- |
+
+Finer activation scales recover ~6% of the served KL and cost 19% of prefill (the per-group path has no
+A-tiled band: row-major prefill GEMM + the per-group prologue at large M). The ~0.015 nats between the
+served W5A8 number and the weights-only number is the e4m3 ELEMENT (3-bit mantissa), not the scale
+granularity -- the floor for every W*A8 build on the fp8 WMMA, MXFP4-PARO included (its 0.048 carries the
+same component). Levers past it: int8 activations on the int8 WMMA (7 uniform bits per group; measured
+at fp8 speed; the same band rewrite W6A8 needs) or A16 on the f16 WMMA (weights-only KL, ~half the
+prefill). PTOK stays 1.
+
+Bug found on the way (latent for int4 since the rotation stream shipped 09-03): with PTOK=0 the loader
+consumed the stream producers' (A, ASG, RS) tuple at every M, but the producers only fill it inside the
+decode band (M <= 64); above it the tuple is allocated and untouched -> garbage prefill (KL 3.9 nats,
+top-1 0.09%, acc/draft 0.000 at 8k ctx, gibberish on an 8k prompt) while ctx-25 decode looked fine.
+`_linear_impl` now uses the tuple only when M <= DECODE_MAX_M. The harness int5 gate now also covers
+the per-group prefill variant at 4 and 5 bits (rel 1.66e-3, PASS): the kernel was never wrong.
