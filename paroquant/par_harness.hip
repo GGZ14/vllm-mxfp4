@@ -350,6 +350,28 @@ static void bench_int5(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
       check("decode", M, dC, ref, t5, t4);
       hipFree(dA); hipFree(dASG); hipFree(dRS); hipFree(dP); hipFree(dCnt); hipFree(dC);
     }
+    // per-GROUP prefill band (PTOK=false: ASG/RS per group, the RADIANCE_PQ_PTOK=0 path), 4-bit and 5-bit
+    for (const int M : {200, 1024}) {
+      b.M = M; fill_acts(b, rng, false, false);
+      std::vector<float> ref; ref_gemm2(b, sh.pb1, sh.pb2, ref, false);
+      unsigned char *dA; float *dASG, *dRS; __bf16 *dC;
+      HIP_CHECK(hipMalloc(&dA, b.A.size())); HIP_CHECK(hipMalloc(&dASG, b.ASG.size() * 4)); HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+      HIP_CHECK(hipMemcpy(dA, b.A.data(), b.A.size(), hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dASG, b.ASG.data(), b.ASG.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+      const dim3 grid((b.N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
+      auto G5 = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, false, true, 5>), grid, block, 0, 0, dA, dW, dSZ, dASG, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+      G5(0); HIP_CHECK(hipDeviceSynchronize()); check("pg-pre5", M, dC, ref, 0.0, 1.0);
+      // 4-bit control on the same codes: only valid if the 4-bit reference is built -- compare against a 4-bit ref
+      {
+        Buffers b4 = b; b4.bits = 4; for (auto &z : b4.SZ) {} ;
+        std::vector<float> ref4; ref_gemm2(b4, sh.pb1, sh.pb2, ref4, false);   // codes = low nibbles, zsc as stored (zp-16): a consistent 4-bit-only algebra check
+        auto G4 = [&](int) { hipLaunchKernelGGL((pq_int4_fp8_gemm_prefill<TN, true, 0, false, true, 4>), grid, block, 0, 0, dA, dW, dSZ, dASG, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dWH); };
+        G4(0); HIP_CHECK(hipDeviceSynchronize());
+        std::vector<unsigned short> Ch((size_t)M * b.N); HIP_CHECK(hipMemcpy(Ch.data(), dC, Ch.size() * 2, hipMemcpyDeviceToHost));
+        double num = 0, den = 0; for (size_t i = 0; i < Ch.size(); ++i) { const double c = bf16_to_f(Ch[i]), r = ref4[i]; num += (c - r) * (c - r); den += r * r; }
+        printf("  int4 pg-pre4  %-8s M=%-4d rel %.2e (4-bit kernel vs 4-bit algebra on the low nibbles) %s\n", sh.name, M, sqrt(num / den), sqrt(num / den) < 5e-3 ? "OK" : "FAIL");
+      }
+      hipFree(dA); hipFree(dASG); hipFree(dRS); hipFree(dC);
+    }
     // per-token prefill (row A) and A-tiled bands
     for (const int M : {200, 1024}) {
       b.M = M; fill_acts(b, rng, false, true);

@@ -211,7 +211,11 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
     tiled = ptok and ATILED_ENABLED
     as_tok = None
     out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
-    if pre is not None and not ptok:
+    # The stream producers fill (A, ASG, RS) only inside the decode band; above it the tuple is
+    # allocated but untouched, so it must be recomputed from x2 there -- also when PTOK is off
+    # (per-group scales at every M), which is what used to consume the untouched tuple.
+    use_pre = pre is not None and M <= DECODE_MAX_M
+    if use_pre:
         a_codes, asg, rs = pre
         if a_codes.shape[0] != P:
             raise RuntimeError(f"paroquant: pre-quantized tuple has {a_codes.shape[0]} partition(s), "
@@ -220,7 +224,7 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
         a_codes = torch.empty((P, M, K), device=x.device, dtype=torch.uint8)
         asg = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
         rs = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
-    if pre is not None and not ptok:
+    if use_pre:
         gemm_scale = asg
     elif ptok:
         # Prefill: pass A (rotate -> bf16 scratch + per-group scales), pass C (token scale +
@@ -272,7 +276,7 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
         den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
         sys.stderr.write(f"[radiance.paroquant] CHECKALL N={N} K={K} M={M} P={P} "
                          f"path={'tiled' if tiled else 'ptok' if ptok else 'decode'}"
-                         f"{'+pre' if pre is not None and not ptok else ''} "
+                         f"{'+pre' if use_pre else ''} "
                          f"rel={float(num / den):.5f}\n")
     return out
 
