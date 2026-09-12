@@ -105,6 +105,6 @@ exec /opt/radiance_entrypoint.sh $MODEL \
   --trust-remote-code \
   --kv-cache-dtype fp8 --mamba-cache-mode align --enable-prefix-caching \
   --attention-backend R4D --no-async-scheduling \
-  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   \"\${SPECARGS[@]}\" $EXTRA
 "
