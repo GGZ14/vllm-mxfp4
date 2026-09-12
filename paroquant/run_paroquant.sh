@@ -103,6 +103,7 @@ else
   MAXLEN=${MAXLEN:-262144}; MAXSEQS=${MAXSEQS:-8}
 fi
 GPU_UTIL=${GPU_UTIL:-0.92}
+MAX_LOGPROBS=${MAX_LOGPROBS:-20}   # --max-logprobs (vLLM default 20); raise, e.g. 256, only to collect prompt_logprobs for a KL-divergence run
 # GDN decode step as ONE launch (conv -> grid barrier -> recurrent), the libr4d rx5 build that
 # also zeroes the cudagraph pad rows. The AutoRound int4 serve (same bf16-input linear contract)
 # has run it since 08-30; the merge hook it needs is installed with the merge itself left OFF
@@ -135,6 +136,10 @@ ROT_STREAM3=${RADIANCE_PQ_ROT_STREAM3:-0}
 CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && CACHE_SUF="$CACHE_SUF-rs"
 [ "$ROT_STREAM2" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs2"
 [ "$ROT_STREAM3" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs3"
+[ "${RADIANCE_SKINNY_GEMM:-1}" = all ] && CACHE_SUF="${CACHE_SUF}-sk"   # skinny in_proj_ba routing changes the compiled graph
+[ "${RADIANCE_PQ_I8:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-i8"
+[ "${RADIANCE_PQ_PG:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-pg"
+[ "${RADIANCE_PQ_ZPE:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-zpe"
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
@@ -144,6 +149,30 @@ mkdir -p "$CACHE"
 MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
 MODEL=/models/$MODEL_DIR
 [ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
+
+# Chat template. The default is the file every number in RESULTS.md was measured with: the GSM8K
+# band (97-98%) is template-bound, and the model's own bundled template scores 95-96% with runaway
+# answers, so this is a measurement-affecting knob, not a cosmetic one. Point CHAT_TEMPLATE at any
+# .jinja to override. It is mounted by path, so it must exist on the HOST, not just in the image.
+CHAT_TEMPLATE=${CHAT_TEMPLATE:-$HF_CACHE/qwen-fixed-v22.3.jinja}
+CHAT_TEMPLATE="$(realpath -m "$CHAT_TEMPLATE")"
+[ -r "$CHAT_TEMPLATE" ] || {
+  echo "chat template not readable: $CHAT_TEMPLATE" >&2
+  echo "  set CHAT_TEMPLATE=<path to a .jinja on the host>, or leave it unset for the default" >&2
+  echo "  ($HF_CACHE/qwen-fixed-v22.3.jinja -- what the measured GSM8K band needs)." >&2
+  exit 1
+}
+# Reuse an existing bind mount when the template already lives under one, so the common case adds
+# no mount; anything else is bound read-only at a fixed path.
+CT_MOUNT=()
+case "$CHAT_TEMPLATE" in
+  "$HF_CACHE"/*)    CT_PATH="/root/.cache/huggingface/${CHAT_TEMPLATE#"$HF_CACHE"/}" ;;
+  "$MODELS"/*)      CT_PATH="/models/${CHAT_TEMPLATE#"$MODELS"/}" ;;
+  "$SCRIPT_DIR"/*)  CT_PATH="/paro/${CHAT_TEMPLATE#"$SCRIPT_DIR"/}" ;;
+  "$PATCHES_DIR"/*) CT_PATH="/patches/${CHAT_TEMPLATE#"$PATCHES_DIR"/}" ;;
+  *) CT_PATH=/chat-template.jinja; CT_MOUNT=(-v "$CHAT_TEMPLATE:$CT_PATH:ro,z") ;;
+esac
+echo "[paro] chat-template=$CHAT_TEMPLATE -> $CT_PATH"
 # TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
 TP=${TP:-2}
 GPUS=${GPUS:-0,1}
@@ -158,14 +187,14 @@ MEM_ARGS=(); [ -n "$MEM_LIMIT" ] && MEM_ARGS=(--memory "$MEM_LIMIT")
 CAPTURE_MOUNT=(); if [ -n "$CAPTURE_DIR" ]; then mkdir -p "$CAPTURE_DIR"; CAPTURE_MOUNT=(-v "$CAPTURE_DIR:/capture:z"); fi
 
 if [ "$MODE" = eval ]; then
-  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS"
+  EXTRA_ARGS=(--enforce-eager --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-logprobs "$MAX_LOGPROBS"
               --max-num-batched-tokens 8192)
   # Per-rank quantized shapes: qkv, o, gate_up, down, in_proj(+merge), out_proj
   CHECKALL=${CHECKALL:-"7168:5120,5120:3072,17408:5120,5120:8704,8192:5120,5120:3072"}
   SPEC_ARGS=()
 else
   PROF_ARGS=(); [ "$PROFILE" = 1 ] && PROF_ARGS=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false); [ "$PROFILE" = 1 ] && mkdir -p "$CACHE/prof"
-  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-num-batched-tokens "$CHUNK"
+  EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-logprobs "$MAX_LOGPROBS" --max-num-batched-tokens "$CHUNK"
               $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
@@ -192,7 +221,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_STEP_TRACE="${RADIANCE_STEP_TRACE:-0}" \
   -e RADIANCE_DFLASH_CAPTURE_DIR="${CAPTURE_DIR:+/capture}" "${CAPTURE_MOUNT[@]}" \
   -e RADIANCE_PRESHUFFLE=1 -e RADIANCE_FUSE_RMS_QUANT=1 \
-  -e R4D_ATTN_FP8=3 \
+  -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_GDN_FUSED_UPDATE="$GDN_FUSED" -e RADIANCE_GDN_MERGE_INPROJ=0 \
   -e RADIANCE_GDN_FUSED_MAX_ITEMS="${RADIANCE_GDN_FUSED_MAX_ITEMS:-32}" \
   -e RADIANCE_DYNAMIC_WIDTH=1 -e RADIANCE_DYNW_ALPHA=0.35 -e RADIANCE_DYNW_MARGIN=2 \
@@ -212,6 +241,11 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_PQ_WPERM="${RADIANCE_PQ_WPERM:-1}" -e RADIANCE_PQ_DECODE_NT="${RADIANCE_PQ_DECODE_NT:-1}" \
   -e RADIANCE_PQ_ATILED="${RADIANCE_PQ_ATILED:-1}" -e RADIANCE_PQ_AT_LBK="${RADIANCE_PQ_AT_LBK:-128}" \
   -e RADIANCE_PQ_AT_HOIST="${RADIANCE_PQ_AT_HOIST:-1}" -e RADIANCE_PQ_PTOK="${RADIANCE_PQ_PTOK:-1}" \
+  -e RADIANCE_PQ_FUSED_TOKQ="${RADIANCE_PQ_FUSED_TOKQ:-1}" \
+  -e RADIANCE_PQ_I8="${RADIANCE_PQ_I8:-0}" \
+  -e RADIANCE_PQ_PG="${RADIANCE_PQ_PG:-0}" \
+  -e RADIANCE_PQ_ZPE="${RADIANCE_PQ_ZPE:-0}" \
+  -e RADIANCE_PQ_PG_PRODUCER="${RADIANCE_PQ_PG_PRODUCER:-3}" \
   -e RADIANCE_PQ_ROT_STREAM="$ROT_STREAM" -e RADIANCE_PQ_ROT_STREAM2="$ROT_STREAM2" \
   -e RADIANCE_PQ_ROT_STREAM3="$ROT_STREAM3" -e RADIANCE_PQ_AR_CHECK="${RADIANCE_PQ_AR_CHECK:-0}" \
   -e RADIANCE_PQ_AR_FALLBACK="${RADIANCE_PQ_AR_FALLBACK:-0}" \
@@ -230,6 +264,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -v "$PATCHES_DIR":/patches:z \
   -v "$SCRIPT_DIR":/paro:z \
   -v "$R4D_CACHE/$R4D_KEY":/r4d:z \
+  "${CT_MOUNT[@]}" \
   -e R4D_SO="$R4D_CACHE/$R4D_KEY" \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
     set -e
@@ -291,7 +326,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   "$MODEL" \
   --served-model-name $SERVED_NAMES \
   --host 0.0.0.0 --port "$PORT" \
-  --kv-cache-dtype fp8 \
+  --kv-cache-dtype "${KV_DTYPE:-fp8}" \
   --tensor-parallel-size "$TP" \
   --gpu-memory-utilization "$GPU_UTIL" \
   --attention-backend R4D \
@@ -299,6 +334,6 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   --mamba-cache-mode align \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
-  --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja \
+  --chat-template "$CT_PATH" \
   "${SPEC_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"

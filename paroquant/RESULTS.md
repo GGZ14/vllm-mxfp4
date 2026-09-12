@@ -501,3 +501,419 @@ step); (2) MXFP4 weights for the drafter via a quantize-aware loop round (-0.65 
 (3) fuse the 24-launch uncaptured precompute/selector glue into 2-3 kernels (~-0.25 ms);
 (4) the NCCL call in the sampler path onto the r4d one-shot AR (-0.1 ms); (5) in-graph glue of the
 drafter's five layers (~0.3 ms, needs the graph's kernels visible: rocprof rather than kineto).
+
+## 2026-09-09: skinny bf16 GEMM for the GDN gate projections (RADIANCE_SKINNY_GEMM=all is now prod)
+
+`pq_skinny_bf16` (par_kernels.h; launcher `launch_skinny_bf16`): split-K over K/256 slices, one
+WG per (n-tile, k-slice), X staged in LDS once per WG, fp32 partials, the last-arriving block reduces
+(counter per output tile). Harness gate `skinny` (`--bench2 skinny`): bit-exact vs the fp32
+reference within bf16 rounding, 6.5 us/call in-graph for [48,5120] (hipBLASLt: 29 us). The launcher
+routes it through `radiance_gemm.py` (copied into the container) as the fallback for libr4d builds
+that lack `gemm_bf16_nt_m64` (rx5/rx6); `patch_skinny_gemm.py` is applied at launch. Shapes routed:
+target `in_proj_ba` N=48/96 (48 calls/step) and the drafter's hidden_projection [256,5120] and
+kernel_projection [1280,5120]. Traps hit: the first version streamed X from L2 per k-slice and was
+slower than hipBLASLt (LDS staging fixed it); the launcher applied neither the patch nor the module
+copy on the first serve, so the first "A/B" measured nothing.
+
+Prod A/B (MXFP4-PARO, tiled prologue, old drafter, SPEC=7, TP=2, GSM8K 97.40 after):
+
+| | int4 PARO | MXFP4-PARO before | **skinny (prod now)** |
+|---|--:|--:|--:|
+| ms/step @ ctx 25 / 8k / 32k | 24.19 / 25.74 / 26.70 | 24.47 / 26.00 / 26.78 | **23.38 / 24.91 / 25.80** |
+| single-stream tok/s @ 25 / 8k / 32k | 105-114 | 116 / 109 / 101 | **120 / 112 / 118** |
+| BetterBench decode single pass, combined | 226.2 | 207.5 | **216.3** (full pass 194.9; same-build spread ~10%) |
+
+The step is now 3.4% under int4 PARO at ctx 25; the residual combined-throughput gap to int4 is
+tokens per update (acceptance), which is the drafter's, not the kernel's.
+
+## 2026-09-09 (evening): drafter loop closed -- the fine-tunes LOSE on held-out traffic; original drafter stays
+
+Loop round 1 (`loop2.sh` rule: promote on decode-bench acc/draft >= best x1.03 and proxy not worse):
+proxy 2.181 -> 2.234, served acc/draft 1.881 vs 1.862 (+1.0%, below the bar), BetterBench single pass
+232.5 vs 216.8 (inside the ~10% same-build spread). Not promoted; the loop was stopped there as agreed.
+
+Why the earlier "+11-17% acceptance" did not hold: bench_decode_ctx samples at temperature 0.7 AND
+cut its long-context prefix at a time-seeded random offset, so no two runs saw the same text (now
+`BENCH_TEMP` / `BENCH_SEED` knobs). A greedy, seeded 5-prompt A/B put all four drafters within 2%
+(orig 1.999 / paro 1.964 / paro2s300 1.982 / paro-r1 2.001 mean acc/draft) with +-0.3 per-prompt
+swings: the target's argmax path still diverges between drafters after a few hundred tokens.
+
+The decisive measurement (`paroquant/drafter/eval_drafter.py`): 160 never-trained-on prompts drawn
+round-robin from all 37 pool sources (`~/drafter_ft/heldout160.jsonl`), single stream, prod sampling
+(temperature 0.7, seed per prompt, max_tokens 512), spec-decode counters read before/after, ~76k
+completion tokens per drafter:
+
+| drafter | acc/draft | tok/update | tok/s |
+|---|--:|--:|--:|
+| tcclaviger FP8 (original) | **3.022** | 4.022 | **163.8** |
+| paro (round 1, 2,400 prompts) | 2.991 | 3.991 | 163.1 |
+| paro2s300 (wide mix, paused at step 300) | 2.962 | 3.962 | 161.6 |
+| paro-r1 (loop round 1) | 2.937 | 3.937 | 160.4 |
+
+Acceptance falls monotonically with more self-distillation. Per source the fine-tunes win where the
+training mix was dense (gsm8k +5%, self_oss +9%, reason_arc +6%) and lose on the broad sources
+(ultrachat, oasst-style chat, Go, JavaScript, codealpaca, shell: -8 to -10%); paro-r1 wins 12 of 37
+sources. The held-out prefix-expected proxy tracked the captured (in-distribution) prompts and could
+not see this. Verdict: the original drafter is prod (`DRAFTER` default), the loop and its drop-ins
+are removed, the fine-tuned exports stay on disk unused. Lesson: judge a drafter on >=50k held-out
+tokens across the served mix at the served sampling settings; a 3-prompt stochastic bench and a
+BetterBench single pass both flatter whichever candidate you ran last.
+
+## 2026-09-09 (evening): KL divergence, PARO-MXFP4 prod vs the FP8 serve
+
+`kld.py` top-20 prompt logprobs, KL(FP8 || PARO-MXFP4) renormalized over the reference's top-K, three
+corpora: wikitext-2 0.042 / 0.049 / 0.057 nats (top-5/10/20), top-1 agreement 90.5%; code 0.042 /
+0.048 / 0.054, 92.7%; served traffic (the target's own answers) 0.034 / 0.039 / 0.044, 91.9%. Full
+table in PAROQUANT.md. Traps: prompt_logprobs allocates whole-chunk full-vocab logits, so the FP8
+unit (0.92 util) OOMs on ~1,000-token chunks -- run the reference at 0.80 with 1,500-char chunks;
+prod's container keeps answering on :8080 (it also serves the alias `Qwen3.8`) for ~30 s after
+`systemctl stop`, so wait for the port to close before booting the reference or the collector reads
+a dying prod as the reference; chunking must match on both sides.
+
+## 2026-09-09 (late): int4 PARO gets the MXFP4-PARO lessons -- skinny gate GEMM (+3-4% step), fused prologue (byte-exact, prefill-neutral)
+
+Back-to-back on the `qwen_vllm_paro` unit (TP=2, SPEC=7, original drafter):
+
+| int4 PARO | ms/step @ ctx 25 / 8k / 32k | KV profile | GSM8K 500q | prefill 2k/8k/16k/32k/64k PP t/s |
+|---|---|---|---|---|
+| baseline (util 0.92, hipBLASLt gates, two-pass prologue) | 24.09 / 25.87 / 26.43 | 811,822 | 97.4-98.0 (rec.) | 3787 / 3643 / 3558 / 3487 / 3335 |
+| **+ `RADIANCE_SKINNY_GEMM=all`, `GPU_UTIL=0.95`, fused prologue (unit default now)** | **23.27 / 24.79 / 25.59** (-3.4 / -4.2 / -3.2%) | **854,369** (+5.2%) | **97.40** (487/500) | 3808 / 3646 / 3566 / 3495 / 3349 (+0.1-0.5%) |
+
+- Skinny split-K bf16 GEMM for the 48 GDN gate projections: the same 1.1 ms/step it gave MXFP4-PARO.
+  The launcher now keys the int4 compile-cache dir on the flag (`-sk` suffix), as the MXFP4 unit did
+  by hand. First boot on a fresh cache dir reported 3.6 GiB more "non-torch" memory per rank (KV
+  664k); every warm-cache boot since is normal (12.9 GiB consumed, KV 854-864k) -- a fresh-compile
+  transient, not a leak. Don't read KV off a first boot.
+- Fused prologue for the PTOK/A-tiled band: `pq_rotate_tokquant<W, TILED, IL, WRS=true>` now also emits
+  the int4 GEMM's plain code row-sums (`pq_tok_encode_row<..., RS>`), so pass A + pass C become one
+  launch with no bf16 round trip of the rotated row; `launch_rotate_tokquant(..., tiled, rs)`, loader
+  knob `RADIANCE_PQ_FUSED_TOKQ` (default 1, forwarded by the launcher). Harness gate `tokqrs`: 48
+  shapes (K 5120/8704, M 40-2048, P 1-3, row + tiled) byte-exact on codes, token scales and row-sums,
+  1.2-4x faster than the two-pass kernels (4x at M=40, ~1.25x at M=2048). Served: **+0.1-0.5% prefill**,
+  inside noise, in a paired same-build sweep (two-pass 3787/3643/3558/3487/3335 -> fused
+  3808/3646/3566/3495/3349). The int4 prefill is bound by the GEMM's zero-point fold (the 09-03 ledger:
+  16 VALU per tile-group), so a faster prologue does not move it. Kept on: byte-exact, one launch
+  fewer per site, and no `xr` scratch (the MXFP4 stack saw +5-9% from the same change because its GEMM
+  is 20% cheaper and its prologue was a larger share).
+- BetterBench decode single pass on the new build: 206.8 combined (int4's 09-03 record 226.2; the
+  same-build spread on this bench is ~10%, so neither number is a verdict).
+- Trap: the launcher forwards an explicit `-e RADIANCE_PQ_*` list; a new loader knob that is not
+  added there silently takes its code default inside the container. The first "fused vs two-pass"
+  sweep compared fused with fused (identical to 0.1%) before the env line existed.
+
+## 2026-09-10: int5 W5A8 ParoQuant -- round-to-nearest checkpoint, kernel and first served numbers
+
+Why 5 bits: the int4 kernel feeds the fp8 WMMA the signed code (c - 8), exact in e4m3; with 5-bit codes
+(c - 16) runs -16..15 and every integer in that range is ALSO exact in e4m3, so the GEMM algebra, the
+zero-point fold, the per-token e4m3 activations, the rotation-stream producers and the split-K / A-tiled
+bands all carry over. Only the weight staging changes: the low nibbles stay in today's word layout and
+the fifth bit rides in a byte-per-(slot, lane) plane in the same fragment order (`pq_stage_w<..., BITS=5>`,
+`ar_unpack8_5`: four `v_perm` table selects per four codes). int6 would NOT have this property (codes to
++-32 are not exact in e4m3) and needs the int8 WMMA rewrite; measured 2026-09-10: int8 WMMA 342 TOPS =
+1.06x fp8's 322, dense int4 16x16x32 682 (needs A4).
+
+Checkpoint (`build_int5.py`, 51 s on one GPU): bf16 base x z-lab's trained rotations -> uniform
+asymmetric int5 g128 RTN (UniformAffineQuantizer's grid with n_bits=5), "int5-bitplane": qweight/qzeros
+= AWQ packing of the low nibbles (the int4 loader's layout), qweight_hi/qzeros_hi = [K, N/32] int32
+fifth-bit planes; 21 GB on disk (MXFP4-PARO 18, FP8 30). `convert_int5.py` writes the same layout from an
+optimize/finetune result dir; `requant.sh NBIT=5 FORMAT=int POW2=0`.
+
+Gates:
+- harness `int5`: 32-code LUT round trip exact; decode / prefill / A-tiled x {qkv, o_proj, gate_up,
+  down, in_proj, tiny2p} x M {1, 8, 40, 64, 200, 1024} all rel 1.65-1.71e-3 (the bf16 output floor,
+  same as int4); 5-bit vs 4-bit kernel time 1.20-1.26x at decode M<=8 (= the 1.235x byte ratio: purely
+  bandwidth-bound, no unpack penalty), 1.02-1.16x prefill/A-tiled (unpack VALU on a staging-bound kernel).
+- KL(bf16 || int5 RTN pseudo), top-256 (~full vocab), 96 x 500-char chunks, 3 corpora:
+  wikitext 0.0109 nats (top-1 94.7%), code 0.0097 (96.4%), served traffic 0.0074 (96.3%) --
+  vs PARO-MXFP4 0.048 / 90.0% on wikitext (1000-char chunks; re-collect prod at 500 to make it exact).
+  ~4.5x closer to bf16 than MXFP4 BEFORE any fine-tune.
+- served (TP=2, SPEC=7, original DFlash2 FP8 drafter, skinny, util 0.95): **26.07 / 27.69 / 28.49
+  ms/step** @ ctx 25 / 8k / 32k (projected ~25.9 / 28.3; MXFP4-PARO 23.38 / 24.91 / 25.80; int4 PARO
+  23.27 / 24.79 / 25.59), 114 / 90 / 115 tok/s, acc/draft 1.98 / 1.48 / 2.27 (ctx-25 acceptance above
+  int4's 1.61 and MXFP4-PARO's ~1.9: the drafter was trained on the bf16 target); KV **767,217** tokens
+  (projected ~760k; MXFP4-PARO 862k); prefill **3490 / 3339 / 3343 / 3271 / 3137** PP t/s @ 2k-64k (int4
+  PARO 3808 / 3646 / 3566 / 3495 / 3349: -8%, the wider unpack on the fold-bound kernel; MXFP4-PARO
+  4770 @ 2k); **GSM8K 97.80% (489/500)**, top of the band (FP8 / AMD MXFP4 97.8, int4 PARO and MXFP4-PARO
+  97.4-97.6).
+
+Traps: (1) a resident CHECKALL reference copy of the full codes doubled the weight footprint and the
+serve died at KV allocation -- the reference is now rebuilt from the kernel-layout tensors
+(`unpermute_wh`) on demand; (2) CHECKALL rel 0.00000 lines fire on the profiling pass (zero inputs) and
+are deduplicated per (N, K, M), so they prove the paths run, not their accuracy -- the harness gate and
+GSM8K are the evidence; (3) prompt-logprob collection on a 25.7 GiB fp16 model needs the KV cache capped
+explicitly (`--kv-cache-memory 1.5G`, eager, 512 batched tokens): utilization-sized KV leaves nothing
+for the whole-chunk fp32 log-softmax; (4) a KLD serve at max-num-seqs 1 makes GSM8K take hours -- run
+GSM8K on the real serve.
+
+Next: stage-2 fine-tune (`STAGE=finetune NBIT=5`, rotations frozen; started 13:37, ~8.5 min/layer)
+-> `convert_int5.py` -> the same gates. Then two prefill experiments on the same pipeline, in order:
+(1) an E2M2 "MXFP5" RTN pseudo checkpoint + KLD (no kernel; decides whether porting the fifth-bit plane
+into the MXFP4 kernel's zero-VALU loop is worth ~2 days: expected prefill 4300-4500 vs int5's 3490);
+(2) int5 + pow2 group scales (`POW2=1`) + the zero-point epilogue (the ZPE ablation, ABL bit 4: RSH/ZSH
+operands, rank-G epilogue WMMA) -- keeps the uniform 32-level grid and the zero point, removes both loop
+FMAs, trades only scale precision; cheaper than a new format if (1) reads poorly. Then the prod
+decision between MXFP4-PARO (speed, KV) and int5 (fidelity: ~8-bit-class KL at 5.25 bits, -10% decode,
+-11% KV, -27% prefill vs MXFP4-PARO).
+
+## 2026-09-11: int5 stage-2 fine-tune -- served-path KL, and the activation quant is now the floor
+
+Fine-tune ran locally, incrementally: base re-saved as fp16 safetensors (`to_fp16.py`) so the optimizer's
+`from_pretrained(dtype=fp16)` maps it from the page cache (0.8 GiB resident after load, verified) instead of
+materializing 55 GB in RAM; each finished block's weights are dropped by the optimizer. 512 samples x 2 epochs,
+rotations frozen, 9.5 min/layer on one R9700 (GPU-bound; RAM 34-48 GB, swap ~0), one random GPU stall at
+layer 42 overnight (resumed per layer: replay ~1.6 min/layer, layer 42 then passed). Traps on the way:
+systemd-oomd is socket-activated (stop the .socket too), zram swap adds pressure, a 512-sample run with the
+bf16 base thrashes 60 GB RAM, `paroquant.cli.convert` instantiates an AWQ module class whose buffers do not
+fit the bit-plane layout -> `convert_int5.py` is now a standalone shard writer over `_quantize_layer`.
+
+Served (TP=2, SPEC=7, DFlash2, MAX_LOGPROBS=256 for the KLD collection, which also shrinks the KV profile
+to ~550k on these boots -- prod without the cap keeps 767k):
+
+| int5, served path (W5A8, prefill = per-token A scales) | ms/step @25/8k/32k | GSM8K | KL top-256 wiki / code / served | top-1 |
+|---|---|---|---|---|
+| RTN | 26.53 / 28.27 / 28.79 | 97.80 | 0.0317 / 0.0262 / 0.0248 | 91.5 / 93.8 / 93.4 |
+| **fine-tuned** | 26.29 / 27.90 / 28.71 | 97.40 | **0.0274 / 0.0246 / 0.0224** | **92.2 / 94.3 / 93.5** |
+| PARO-MXFP4 prod (1000-char chunks) | 23.38 / 24.91 / 25.80 | 97.40 | 0.048 / 0.054(top-20) / 0.044(top-20) | 90.0 / 92.7 / 91.9 |
+
+The fine-tune is worth 7-14% of served KL. The bigger number: the RTN *pseudo* path (weights only, no
+activation quant) measured 0.0109 / 0.0097 / 0.0074, so ~0.02 nats of the served 0.027-0.032 is the per-token
+e4m3 activation quantization, not the 5-bit weights. Prompt logprobs are a prefill, which runs the per-token
+(PTOK) activation-scale path; the decode band already uses per-group scales. Next measurement: the same KLD
+with `RADIANCE_PQ_PTOK=0` (per-group everywhere, ~7% prefill cost).
+
+## 2026-09-11: activation-scale granularity on int5 -- per-group A scales are NOT the lever (and a latent PTOK=0 bug)
+
+`RADIANCE_PQ_PTOK=0` (per-group e4m3 activation scales at every M) on the fine-tuned int5, served path:
+
+| int5 FT, served | KL top-256 wiki / code / served | top-1 wiki | prefill 2k/8k/16k/32k/64k PP t/s | GSM8K |
+|---|---|---|---|---|
+| per-token A scales (default) | 0.0274 / 0.0246 / 0.0224 | 92.2 | 3569 / 3493 / 3520 / 3441 / 3298 | 97.40 |
+| per-group A scales (PTOK=0) | 0.0259 / -- / -- | 92.2 | **2904 / 2802 / 2843 / 2800 / 2697 (-19%)** | 97.20 |
+| weights only (RTN pseudo) | 0.0109 / 0.0097 / 0.0074 | 94.7 | -- | -- |
+
+Finer activation scales recover ~6% of the served KL and cost 19% of prefill (the per-group path has no
+A-tiled band: row-major prefill GEMM + the per-group prologue at large M). The ~0.015 nats between the
+served W5A8 number and the weights-only number is the e4m3 ELEMENT (3-bit mantissa), not the scale
+granularity -- the floor for every W*A8 build on the fp8 WMMA, MXFP4-PARO included (its 0.048 carries the
+same component). Levers past it: int8 activations on the int8 WMMA (7 uniform bits per group; measured
+at fp8 speed; the same band rewrite W6A8 needs) or A16 on the f16 WMMA (weights-only KL, ~half the
+prefill). PTOK stays 1.
+
+Bug found on the way (latent for int4 since the rotation stream shipped 09-03): with PTOK=0 the loader
+consumed the stream producers' (A, ASG, RS) tuple at every M, but the producers only fill it inside the
+decode band (M <= 64); above it the tuple is allocated and untouched -> garbage prefill (KL 3.9 nats,
+top-1 0.09%, acc/draft 0.000 at 8k ctx, gibberish on an 8k prompt) while ctx-25 decode looked fine.
+`_linear_impl` now uses the tuple only when M <= DECODE_MAX_M. The harness int5 gate now also covers
+the per-group prefill variant at 4 and 5 bits (rel 1.66e-3, PASS): the kernel was never wrong.
+
+## 2026-09-11: I8 mode -- int8 activations on the iu8 WMMA (W5A8-int8); per-token int8 LOSES to e4m3
+
+Built as a mode of the same kernels (`I8` template flag): weight codes go to `v_wmma_i32_16x16x16_iu8` as
+the signed integer (c - 16) via a perm-mask unpack (no e4m3 table), slab products accumulate in int32 and
+convert once per fold, the fold algebra and SZ layout are unchanged, and every activation producer has an
+int8 variant (scale amax/127, round + clamp +-127, integer row-sums). `RADIANCE_PQ_I8=1` selects it end to
+end; cache dir suffix `-i8`. Harness gate `i8`: all bands x shapes rel 1.66e-3 (bf16 floor), int8 kernels
+0.87-1.03x the fp8 time (the int8 unpack is cheaper than the four-table e4m3 select); producers exact vs a
+CPU int8 reference, fused == two-pass.
+
+Served (fine-tuned int5, TP=2, SPEC=7): decode 25.89 / 27.59 / 28.42 ms/step (fp8-A: 26.29 / 27.90 / 28.71),
+prefill 3644 / 3535 / 3604 / 3547 / 3380 (fp8-A: 3569 / 3493 / 3520 / 3441 / 3298), GSM8K 98.00 (490/500).
+But KL(bf16 || served), top-256: wiki 0.0334 / code 0.0314 / served 0.0273 vs e4m3 per-token 0.0274 /
+0.0246 / 0.0224 -- **per-token int8 is 15-28% WORSE than per-token e4m3.** One uniform 127-level grid per
+5120-wide token spends its levels on the row's largest channel and flattens the bulk; e4m3 keeps relative
+precision for the small values. The rotations soften the outlier channels but do not remove them. The decode
+band already runs per-group int8; this KLD is a prefill (per-token path). Next: the same KLD with per-group
+int8 everywhere (`PTOK=0`, no A-tiled band, -19% prefill) -- decides whether an A-tiled band with per-group
+activation scales is the remaining piece or whether int8 activations are not the lever at all.
+
+## 2026-09-11: where the served-vs-weights-only gap is NOT (int5 FT, served KL top-256, wikitext)
+
+| variant | wiki | code | served | top-1 wiki |
+|---|---|---|---|---|
+| e4m3 per-token (default) | 0.0274 | 0.0246 | 0.0224 | 92.2 |
+| e4m3 per-group (PTOK=0) | 0.0259 | -- | -- | 92.2 |
+| int8 per-token (I8) | 0.0334 | 0.0314 | 0.0273 | 91.3 |
+| int8 per-group (I8, PTOK=0) | 0.0251 | 0.0234 | 0.0217 | 92.4 |
+| e4m3 per-token + bf16 attention + bf16 KV | 0.0266 | 0.0251 | 0.0227 | 92.4 |
+| weights only (RTN pseudo, 0.5.8 stock stack) | 0.0109 | 0.0097 | 0.0074 | 94.7 |
+
+Activation element and granularity move the served KL by <10% either way (int8 per-token is worse: one
+127-level grid per 5120-wide token flattens the bulk); bf16 attention + bf16 KV move it 3% (fp8 KV cache and
+fp8 attention stay -- 2x KV for nothing measurable). Decode 25.9-26.4 ms/step across all of them. The ~0.014
+between every served variant and the weights-only pseudo is therefore not the linears' activation quant and
+not attention. Next diagnostic: the pseudo checkpoint served on the 0.9.3 stack (prod attention/KV) --
+if it reads ~0.025 the gap is the serving stack's numerics vs the 0.5.8 reference (a cross-image
+measurement artifact), if ~0.011 it is something in the W5A8 GEMM path. Launcher now takes
+`R4D_ATTN_FP8` (default 3) and `KV_DTYPE` (default fp8) as env.
+
+## 2026-09-11 (late): SAME-STACK reference -- the served floor was the cross-image offset; int8 per-group wins
+
+Serving the RTN pseudo checkpoint (fp16 weights, no W5A8 path) on the 0.9.3 stack read 0.0288 vs the 0.5.8
+bf16 reference, against 0.0109 for the same weights on the 0.5.8 stack: ~0.018 nats of every "served" KL was
+the serving stack's numerics (R4D attention, fused GDN/norm kernels, fp8 KV, chunked prefill) relative to a
+reference collected on another image, not quantization. The bf16 base served on 0.9.3 (`MODE=eval MAXLEN=8192
+CHUNK=1024 MAXSEQS=1 GPU_UTIL=0.97`, eager) is the right reference; the two stacks' bf16 outputs differ by
+KL 0.0198 (top-1 93.4%) -- more than the quantization itself.
+
+Same-stack KL(bf16@0.9.3 || candidate), wikitext, 96 x 500-char chunks, top-256 / top-1:
+
+| candidate | KL | top-1 |
+|---|---|---|
+| int5 RTN pseudo (weights only) | 0.0126 | 94.6% |
+| int5 RTN served (W5A8 e4m3) | 0.0155 | 93.8% |
+| int5 FT served (W5A8 e4m3 per-token, prod default) | 0.0126 | 94.3% |
+| int5 FT served, bf16 attention + bf16 KV | 0.0119 | 94.5% |
+| **int5 FT served, int8 per-group activations (I8 + PTOK=0)** | **0.0098** | **95.0%** |
+
+So: the W5A8 e4m3 activation path costs ~0.002 nats, not 0.015; the fine-tune is worth ~0.003; int8 PER-GROUP
+activations (7 uniform bits per 128 channels) beat e4m3 per-token by 22% and land below the weights-only RTN
+number -- per-TOKEN int8 was the wrong granularity, not the wrong format. fp8 KV / fp8 attention cost 0.0007.
+Remaining kernel piece: an A-tiled prefill band with per-group activation scales, so the per-group int8 path
+runs at tiled speed (the row-major per-group kernel is -19% prefill); the decode band is per-group int8
+already. Then int8 per-group everywhere is the prod candidate: 8-bit-class fidelity at 5.25 bits, decode at
+parity (25.9 ms/step), prefill at int5's ~3550-3650.
+
+Method notes: the bf16 base on 0.9.3 OOMs on prompt logprobs past ~120 chunks at 0.97 util (only wikitext
+collected) -- collect corpora in separate boots or cap KV explicitly; `MAXSEQS=1` under prod mode trips
+vLLM's static-shape compile ("Expected exactly one compiled range_entry"), eval mode (eager) avoids it.
+
+## 2026-09-11 (evening): per-group int8 on the A-tiled band -- the prod candidate
+
+`RADIANCE_PQ_I8=1 RADIANCE_PQ_PG=1`: `pq_rotate_groupquant` (rotate + per-group int8 quant + tiled write, one
+launch, byte-exact vs pass A) feeds `pq_int4_fp8_gemm_atiled<..., PG>` (asg[m,g] staged per slab and folded,
+no epilogue scale); decode band unchanged (per-group int8 already). Harness `pg`: PASS, band 1.09-1.17x the
+per-token band (the fold multiply), producer exact.
+
+Served, fine-tuned int5, TP=2, SPEC=7, same-stack reference (bf16 base on 0.9.3):
+
+| int5 FT variant | KL wiki top-5 / top-256 | top-1 | ms/step @25/8k/32k | prefill 2k/8k/16k/32k/64k | GSM8K |
+|---|---|---|---|---|---|
+| e4m3 per-token (int5 default) | 0.0088 / 0.0126 | 94.3 | 26.29 / 27.90 / 28.71 | 3569 / 3493 / 3520 / 3441 / 3298 | 97.40 |
+| int8 per-token (I8) | -- (worse cross-stack) | -- | 25.89 / 27.59 / 28.42 | 3644 / 3535 / 3604 / 3547 / 3380 | 98.00 |
+| int8 per-group, row-major (I8 PTOK=0) | 0.0066 / 0.0098 | 95.0 | 25.86 / 27.85 | ~2900 (-19%) | -- |
+| **int8 per-group, A-tiled (I8 PG)** | **0.0067 / 0.0097** | **95.2** | 26.01 / 27.35 / 28.16 | **3328 / 3214 / 3267 / 3211 / 3077** | 97.20 |
+
+The tiled per-group band keeps the best fidelity (0.0097, top-1 95.2%: below the RTN weights-only 0.0126 and
+23% under the e4m3 per-token path) at -9% prefill vs per-token int8 instead of -19%, decode at parity, KV 767k
+(prod cap). Row-major vs tiled per-group differ by KL 0.004 -- two bf16-correct kernels' rounding through 64
+layers; anything under ~0.005 between variants is implementation noise on this measurement. Remaining prefill
+lever for this configuration: pow2 weight scales folded at staging + the zero-point epilogue, which removes
+the two weight-side FMAs and leaves only the activation-scale FMA (back to the per-token band's cost).
+
+## 2026-09-11 (evening): pow2 group scales -- REJECTED (2.8x the KL); E2M2 skipped on the same grounds
+
+`build_int5.py POW2=1` (z-lab's pow2 projection of the fp16 group scale, zero point from the unprojected
+scale), RTN pseudo served on the 0.9.3 stack, same-stack KL wikitext top-5 / top-256 / top-1: **0.0238 /
+0.0348 / 90.8%** vs plain fp16 scales 0.0087 / 0.0126 / 94.6%. Rounding a group-128 scale to a power of two
+costs up to a factor of two in step size -- most of a bit of the grid -- and the fidelity was the point. The
+pow2 + zero-point-epilogue zero-VALU loop is therefore not a path for int5; the per-group fold's 9% prefill
+stays. E2M2 "MXFP5" (pow2 block-32 scales + a float grid) is the same mechanism on a coarser grid and is
+expected in MXFP4's class; not run.
+
+## 2026-09-11 (night): the three builds on ONE reference (bf16 base served on the same 0.9.3 stack), wikitext
+
+| served build | KL top-5 / top-256 | top-1 | ms/step @25 | prefill @2k | KV |
+|---|---|---|---|---|---|
+| MXFP4-PARO (prod) | 0.0296 / 0.0419 | 90.3% | 23.3 | 4770 | 862k |
+| int4 PARO | 0.0195 / 0.0285 | 91.5% | 23.5 | 3808 | 854k |
+| int5 RTN, e4m3 per-token | 0.0110 / 0.0155 | 93.8% | 26.1 | 3490 | 767k |
+| int5 FT, e4m3 per-token | 0.0088 / 0.0126 | 94.3% | 26.3 | 3569 | 767k |
+| **int5 FT, int8 per-group (I8 PG)** | **0.0067 / 0.0097** | **95.2%** | 26.0 | 3328 | 767k |
+
+fp16 group scale (int4 PARO vs MXFP4-PARO): -32% KL; fifth bit: 0.0285 -> 0.0155; fine-tune: -> 0.0126;
+per-group int8 activations: -> 0.0097. GSM8K identical within noise on every row (97.2-98.0). Decode
+25.9-26.3 for every int5 variant (weight stream), MXFP4-PARO / int4 PARO 23.3-23.5.
+
+## 2026-09-12: zero-point epilogue (ZPE) shipped on the A-tiled band -- prefill +6.5%, no pow2
+
+The epilogue form of the zero-point correction (ABL bit 4, until now an ablation) is a shipped band:
+`RADIANCE_PQ_ZPE=1` (cache suffix `-zpe`). The loop keeps only the scale fold (`fma(sc, asg*t, acc)`); the
+term `sum_g rs[m,g] * sc*(zp-16)[g,n]` becomes Gp/16 fp16 WMMAs per output tile in the epilogue, with RSH
+= fp16 row-sums in fragment order (`pq_rs_to_rsh`, one launch per GEMM, byte-exact against the harness
+builder at G = 5/40/68/136) and ZSH = `sz[..., 1]` as `layer.zsh` [N, Gp]. The zero-scales are staged into
+the dead W slab in 64-group chunks, so any G works (down_proj at TP=2 is G=68; the ablation was limited to
+64). The row-sum slab stage is skipped under ZPE. No pow2 anywhere: the fp16 group scales that carry the
+fidelity are untouched.
+
+Harness `zpe` (int5, e4m3/int8 x per-token/per-group, M=200/1024/2048; reference rel identical to the
+in-loop form at 1.66e-3 on every row):
+
+| shape | in-loop -> ZPE (M=2048, int8 per-group) | ratio |
+|---|---|---|
+| qkv | 965 -> 891 us | 0.923 |
+| o_proj | ~395 -> ~381 us | 0.96 |
+| (qkv, e4m3 per-token) | 880 -> 810 us | 0.920 |
+
+Served, fine-tuned int5, I8 PG, TP=2, SPEC=7, same-stack reference:
+
+| int5 FT I8 PG | KL wiki top-5 / top-256 | top-1 | ms/step @25/8k/32k | prefill 2k/8k/32k/64k | GSM8K | KV |
+|---|---|---|---|---|---|---|
+| in-loop | 0.0067 / 0.0097 | 95.2 | 26.01 / 27.35 / 28.16 | 3328 / 3214 / 3211 / 3077 | 97.20 | 767k |
+| **+ ZPE** | **0.0069 / 0.0099** | **95.25** | 25.73 / 27.74 / 28.09 | **3550 / 3427 / 3416 / 3267** | 96.80, 97.80 | 769k |
+
++6.2-6.7% prefill at every context, TTFT 10.6 -> 9.9 s at 33k, decode unchanged (the decode band has no
+epilogue), in-loop vs ZPE mutual KL 0.004 (the fp16 row-sum rounding; under the 0.005 noise line), GSM8K
+two samples 96.8 / 97.8 around the in-loop 97.2. KV: the first ZPE boot read 547k -- a FRESH compile cache
+costs ~1 GiB of non-torch memory on the profiling boot; the warm reboot reads 769k. Never judge KV on a
+first boot. This is the prod candidate's configuration: `RADIANCE_PQ_I8=1 RADIANCE_PQ_PG=1 RADIANCE_PQ_ZPE=1`.
+
+Remaining int5 prefill levers (queued): the fifth-bit staging unpack (the 5-bit band runs 1.04-1.15x the
+4-bit band in the same mode, gate_up worst) and emitting the tiled int8 activations straight from the
+norm/silu producers above the decode band (one bf16 round trip per linear). The per-group fold (9%) is the
+fidelity price and the zero-VALU loop needs pow2 scales (rejected) -- both closed.
+
+## 2026-09-12: fifth-bit staging unpack -- byte-exact, small; the rest of the 5-bit gap is bytes
+
+The 5-bit unpack cost 44 VALU per 8 codes on the int8 path (int4: 19): the bit-plane spread was 11 ops per
+word and the sign-extension 7. Now: the spread is one 24-bit multiply (`(x & 0x55) * 0x00410410`, copies at
+shifts 4/10/16/22 whose only collisions carry into unused bits) and the sign-extension an xor plus a shift
+pair (`y = c ^ top; y | ((y & top) << 4) - ((y & top) << 1)`) -- 20 ops. A first version used the 24-bit
+multiply for the sign-extension too, which drops bit 28 (byte 3's sign): the new mixed-pattern probe
+(4.2M random words x 3 paths vs the shift/select forms) caught it; both probes now report 0 mismatches.
+5-bit vs 4-bit band time (harness int5, e4m3, A-tiled M=1024): qkv 1.04 -> 1.01x, o_proj 1.08 -> 1.04x,
+gate_up 1.15 -> 1.11x, down 1.07x, in_proj 1.04 -> 1.02x; int8 bands unchanged. What remains is the
+weight stream: 5.25 bits/weight is 23% more bytes than 4.25 and gate_up at M=1024 is weight-stream-bound.
+Closed.
+
+## 2026-09-12: the per-group prefill producer is LDS-bank-conflict-bound -- conflict-free layout, 1.9x
+
+Measured first (harness `pg` producer bandwidth, M=2048): `pq_rotate_groupquant` (one workgroup per row,
+the PG producer) moves 96 MB in 524 us on the qkv shape = 184 GB/s, under 30% of DRAM, and costs more
+than half the GEMM it feeds (891 us at M=2048). Ruling out the usual suspects, each byte-exact:
+
+| producer form | qkv (K=5120, P=3) | down (K=8704, P=1) |
+|---|---|---|
+| one workgroup per row (records re-read per row) | 508-524 us | 277-285 |
+| pass A, records resident over 256 rows | 502 | 279 |
+| pass A + tiled store | 489 | 274 |
+| pass A tiled, NR=2 / 4 / 8 rows per wave interleaved | 473 / 470 / 471 | 272 / 271 / 275 |
+| **LDS probe: same kernel, bank-friendly pairs (t, t+64)** | **222** | **138** |
+| LDS probe: adjacent pairs (2t, 2t+1), 2-way conflicts | 347 | 215 |
+| **conflict-free ownership layout (`pq_rotate_quant3`)** | **254** | **149** |
+
+Records, layout and latency chains all land at ~480 us; only the pair indices move it. With the
+checkpoint's random Givens pairs a layer's 4 LDS reads + 4 writes per lane hit random banks (~3 cycles
+each); the LDS unit, not memory, sets the time. `pq_rotate_quant3` keeps the row in a per-layer
+OWNERSHIP layout (in layer r the lane's two pairs sit at slots {l, 32+l, 64+l, 96+l}, all bank l: reads
+never conflict) and writes each layer's outputs into the next layer's layout through four instructions
+whose destinations are a perfect matching of source lanes onto destination lanes (a 4-regular bipartite
+multigraph splits into 4 perfect matchings -- Euler-tour split, `pq_build_rot3` on the CPU at load, the
+two destination entries carried in the record words the channel indices used to occupy; the same for the
+initial channel-order -> layer-0 scatter, and the last layer writes channel order back). The fma
+expressions and their per-pair order are pq_rotate_quant2's: code-diff 0, scale-diff 0, rs-diff 0 vs pass
+A on e4m3 and int8, 0 table failures. 254 us = 385 GB/s. `RADIANCE_PQ_PG_PRODUCER=3` is the launcher
+default (2 = pass A tiled, 1 = per-row, all byte-exact).
+
+Served, fine-tuned int5, I8 PG ZPE, TP=2, SPEC=7, same-stack reference, warm cache:
+
+| int5 FT I8 PG | KL wiki top-5 / top-256 | top-1 | ms/step @25/8k/32k | prefill 2k/8k/32k/64k | GSM8K | KV |
+|---|---|---|---|---|---|---|
+| in-loop, per-row producer (09-11) | 0.0067 / 0.0097 | 95.2 | 26.01 / 27.35 / 28.16 | 3328 / 3214 / 3211 / 3077 | 97.20 | 765k |
+| + ZPE | 0.0069 / 0.0099 | 95.25 | 25.73 / 27.74 / 28.09 | 3550 / 3427 / 3416 / 3267 | 96.8, 97.8 | 769k |
+| **+ ZPE + conflict-free producer** | **0.0070 / 0.0100** | **95.21** | 25.90 / 27.46 / 28.19 | **3941 / 3790 / 3616 / 3436** | 97.40 | 760k |
+
+The two 09-12 changes together: prefill +18% at 2k / +18% at 8k / +13% at 32k / +12% at 64k (the producer
+is a fixed cost per token, the GEMM share grows with context), TTFT at 33k 10.6 -> 9.4 s, decode unchanged
+(the decode band uses neither), KL unchanged (producer1 vs producer3 mutual KL 0.0002 / top-1 99.8%: the
+serving floor for identical codes), GSM8K in band. The tables cost ~1.2% of KV (the decode-band producers
+still need the original records). Gap to MXFP4-PARO at 2k: 4770 vs 3941 = 17% (was 30%).

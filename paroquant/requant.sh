@@ -48,6 +48,7 @@ CACHE=${CACHE:-$HOME/.cache/paroquant}
 # total, not the full corpora) are fetched on first run, so this cannot be offline. Set
 # HF_OFFLINE=1 once they are cached.
 FORMAT=${FORMAT:-mxfp4}          # mxfp4 | int
+NBIT=${NBIT:-4}                  # weight bits for FORMAT=int (5 = the W5A8 grid; the serving kernel takes 4 or 5)
 POW2=${POW2:-1}                  # only meaningful when FORMAT=int
 SCALE_RULE=${SCALE_RULE:-ocp}    # mxfp4 shared exponent: ocp (AMD-compatible) | noclip
 
@@ -119,12 +120,12 @@ run() {
 if [ "$STAGE" = finetune ]; then
   [ -f "$MODELS/$INIT_ROTATIONS" ] || { echo "trained rotations missing at $MODELS/$INIT_ROTATIONS" >&2; exit 1; }
   mkdir -p "$FT_RESULTS"; RESULTS="$FT_RESULTS"
-  echo "=== finetune (format=$FORMAT rule=$SCALE_RULE train_size=$TRAIN_SIZE epochs=$FT_EPOCHS, rotations frozen from $INIT_ROTATIONS) ==="
+  echo "=== finetune (format=$FORMAT nbit=$NBIT pow2=$POW2 rule=$SCALE_RULE train_size=$TRAIN_SIZE epochs=$FT_EPOCHS, rotations frozen from $INIT_ROTATIONS) ==="
   PARO_INIT_ROTATIONS="/models/$INIT_ROTATIONS" run -m paroquant.cli.optimize \
     --model "/models/$BASE" \
     --params "weight:$WEIGHT_LR,quantizer:$QUANT_LR" \
     --epochs "$FT_EPOCHS" \
-    --group-size 128 --n-bit 4 --num-rotations 8 \
+    --group-size 128 --n-bit "$NBIT" --num-rotations 8 \
     --skipped-modules "linear_attn.in_proj_a" "linear_attn.in_proj_b" \
     --datasets wikitext2 c4 redpajama --val-dataset pileval \
     --train-size "$TRAIN_SIZE" --validation-size 64 --batch-size "$BATCH_SIZE" \
@@ -140,7 +141,7 @@ if [ "$STAGE" = all ] || [ "$STAGE" = optimize ]; then
     --params "channel_scales:$ROT_LR,angles:$ROT_LR" "weight:$WEIGHT_LR,quantizer:$QUANT_LR" \
     --epochs $EPOCHS \
     --group-size 128 \
-    --n-bit 4 \
+    --n-bit "$NBIT" \
     --num-rotations 8 \
     --skipped-modules "linear_attn.in_proj_a" "linear_attn.in_proj_b" \
     --datasets wikitext2 c4 redpajama \
