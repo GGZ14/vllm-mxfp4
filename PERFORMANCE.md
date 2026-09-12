@@ -59,8 +59,9 @@ it is worth.
 | | MXFP4 prod | ParoQuant | |
 |---|---|---|---|
 | GSM8K 500q | 97.8% | **97.4-98.0%** | per-token vs per-group activation scales; inside binomial noise |
-| decode @ ctx25 | 22.3 ms/step | 24.19 ms/step | -7% |
+| decode @ ctx25 | 22.3 ms/step | 24.19 ms/step (**23.27** since 2026-09-09: skinny gate GEMM + util 0.95, KV 854k) | -7% (-4%) |
 | combined decode | 186.0 t/s | **226.2 t/s** | +22% |
+| KL vs FP8 serve (top-20, wikitext / code / served) | — | MXFP4-PARO: 0.057 / 0.054 / 0.044 nats; top-1 agreement 90.5-92.7% | see PAROQUANT.md |
 | conc 1/2/4/8/16 | — | 168 / 276 / 399 / **512** / 518 | |
 | prefill @ 2k/8k/16k/32k/64k | — | 3782 / 3700 / 3725 / 3621 / 3450 t/s | -8.8% at 8k when it shipped, parity from ~64k |
 | KV cache profile | — | 622k tokens | |

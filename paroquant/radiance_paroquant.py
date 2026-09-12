@@ -82,6 +82,23 @@ PTOK_ENABLED = os.environ.get("RADIANCE_PQ_PTOK", "1") == "1"
 # Prefill GEMM on a fragment-tiled activation (pass C writes the tile layout, the GEMM reads A
 # straight from global into the WMMA register; no A tile in LDS). Harness-gated 2026-09-02.
 ATILED_ENABLED = os.environ.get("RADIANCE_PQ_ATILED", "1") == "1"
+# Fused prefill prologue: pass A + pass C as one launch (pq_rotate_tokquant with row-sums), byte-exact
+# (par_harness tokqrs). 0 = the two-pass path.
+FUSED_TOKQ = os.environ.get("RADIANCE_PQ_FUSED_TOKQ", "1") == "1"
+# I8: int8 activations (per-group / per-token scale amax/127, integer row-sums) on the iu8 WMMA
+# instead of e4m3 on the fp8 WMMA. Same weights, same SZ; the producers and GEMMs switch together.
+I8 = os.environ.get("RADIANCE_PQ_I8", "0") == "1"
+I8_FLAG = 1 if I8 else 0
+# PG: per-GROUP activation scales above the decode band too, on the A-tiled band (pq_rotate_groupquant
+# producer + pq_int4_fp8_gemm_atiled<PG>). Without ATILED it falls back to the row-major per-group path.
+PG = os.environ.get("RADIANCE_PQ_PG", "0") == "1"
+# PG producer form above the decode band: 3 = conflict-free ownership-layout kernel (default; the
+# Givens chain in LDS is bank-conflict-bound with the checkpoint's random pairs, this one is ~2x),
+# 2 = pass-A kernel with records resident, 1 = one workgroup per row. All byte-exact to each other.
+PG_PRODUCER = int(os.environ.get("RADIANCE_PQ_PG_PRODUCER", "3"))
+# ZPE: the zero-point correction as an fp16 WMMA epilogue on the A-tiled band (rank-G product of the row-sum
+# fragments and the zero-scales) instead of one FMA per element per group in the loop.
+ZPE = os.environ.get("RADIANCE_PQ_ZPE", "0") == "1"
 # Weight layout: fragment order (one 32-lane u32 slot per (n-tile, k-step)) rather than the
 # loader's [N, K/8]. The kernels read RADIANCE_PQ_WPERM themselves; this flag and theirs MUST
 # agree or the weight is read as garbage. Fragment order is what makes the decode kernel's
@@ -141,15 +158,31 @@ def _e4m3_table(device):
     return _E4M3_TABLE[0]
 
 
-def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None):
+def unpermute_wh(whi: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Fragment-order fifth-bit plane [N, K/8] u8 -> [N, K] u8 (0/1), reference path only."""
+    nt, ks = N // 16, K // 16
+    hb = whi.view(nt, ks, 2, 16, 1).permute(0, 3, 1, 2, 4).contiguous().view(N, K // 8)
+    shifts = torch.arange(8, device=whi.device, dtype=torch.uint8)
+    return ((hb.unsqueeze(-1) >> shifts) & 1).reshape(N, K)
+
+
+def unpack_codes(qweight_row: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Row-layout [N, K/8] i32 (eight nibbles along K, low nibble = lowest k) -> [N, K] u8."""
+    w32 = qweight_row.view(torch.int32)
+    shifts = torch.arange(0, 32, 4, device=qweight_row.device, dtype=torch.int32)
+    return ((w32.unsqueeze(-1) >> shifts) & 0xF).reshape(N, K).to(torch.uint8)
+
+
+def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None, codes_full=None, zoff=8.0):
     """Dequantize to fp32 and matmul, mirroring the kernel algebra. Deliberately slow/obvious.
     Per-group mode: asg [P,M,G], rs = rowsum*asg. Per-token mode: as_tok [P,M], rs plain."""
-    device = qweight.device
+    device = a_codes.device
     G = K // GROUP
     sc = sz.view(G, N, 2)[..., 0].float()            # [G, N]
     zsc = sz.view(G, N, 2)[..., 1].float()
     P, M = a_codes.shape[0], a_codes.shape[1]
-    aval = _e4m3_table(device)[a_codes.view(torch.uint8).long()]     # [P, M, K] f32
+    if I8: aval = a_codes.view(torch.int8).float()                     # [P, M, K] int8 -> f32
+    else: aval = _e4m3_table(device)[a_codes.view(torch.uint8).long()]  # [P, M, K] e4m3 -> f32
     out = torch.zeros((M, N), dtype=torch.float64, device=device)
     bounds = [0, min(pb1, N), min(pb2, N), N]
     CHUNK = 512      # n-columns at a time: the ref must not OOM a 0.92-util worker
@@ -157,11 +190,14 @@ def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None):
         n0, n1 = bounds[p], bounds[p + 1]
         for c0 in range(n0, n1, CHUNK):
             c1 = min(n1, c0 + CHUNK)
-            w32 = qweight[c0:c1].view(torch.int32).to(torch.int32)
-            codes = torch.empty((c1 - c0, K), dtype=torch.float32, device=device)
-            for j in range(PACK):
-                codes[:, j::PACK] = ((w32 >> (4 * j)) & 0xF).float()
-            wv = (codes - 8.0).view(c1 - c0, G, GROUP).double()
+            if codes_full is not None:
+                codes = codes_full[c0:c1].float()
+            else:
+                w32 = qweight[c0:c1].view(torch.int32).to(torch.int32)
+                codes = torch.empty((c1 - c0, K), dtype=torch.float32, device=device)
+                for j in range(PACK):
+                    codes[:, j::PACK] = ((w32 >> (4 * j)) & 0xF).float()
+            wv = (codes - zoff).view(c1 - c0, G, GROUP).double()
             dot = torch.einsum("mgk,ngk->mng", aval[p].view(M, G, GROUP).double(), wv)
             if as_tok is None:
                 # rs carries rowsum*asg (prologue); the correction term has no asg factor
@@ -175,7 +211,7 @@ def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None):
     return out.to(torch.bfloat16)
 
 
-def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None):
+def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None, zsh=None, rec3=None, rinit=None):
     """The whole dispatch, opaque to dynamo. pre = (A, ASG, RS) already rotated+quantized by the
     fused norm producer (decode band only; ignored -- recomputed from x2 -- above the band)."""
     N, K = qweight.shape[0], qweight.shape[1] * PACK
@@ -185,11 +221,17 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None):
     M = x2.shape[0]
     _ensure_scratch(x.device)
     stream = torch.cuda.current_stream().cuda_stream
-    ptok = PTOK_ENABLED and M > DECODE_MAX_M
+    whi_p = whi.data_ptr() if whi is not None else 0       # int5: fifth-bit plane
+    pg_tiled = PG and ATILED_ENABLED and M > DECODE_MAX_M
+    ptok = PTOK_ENABLED and M > DECODE_MAX_M and not PG
     tiled = ptok and ATILED_ENABLED
     as_tok = None
     out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
-    if pre is not None and not ptok:
+    # The stream producers fill (A, ASG, RS) only inside the decode band; above it the tuple is
+    # allocated but untouched, so it must be recomputed from x2 there -- also when PTOK is off
+    # (per-group scales at every M), which is what used to consume the untouched tuple.
+    use_pre = pre is not None and M <= DECODE_MAX_M
+    if use_pre:
         a_codes, asg, rs = pre
         if a_codes.shape[0] != P:
             raise RuntimeError(f"paroquant: pre-quantized tuple has {a_codes.shape[0]} partition(s), "
@@ -198,80 +240,113 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None):
         a_codes = torch.empty((P, M, K), device=x.device, dtype=torch.uint8)
         asg = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
         rs = torch.empty((P, M, G), device=x.device, dtype=torch.float32)
-    if pre is not None and not ptok:
+    if use_pre:
+        gemm_scale = asg
+    elif pg_tiled:
+        # per-group scales on the tiled band: one fused launch (rotate + per-group quant + tiled write)
+        Mt = (M + 15) // 16
+        a_codes = torch.empty((P, Mt * 16 * K), device=x.device, dtype=torch.uint8)
+        use3 = PG_PRODUCER == 3 and rec3 is not None
+        _ext.launch_rotate_groupquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), a_codes.data_ptr(),
+                                      asg.data_ptr(), rs.data_ptr(), M, K, P, krot, stream,
+                                      3 if use3 else min(PG_PRODUCER, 2), I8_FLAG,
+                                      rec3.data_ptr() if use3 else 0, rinit.data_ptr() if use3 else 0)
         gemm_scale = asg
     elif ptok:
         # Prefill: pass A (rotate -> bf16 scratch + per-group scales), pass C (token scale +
         # encode + plain row-sums), PTOK GEMM (AutoRound-cost fold, As in the epilogue).
         # Tiled: pass C emits the fragment-tiled layout (16-row padded) and the A-direct GEMM
         # consumes it; row-major otherwise.
-        xr = torch.empty((P, M, K), device=x.device, dtype=torch.bfloat16)
         as_tok = torch.empty((P, M), device=x.device, dtype=torch.float32)
-        _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
-                                 asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream)
         if tiled:
             Mt = (M + 15) // 16
             a_codes = torch.empty((P, Mt * 16 * K), device=x.device, dtype=torch.uint8)
-        _ext.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
-                                as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream,
-                                1 if tiled else 0)
+        if FUSED_TOKQ:
+            # one launch: rotate -> token amax -> encode (+ tiled layout) + plain row-sums
+            _ext.launch_rotate_tokquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
+                                        a_codes.data_ptr(), as_tok.data_ptr(), M, K, P, krot,
+                                        stream, 1 if tiled else 0, rs.data_ptr(), I8_FLAG)
+        else:
+            xr = torch.empty((P, M, K), device=x.device, dtype=torch.bfloat16)
+            _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), xr.data_ptr(),
+                                     asg.data_ptr(), rs.data_ptr(), M, K, P, krot, 1, stream, I8_FLAG)
+            _ext.launch_token_quant(xr.data_ptr(), asg.data_ptr(), a_codes.data_ptr(),
+                                    as_tok.data_ptr(), rs.data_ptr(), M, K, P, stream,
+                                    1 if tiled else 0, I8_FLAG)
         gemm_scale = as_tok
     else:
         _ext.launch_rotate_quant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(),
                                  a_codes.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P,
-                                 krot, 0, stream)
+                                 krot, 0, stream, I8_FLAG)
         gemm_scale = asg
-    if tiled:
+    if tiled or pg_tiled:
+        zpe_on = ZPE and zsh is not None
+        rsh_p = 0
+        if zpe_on:
+            Mt, Gp = (M + 15) // 16, (G + 15) & ~15
+            rsh = torch.empty((P, Mt * Gp * 16), device=x.device, dtype=torch.float16)
+            _ext.launch_rs_to_rsh(rs.data_ptr(), rsh.data_ptr(), M, G, P, stream)
+            rsh_p = rsh.data_ptr()
         _ext.launch_gemm_at(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                             gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K,
-                            pb1, pb2, stream)
+                            pb1, pb2, stream, whi_p, I8_FLAG, 1 if pg_tiled else 0,
+                            1 if zpe_on else 0, rsh_p, zsh.data_ptr() if zpe_on else 0)
     else:
         _ext.launch_gemm(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                          gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K, pb1,
-                         pb2, 1 if ptok else 0, stream)
+                         pb2, 1 if ptok else 0, stream, whi_p, I8_FLAG)
     if CHECK_ALL is not None and (N, K) in CHECK_ALL and M <= CHECK_MAX_M \
             and (N, K, M) not in _checked:
         _checked.add((N, K, M))
-        a_ref = untile_a(a_codes, P, M, K) if tiled else a_codes
-        w_ref = unpermute_w(qweight, N, K) if WPERM else qweight
-        ref = _exact_ref(a_ref, asg, rs, w_ref, sz, N, K, pb1, pb2, as_tok=as_tok)
+        a_ref = untile_a(a_codes, P, M, K) if (tiled or pg_tiled) else a_codes
+        if whi is not None:   # int5: full codes rebuilt from the kernel-layout tensors (no resident copy)
+            lo = unpack_codes(unpermute_w(qweight, N, K), N, K)
+            ref = _exact_ref(a_ref, asg, rs, None, sz, N, K, pb1, pb2, as_tok=as_tok,
+                             codes_full=lo | (unpermute_wh(whi, N, K) << 4), zoff=16.0)
+        else:
+            w_ref = unpermute_w(qweight, N, K) if WPERM else qweight
+            ref = _exact_ref(a_ref, asg, rs, w_ref, sz, N, K, pb1, pb2, as_tok=as_tok)
         num = (out.float() - ref.float()).pow(2).sum().sqrt()
         den = ref.float().pow(2).sum().sqrt().clamp_min(1e-30)
         sys.stderr.write(f"[radiance.paroquant] CHECKALL N={N} K={K} M={M} P={P} "
-                         f"path={'tiled' if tiled else 'ptok' if ptok else 'decode'}"
-                         f"{'+pre' if pre is not None and not ptok else ''} "
+                         f"path={'pg-tiled' if pg_tiled else 'tiled' if tiled else 'ptok' if ptok else 'decode'}"
+                         f"{'+pre' if use_pre else ''} "
                          f"rel={float(num / den):.5f}\n")
     return out
 
 
 @torch.library.custom_op("radiance::paroquant_linear", mutates_args=())
 def paroquant_linear(x: torch.Tensor, qweight: torch.Tensor, sz: torch.Tensor,
-                     rec: torch.Tensor, cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
+                     rec: torch.Tensor, cs: torch.Tensor, pb1: int, pb2: int,
+                     whi: torch.Tensor | None = None, zsh: torch.Tensor | None = None,
+                     rec3: torch.Tensor | None = None, rinit: torch.Tensor | None = None) -> torch.Tensor:
     """Owns the whole dispatch so no shape branch is visible to dynamo (see the AutoRound module
     for why: a data-dependent M branch in apply() splits the compiled graph at every linear)."""
     K = qweight.shape[1] * PACK
-    out = _linear_impl(x.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2)
+    out = _linear_impl(x.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, whi=whi, zsh=zsh, rec3=rec3, rinit=rinit)
     return out.view(*x.shape[:-1], qweight.shape[0])
 
 
 @paroquant_linear.register_fake
-def _(x, qweight, sz, rec, cs, pb1, pb2):
+def _(x, qweight, sz, rec, cs, pb1, pb2, whi=None, zsh=None, rec3=None, rinit=None):
     return torch.empty((*x.shape[:-1], qweight.shape[0]), device=x.device, dtype=torch.bfloat16)
 
 
 @torch.library.custom_op("radiance::paroquant_linear_pre", mutates_args=())
 def paroquant_linear_pre(hs: torch.Tensor, a: torch.Tensor, asg: torch.Tensor, rs: torch.Tensor,
                          qweight: torch.Tensor, sz: torch.Tensor, rec: torch.Tensor,
-                         cs: torch.Tensor, pb1: int, pb2: int) -> torch.Tensor:
+                         cs: torch.Tensor, pb1: int, pb2: int,
+                         whi: torch.Tensor | None = None, zsh: torch.Tensor | None = None,
+                     rec3: torch.Tensor | None = None, rinit: torch.Tensor | None = None) -> torch.Tensor:
     """Linear on the rotation-stream tuple: (A, ASG, RS) from pq_add_rms_rot in the decode band,
     hs (bf16) for the prefill path above it."""
     K = qweight.shape[1] * PACK
-    out = _linear_impl(hs.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, pre=(a, asg, rs))
+    out = _linear_impl(hs.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, pre=(a, asg, rs), whi=whi, zsh=zsh, rec3=rec3, rinit=rinit)
     return out.view(*hs.shape[:-1], qweight.shape[0])
 
 
 @paroquant_linear_pre.register_fake
-def _(hs, a, asg, rs, qweight, sz, rec, cs, pb1, pb2):
+def _(hs, a, asg, rs, qweight, sz, rec, cs, pb1, pb2, whi=None, zsh=None, rec3=None, rinit=None):
     return torch.empty((*hs.shape[:-1], qweight.shape[0]), device=hs.device, dtype=torch.bfloat16)
 
 
@@ -300,7 +375,7 @@ def pq_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
     _ext.launch_add_rms_rot(y2.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                             rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
                             a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
-                            1 if fused else 0, torch.cuda.current_stream().cuda_stream)
+                            1 if fused else 0, torch.cuda.current_stream().cuda_stream, I8_FLAG)
     return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
 
 
@@ -345,7 +420,7 @@ def pq_ew_rot(mode: int, x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, eps:
     _ext.launch_ew_rot(mode, x2.data_ptr(), y2.data_ptr(), ys, w.data_ptr(), float(eps),
                        rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), a.data_ptr(),
                        asg.data_ptr(), rs.data_ptr(), M, N, rec.shape[1], 1 if fused else 0,
-                       torch.cuda.current_stream().cuda_stream)
+                       torch.cuda.current_stream().cuda_stream, I8_FLAG)
     return hs, a, asg, rs
 
 
@@ -495,7 +570,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
                                    weight.data_ptr(), float(eps), rec.data_ptr(), cs.data_ptr(),
                                    hs.data_ptr(), ro.data_ptr(), a.data_ptr(), asg.data_ptr(),
                                    rs.data_ptr(), M, K, P, rec.shape[1], _AR["drain"], _AR["acq"],
-                                   stream)
+                                   stream, I8_FLAG)
         if AR_CHECK and _AR.get("checks", 0) < AR_CHECK:
             # RADIANCE_PQ_AR_CHECK=N: for the first N decode-band calls also run the unfused
             # path (vLLM all-reduce + plain kernel) on the same inputs and report the divergence
@@ -508,7 +583,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
             _ext.launch_add_rms_rot(yr.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                                     rec.data_ptr(), cs.data_ptr(), hs2.data_ptr(), ro2.data_ptr(),
                                     a2.data_ptr(), asg2.data_ptr(), rs2.data_ptr(), M, K, P,
-                                    rec.shape[1], 1, stream)
+                                    rec.shape[1], 1, stream, I8_FLAG)
             torch.cuda.synchronize()
             rows_bad = int((ro != ro2).view(M, -1).any(dim=1).sum())
             sys.stderr.write(f"[radiance.paroquant] AR_CHECK call {_AR['checks']} M={M} K={K} P={P}: "
@@ -521,7 +596,7 @@ def pq_ar_add_rms_rot(y: torch.Tensor, residual: torch.Tensor, weight: torch.Ten
     _ext.launch_add_rms_rot(yr.data_ptr(), res.data_ptr(), weight.data_ptr(), float(eps),
                             rec.data_ptr(), cs.data_ptr(), hs.data_ptr(), ro.data_ptr(),
                             a.data_ptr(), asg.data_ptr(), rs.data_ptr(), M, K, P, rec.shape[1],
-                            1 if M <= DECODE_MAX_M else 0, stream)
+                            1 if M <= DECODE_MAX_M else 0, stream, I8_FLAG)
     return hs.view(y.shape), ro.view(residual.shape), a, asg, rs
 
 
@@ -782,8 +857,10 @@ class ParoQuantConfig(QuantizationConfig):
 
     def __init__(self, bits: int, group_size: int, krot: int, fp16_patterns: list[str]):
         super().__init__()
-        if bits != 4:
-            raise ValueError(f"radiance paroquant kernel supports 4 bits only, got {bits}")
+        if bits not in (4, 5):
+            raise ValueError(f"radiance paroquant kernel supports 4 or 5 bits, got {bits}")
+        if bits == 5 and not WPERM:
+            raise ValueError("paroquant int5 needs the fragment-order weight layout (RADIANCE_PQ_WPERM=1)")
         if group_size != GROUP:
             raise ValueError(f"radiance paroquant kernel is built for group_size={GROUP}, got "
                              f"{group_size}; the slab structure is aligned to the group.")
@@ -881,6 +958,19 @@ class ParoQuantLinearMethod(LinearMethodBase):
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("scales", scales)
         layer.register_parameter("qzeros", qzeros)
+        if self.quant_config.bits == 5:
+            # int5-bitplane: the fifth bit of every code / zero point, bit (n % 32) of int32 word
+            # n // 32 (packed along N like qweight, so vLLM's N-sharding and merging apply).
+            qweight_hi = PackedvLLMParameter(
+                data=torch.empty(input_size_per_partition, out_part // 32, dtype=torch.int32),
+                input_dim=0, output_dim=1, packed_dim=1, packed_factor=32,
+                weight_loader=weight_loader)
+            qzeros_hi = PackedvLLMParameter(
+                data=torch.empty(input_size_per_partition // g, out_part // 32, dtype=torch.int32),
+                input_dim=0, output_dim=1, packed_dim=1, packed_factor=32,
+                weight_loader=weight_loader)
+            layer.register_parameter("qweight_hi", qweight_hi)
+            layer.register_parameter("qzeros_hi", qzeros_hi)
 
         # Rotation params: one slot per output partition, loaded by shard id.
         for name, shape, dtype in [
@@ -908,8 +998,24 @@ class ParoQuantLinearMethod(LinearMethodBase):
             v = (t.unsqueeze(-1) >> shifts) & 0xF
             return v[..., inv].reshape(t.shape[0], -1).to(torch.uint8)
 
+        bits = self.quant_config.bits
+        zoff = float(1 << (bits - 1))          # the WMMA sees (c - 8) / (c - 16)
+
+        def unpack_bitplane(t):   # [R, C/32] int32 -> [R, C] uint8 (0/1), bit (c % 32) of word c // 32
+            shifts = torch.arange(0, 32, device=device, dtype=torch.int32)
+            return ((t.unsqueeze(-1) >> shifts) & 1).reshape(t.shape[0], -1).to(torch.uint8)
+
         # qweight -> kernel layout [N, K/8] u32 packed along K, low nibble = lowest k.
-        codes = unpack_awq(layer.qweight.data).t().contiguous()          # [N, K]
+        codes = unpack_awq(layer.qweight.data).t().contiguous()          # [N, K] low nibbles
+        whi = None
+        if bits == 5:
+            hi = unpack_bitplane(layer.qweight_hi.data).t().contiguous()  # [N, K] fifth bits
+            # fifth-bit plane [N, K/8] u8, bit i = code 8j+i, then fragment order: one byte per
+            # (n-tile, k-step, lane) in permute_w's slot order.
+            hb = (hi.reshape(N, K // 8, 8).to(torch.int32) << torch.arange(8, device=device, dtype=torch.int32)).sum(-1).to(torch.uint8)
+            nt, ks = N // 16, K // 16
+            whi = (hb.view(nt, 16, ks, 2, 1).permute(0, 2, 3, 1, 4).contiguous().view(N, K // 8))
+            del hi, hb
         cw = codes.reshape(N, K // PACK, PACK).to(torch.int64)
         shifts = torch.arange(0, 32, 4, device=device, dtype=torch.int64)
         packed = (cw << shifts).sum(dim=-1)                              # exact: disjoint nibbles
@@ -923,10 +1029,12 @@ class ParoQuantLinearMethod(LinearMethodBase):
 
         # scales + zeros -> interleaved SZ [G, N, 2] f16 {scale, scale*(zp-8)}.
         zeros = unpack_awq(layer.qzeros.data).to(torch.float32)          # [G, N]
+        if bits == 5:
+            zeros = zeros + unpack_bitplane(layer.qzeros_hi.data).to(torch.float32) * 16.0
         sc = layer.scales.data.to(torch.float32)                         # [G, N]
         sz = torch.empty((G, N, 2), dtype=torch.float16, device=device)
         sz[..., 0] = sc.to(torch.float16)
-        sz[..., 1] = (sc * (zeros - 8.0)).to(torch.float16)
+        sz[..., 1] = (sc * (zeros - zoff)).to(torch.float16)
 
         # Collapse consecutive vLLM partitions that share one rotation (in_proj_qkvz: q,k,v all
         # carry the in_proj_qkv rotation) into runs; the GEMM selects per DISTINCT rotation.
@@ -972,9 +1080,28 @@ class ParoQuantLinearMethod(LinearMethodBase):
 
         del layer.qweight, layer.scales, layer.qzeros, layer.theta, layer.pairs
         del layer.channel_scales
+        if bits == 5:
+            del layer.qweight_hi, layer.qzeros_hi
+            layer.whi = torch.nn.Parameter(whi, requires_grad=False)
         layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
         layer.sz = torch.nn.Parameter(sz.contiguous(), requires_grad=False)
+        if ZPE:
+            Gp = (G + 15) & ~15
+            zsh = torch.zeros((N, Gp), dtype=torch.float16, device=device)
+            zsh[:, :G] = sz[..., 1].t()
+            layer.zsh = torch.nn.Parameter(zsh.contiguous(), requires_grad=False)
         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
+        if PG and PG_PRODUCER == 3:
+            # conflict-free producer tables: built on the CPU from the pair records (Euler-split
+            # matchings per (partition, group, layer)); ~ms per linear
+            rec_cpu = rec.contiguous().cpu()
+            r3 = torch.zeros_like(rec_cpu)
+            rinit = torch.zeros((P, G, 32, 4), dtype=torch.int16)
+            bad = _ext.build_rot3(rec_cpu.data_ptr(), P, krot, K, r3.data_ptr(), rinit.data_ptr())
+            if bad:
+                raise RuntimeError(f"paroquant: {bad} rotation tables failed to decompose (pairs not a matching?)")
+            layer.rec3 = torch.nn.Parameter(r3.to(device), requires_grad=False)
+            layer.rinit = torch.nn.Parameter(rinit.to(device), requires_grad=False)
         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
 
     # rotation stream: this method's producers build the per-GROUP tuple its GEMM consumes
@@ -996,17 +1123,25 @@ class ParoQuantLinearMethod(LinearMethodBase):
             hs, a, asg, rs = x
             out = torch.ops.radiance.paroquant_linear_pre(hs, a, asg, rs, layer.qweight,
                                                           layer.sz, layer.rec, layer.cs,
-                                                          layer.pq_pb1, layer.pq_pb2)
+                                                          layer.pq_pb1, layer.pq_pb2,
+                                                          getattr(layer, "whi", None),
+                                                          getattr(layer, "zsh", None),
+                                                      getattr(layer, "rec3", None),
+                                                      getattr(layer, "rinit", None))
         else:
             out = torch.ops.radiance.paroquant_linear(x, layer.qweight, layer.sz, layer.rec,
-                                                      layer.cs, layer.pq_pb1, layer.pq_pb2)
+                                                      layer.cs, layer.pq_pb1, layer.pq_pb2,
+                                                      getattr(layer, "whi", None),
+                                                      getattr(layer, "zsh", None),
+                                                      getattr(layer, "rec3", None),
+                                                      getattr(layer, "rinit", None))
         if bias is not None:
             out = out + bias
         return out
 
 
 if os.environ.get("RADIANCE_PAROQUANT", "0") == "1":
-    sys.stderr.write("[radiance.paroquant] registered (int4 g128 asym + rotations, W4A8, "
+    sys.stderr.write(f"[radiance.paroquant] registered (int4/int5 g128 asym + rotations, W{{4,5}}A8-{'int8' if I8 else 'e4m3'}, "
                      f"gfx1201; weight layout {'FRAGMENT ORDER' if WPERM else 'row'}, "
                      f"prefill {'A-tiled' if ATILED_ENABLED else 'row'}, decode band M<="
                      f"{DECODE_MAX_M}, rot stream {'on' if ROT_STREAM else 'off'})\n")
