@@ -92,6 +92,13 @@ I8_FLAG = 1 if I8 else 0
 # PG: per-GROUP activation scales above the decode band too, on the A-tiled band (pq_rotate_groupquant
 # producer + pq_int4_fp8_gemm_atiled<PG>). Without ATILED it falls back to the row-major per-group path.
 PG = os.environ.get("RADIANCE_PQ_PG", "0") == "1"
+# PG producer form above the decode band: 3 = conflict-free ownership-layout kernel (default; the
+# Givens chain in LDS is bank-conflict-bound with the checkpoint's random pairs, this one is ~2x),
+# 2 = pass-A kernel with records resident, 1 = one workgroup per row. All byte-exact to each other.
+PG_PRODUCER = int(os.environ.get("RADIANCE_PQ_PG_PRODUCER", "3"))
+# ZPE: the zero-point correction as an fp16 WMMA epilogue on the A-tiled band (rank-G product of the row-sum
+# fragments and the zero-scales) instead of one FMA per element per group in the loop.
+ZPE = os.environ.get("RADIANCE_PQ_ZPE", "0") == "1"
 # Weight layout: fragment order (one 32-lane u32 slot per (n-tile, k-step)) rather than the
 # loader's [N, K/8]. The kernels read RADIANCE_PQ_WPERM themselves; this flag and theirs MUST
 # agree or the weight is read as garbage. Fragment order is what makes the decode kernel's
@@ -204,7 +211,7 @@ def _exact_ref(a_codes, asg, rs, qweight, sz, N, K, pb1, pb2, as_tok=None, codes
     return out.to(torch.bfloat16)
 
 
-def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
+def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None, zsh=None, rec3=None, rinit=None):
     """The whole dispatch, opaque to dynamo. pre = (A, ASG, RS) already rotated+quantized by the
     fused norm producer (decode band only; ignored -- recomputed from x2 -- above the band)."""
     N, K = qweight.shape[0], qweight.shape[1] * PACK
@@ -239,8 +246,11 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
         # per-group scales on the tiled band: one fused launch (rotate + per-group quant + tiled write)
         Mt = (M + 15) // 16
         a_codes = torch.empty((P, Mt * 16 * K), device=x.device, dtype=torch.uint8)
+        use3 = PG_PRODUCER == 3 and rec3 is not None
         _ext.launch_rotate_groupquant(x2.data_ptr(), rec.data_ptr(), cs.data_ptr(), a_codes.data_ptr(),
-                                      asg.data_ptr(), rs.data_ptr(), M, K, P, krot, stream, 1, I8_FLAG)
+                                      asg.data_ptr(), rs.data_ptr(), M, K, P, krot, stream,
+                                      3 if use3 else min(PG_PRODUCER, 2), I8_FLAG,
+                                      rec3.data_ptr() if use3 else 0, rinit.data_ptr() if use3 else 0)
         gemm_scale = asg
     elif ptok:
         # Prefill: pass A (rotate -> bf16 scratch + per-group scales), pass C (token scale +
@@ -270,9 +280,17 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
                                  krot, 0, stream, I8_FLAG)
         gemm_scale = asg
     if tiled or pg_tiled:
+        zpe_on = ZPE and zsh is not None
+        rsh_p = 0
+        if zpe_on:
+            Mt, Gp = (M + 15) // 16, (G + 15) & ~15
+            rsh = torch.empty((P, Mt * Gp * 16), device=x.device, dtype=torch.float16)
+            _ext.launch_rs_to_rsh(rs.data_ptr(), rsh.data_ptr(), M, G, P, stream)
+            rsh_p = rsh.data_ptr()
         _ext.launch_gemm_at(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                             gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K,
-                            pb1, pb2, stream, whi_p, I8_FLAG, 1 if pg_tiled else 0)
+                            pb1, pb2, stream, whi_p, I8_FLAG, 1 if pg_tiled else 0,
+                            1 if zpe_on else 0, rsh_p, zsh.data_ptr() if zpe_on else 0)
     else:
         _ext.launch_gemm(a_codes.data_ptr(), qweight.data_ptr(), sz.data_ptr(),
                          gemm_scale.data_ptr(), rs.data_ptr(), out.data_ptr(), M, N, K, pb1,
@@ -300,16 +318,17 @@ def _linear_impl(x2, qweight, sz, rec, cs, pb1, pb2, pre=None, whi=None):
 @torch.library.custom_op("radiance::paroquant_linear", mutates_args=())
 def paroquant_linear(x: torch.Tensor, qweight: torch.Tensor, sz: torch.Tensor,
                      rec: torch.Tensor, cs: torch.Tensor, pb1: int, pb2: int,
-                     whi: torch.Tensor | None = None) -> torch.Tensor:
+                     whi: torch.Tensor | None = None, zsh: torch.Tensor | None = None,
+                     rec3: torch.Tensor | None = None, rinit: torch.Tensor | None = None) -> torch.Tensor:
     """Owns the whole dispatch so no shape branch is visible to dynamo (see the AutoRound module
     for why: a data-dependent M branch in apply() splits the compiled graph at every linear)."""
     K = qweight.shape[1] * PACK
-    out = _linear_impl(x.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, whi=whi)
+    out = _linear_impl(x.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, whi=whi, zsh=zsh, rec3=rec3, rinit=rinit)
     return out.view(*x.shape[:-1], qweight.shape[0])
 
 
 @paroquant_linear.register_fake
-def _(x, qweight, sz, rec, cs, pb1, pb2, whi=None):
+def _(x, qweight, sz, rec, cs, pb1, pb2, whi=None, zsh=None, rec3=None, rinit=None):
     return torch.empty((*x.shape[:-1], qweight.shape[0]), device=x.device, dtype=torch.bfloat16)
 
 
@@ -317,16 +336,17 @@ def _(x, qweight, sz, rec, cs, pb1, pb2, whi=None):
 def paroquant_linear_pre(hs: torch.Tensor, a: torch.Tensor, asg: torch.Tensor, rs: torch.Tensor,
                          qweight: torch.Tensor, sz: torch.Tensor, rec: torch.Tensor,
                          cs: torch.Tensor, pb1: int, pb2: int,
-                         whi: torch.Tensor | None = None) -> torch.Tensor:
+                         whi: torch.Tensor | None = None, zsh: torch.Tensor | None = None,
+                     rec3: torch.Tensor | None = None, rinit: torch.Tensor | None = None) -> torch.Tensor:
     """Linear on the rotation-stream tuple: (A, ASG, RS) from pq_add_rms_rot in the decode band,
     hs (bf16) for the prefill path above it."""
     K = qweight.shape[1] * PACK
-    out = _linear_impl(hs.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, pre=(a, asg, rs), whi=whi)
+    out = _linear_impl(hs.reshape(-1, K), qweight, sz, rec, cs, pb1, pb2, pre=(a, asg, rs), whi=whi, zsh=zsh, rec3=rec3, rinit=rinit)
     return out.view(*hs.shape[:-1], qweight.shape[0])
 
 
 @paroquant_linear_pre.register_fake
-def _(hs, a, asg, rs, qweight, sz, rec, cs, pb1, pb2, whi=None):
+def _(hs, a, asg, rs, qweight, sz, rec, cs, pb1, pb2, whi=None, zsh=None, rec3=None, rinit=None):
     return torch.empty((*hs.shape[:-1], qweight.shape[0]), device=hs.device, dtype=torch.bfloat16)
 
 
@@ -1065,7 +1085,23 @@ class ParoQuantLinearMethod(LinearMethodBase):
             layer.whi = torch.nn.Parameter(whi, requires_grad=False)
         layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
         layer.sz = torch.nn.Parameter(sz.contiguous(), requires_grad=False)
+        if ZPE:
+            Gp = (G + 15) & ~15
+            zsh = torch.zeros((N, Gp), dtype=torch.float16, device=device)
+            zsh[:, :G] = sz[..., 1].t()
+            layer.zsh = torch.nn.Parameter(zsh.contiguous(), requires_grad=False)
         layer.rec = torch.nn.Parameter(rec.contiguous(), requires_grad=False)
+        if PG and PG_PRODUCER == 3:
+            # conflict-free producer tables: built on the CPU from the pair records (Euler-split
+            # matchings per (partition, group, layer)); ~ms per linear
+            rec_cpu = rec.contiguous().cpu()
+            r3 = torch.zeros_like(rec_cpu)
+            rinit = torch.zeros((P, G, 32, 4), dtype=torch.int16)
+            bad = _ext.build_rot3(rec_cpu.data_ptr(), P, krot, K, r3.data_ptr(), rinit.data_ptr())
+            if bad:
+                raise RuntimeError(f"paroquant: {bad} rotation tables failed to decompose (pairs not a matching?)")
+            layer.rec3 = torch.nn.Parameter(r3.to(device), requires_grad=False)
+            layer.rinit = torch.nn.Parameter(rinit.to(device), requires_grad=False)
         layer.cs = torch.nn.Parameter(cs, requires_grad=False)
 
     # rotation stream: this method's producers build the per-GROUP tuple its GEMM consumes
@@ -1088,11 +1124,17 @@ class ParoQuantLinearMethod(LinearMethodBase):
             out = torch.ops.radiance.paroquant_linear_pre(hs, a, asg, rs, layer.qweight,
                                                           layer.sz, layer.rec, layer.cs,
                                                           layer.pq_pb1, layer.pq_pb2,
-                                                          getattr(layer, "whi", None))
+                                                          getattr(layer, "whi", None),
+                                                          getattr(layer, "zsh", None),
+                                                      getattr(layer, "rec3", None),
+                                                      getattr(layer, "rinit", None))
         else:
             out = torch.ops.radiance.paroquant_linear(x, layer.qweight, layer.sz, layer.rec,
                                                       layer.cs, layer.pq_pb1, layer.pq_pb2,
-                                                      getattr(layer, "whi", None))
+                                                      getattr(layer, "whi", None),
+                                                      getattr(layer, "zsh", None),
+                                                      getattr(layer, "rec3", None),
+                                                      getattr(layer, "rinit", None))
         if bias is not None:
             out = out + bias
         return out

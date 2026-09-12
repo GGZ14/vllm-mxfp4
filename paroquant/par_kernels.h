@@ -51,6 +51,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <vector>
+#include <algorithm>
 
 typedef float floatx8 __attribute__((ext_vector_type(8)));
 typedef int intx8 __attribute__((ext_vector_type(8)));
@@ -116,8 +118,12 @@ __device__ __forceinline__ unsigned int ar_lut5(unsigned int c4) {   // four 5-b
   return (hi & m4) | (lo & ~m4);
 }
 // hb holds the eight fifth bits of a word's codes (bit i <-> nibble i, i.e. k = base + i).
-__device__ __forceinline__ unsigned int pq_spread4(unsigned int x) {   // bits 0,2,4,6 -> bit 4 of bytes 0..3
-  return ((x & 1u) << 4) | ((x & 4u) << 10) | ((x & 16u) << 16) | ((x & 64u) << 22);
+// bits 0,2,4,6 -> bit 4 of bytes 0..3: one 24-bit multiply lands copies of the masked byte at shifts
+// 4/10/16/22 (bit 2j -> 4 + 8j); the only cross-copy collisions are at bits 10/16/22, whose carries stop
+// one bit later, so the masked positions 4/12/20/28 are clean. 3 VALU instead of 11 (harness i8 probe
+// checks every (word, plane) pattern against the shift form).
+__device__ __forceinline__ unsigned int pq_spread4(unsigned int x) {
+  return __umul24(x & 0x55u, 0x00410410u) & 0x10101010u;
 }
 __device__ __forceinline__ uint2_t ar_unpack8_5(unsigned int wv, unsigned int hb) {
   const unsigned int be = ar_lut5((wv & 0x0F0F0F0Fu) | pq_spread4(hb));               // k = 0,2,4,6
@@ -132,15 +138,17 @@ __device__ __forceinline__ uint2_t ar_unpack8_5(unsigned int wv, unsigned int hb
 // The fold algebra is unchanged: SZ still carries {sc, sc*(zp - 2^(BITS-1))} and RS the (scaled)
 // row-sum, only now RS is a sum of integers. The slab product accumulates in int32 (|a| <= 127,
 // |w| <= 16, 128 k: < 2^18) and is converted to float once per fold.
+// four codes (one per byte, 0..2^BITS-1) -> four int8 (c - 2^(BITS-1)): flipping the top code bit gives
+// the offset value with that bit as the sign, and the sign bits times (256 - 2^BITS) / 2^(BITS-1)
+// (= 14 for 5-bit, 30 for 4-bit; no cross-byte carry, each byte product is < 256) fill the upper bits.
+// The multiply is written as shifts: a 24-bit multiply would drop the byte-3 sign bit (bit 28) and
+// v_mul_lo_u32 is not full rate. 6 VALU instead of 7, no v_perm.
 template <int BITS>
-__device__ __forceinline__ unsigned int pq_i8_codes4(unsigned int c4) {   // four codes -> four int8
-  if constexpr (BITS == 5) {
-    const unsigned int m = __builtin_amdgcn_perm(0u, 0x0000FF00u, ((c4 & 0x10101010u) ^ 0x10101010u) >> 4);
-    return (c4 & 0x0F0F0F0Fu) | (m & 0xF0F0F0F0u);        // c - 16
-  } else {
-    const unsigned int m = __builtin_amdgcn_perm(0u, 0x0000FF00u, ((c4 & 0x08080808u) ^ 0x08080808u) >> 3);
-    return (c4 & 0x07070707u) | (m & 0xF8F8F8F8u);        // c - 8
-  }
+__device__ __forceinline__ unsigned int pq_i8_codes4(unsigned int c4) {
+  constexpr unsigned int top = BITS == 5 ? 0x10101010u : 0x08080808u;
+  constexpr int hi = BITS == 5 ? 4 : 5;                   // 14 = 16 - 2, 30 = 32 - 2
+  const unsigned int y = c4 ^ top, t = y & top;
+  return y | ((t << hi) - (t << 1));
 }
 template <int BITS>
 __device__ __forceinline__ uint2_t ar_unpack8_i8(unsigned int wv, unsigned int hb) {
@@ -432,6 +440,13 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant(
   }
 }
 
+// Fragment-tiled A ([P][Mt][kstep][half][row16][8 B], what pq_token_quant_tiled writes and the
+// A-tiled GEMMs read): byte offset of element k of row m within the partition's tiled slab.
+__host__ __device__ __forceinline__ size_t pq_tiled_off(int m, int k, int K) {
+  const int ks = k >> 4, kk = k & 15;
+  return (size_t)(m >> 4) * (K / 16) * 256 + (size_t)ks * 256 + (size_t)(((kk >> 3) * 16 + (m & 15)) * 8) + (kk & 7);
+}
+
 // v2 of the prologue, same contract. The records of this lane's two pairs per layer live in
 // REGISTERS (16 x u64, loaded straight from global with the token's x and the channel scales in
 // the same latency window), so there is no record LDS fill, no __syncthreads, and a rotation
@@ -439,17 +454,25 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant(
 // latency chain (40 x P blocks on 64 CUs), so the two removed round trips are the win; at
 // prefill the LDS op count is the win. Arithmetic is identical (same fmaf on the same disjoint
 // pairs) -> bit-exact against v1, gated in par_harness.
-template <bool ROTOUT = false, bool I8 = false>
+// TILED: A in the A-tiled band's fragment layout ([P, Mt*16, K], pq_tiled_off) -- the per-group
+// prefill producer. NR: rows per wave carried through the layers together, one s_waitcnt per layer
+// for all of them -- the producer is the LDS latency chain, not bytes (M=2048 qkv: 500 us = 190 GB/s
+// with NR=1 whether the records are resident or re-read per row), so NR=4 hides three chains
+// behind the first. Per-row arithmetic and order are unchanged -> byte-exact against NR=1 (harness pg).
+template <bool ROTOUT = false, bool I8 = false, bool TILED = false, int NR = 1>
 __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
     const __bf16 *__restrict__ X, const unsigned short *__restrict__ T,
     const __half *__restrict__ CS, unsigned char *__restrict__ A, float *__restrict__ ASG,
     float *__restrict__ RS, int M, int K, int krot) {
+  static_assert(!(ROTOUT && TILED), "tiled output is the quantized layout");
+  static_assert(NR == 1 || !ROTOUT, "interleaved rows are the quantized path");
   const int g = blockIdx.x, p = blockIdx.z;
   const int G = K / PQ_GROUP;
+  const int Mt = (M + 15) >> 4;
   const int m_lo = blockIdx.y * PQ_ROT_TCHUNK;
   const int m_hi = min(M, m_lo + PQ_ROT_TCHUNK);
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-  __shared__ float s_x[PQ_ROT_WAVES][PQ_GROUP];
+  __shared__ float s_x[PQ_ROT_WAVES][NR][PQ_GROUP];
   const int c0 = lane * 4;
 
   // This lane's pairs: t = lane and lane + 32 of every layer. Layers past krot are clamped to
@@ -469,12 +492,21 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
   const float cs2 = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
   const float cs3 = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
 
-  for (int m = m_lo + wave; m < m_hi; m += PQ_ROT_TPB) {
-    const uint2_t xv = *(const uint2_t *)(X + (size_t)m * K + (size_t)g * PQ_GROUP + c0);
-    float v0 = __uint_as_float(xv[0] << 16) * cs0, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * cs1;
-    float v2 = __uint_as_float(xv[1] << 16) * cs2, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * cs3;
-    s_x[wave][c0 + 0] = v0; s_x[wave][c0 + 1] = v1;
-    s_x[wave][c0 + 2] = v2; s_x[wave][c0 + 3] = v3;
+  for (int m = m_lo + wave; m < m_hi; m += PQ_ROT_TPB * NR) {
+    // the wave's NR rows: m, m + TPB, ... ; rows past the chunk clamp to the last real one (their
+    // stores then rewrite identical values -- clamp, never predicate)
+    int mr[NR];
+#pragma unroll
+    for (int q = 0; q < NR; ++q) { const int mm = m + q * PQ_ROT_TPB; mr[q] = mm < m_hi ? mm : m_hi - 1; }
+    float v0[NR], v1[NR], v2[NR], v3[NR];
+#pragma unroll
+    for (int q = 0; q < NR; ++q) {
+      const uint2_t xv = *(const uint2_t *)(X + (size_t)mr[q] * K + (size_t)g * PQ_GROUP + c0);
+      v0[q] = __uint_as_float(xv[0] << 16) * cs0; v1[q] = __uint_as_float(xv[0] & 0xFFFF0000u) * cs1;
+      v2[q] = __uint_as_float(xv[1] << 16) * cs2; v3[q] = __uint_as_float(xv[1] & 0xFFFF0000u) * cs3;
+      s_x[wave][q][c0 + 0] = v0[q]; s_x[wave][q][c0 + 1] = v1[q];
+      s_x[wave][q][c0 + 2] = v2[q]; s_x[wave][q][c0 + 3] = v3[q];
+    }
     __asm__ volatile("s_waitcnt lgkmcnt(0)");
 
 #pragma unroll
@@ -487,42 +519,289 @@ __global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant2(
           const float c = __half2float(__ushort_as_half((unsigned short)((rv >> 16) & 0xFFFFu)));
           const float sn = __half2float(__ushort_as_half((unsigned short)((rv >> 32) & 0xFFFFu)));
           const int i = ij & 0xFF, j = ij >> 8;
-          const float xi = s_x[wave][i], xj = s_x[wave][j];
-          s_x[wave][i] = fmaf(c, xi, sn * xj);
-          s_x[wave][j] = fmaf(c, xj, -sn * xi);
+          float xi[NR], xj[NR];
+#pragma unroll
+          for (int q = 0; q < NR; ++q) { xi[q] = s_x[wave][q][i]; xj[q] = s_x[wave][q][j]; }
+#pragma unroll
+          for (int q = 0; q < NR; ++q) {
+            s_x[wave][q][i] = fmaf(c, xi[q], sn * xj[q]);
+            s_x[wave][q][j] = fmaf(c, xj[q], -sn * xi[q]);
+          }
         }
         __asm__ volatile("s_waitcnt lgkmcnt(0)");
       }
     }
 
-    v0 = s_x[wave][c0 + 0]; v1 = s_x[wave][c0 + 1];
-    v2 = s_x[wave][c0 + 2]; v3 = s_x[wave][c0 + 3];
-    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
 #pragma unroll
-    for (int off = 16; off >= 1; off >>= 1)
-      amax = fmaxf(amax, __shfl_xor(amax, off, 32));
-    const float scale = pq_qscale<I8>(amax);
-    const float inv = 1.f / scale;
+    for (int q = 0; q < NR; ++q) {
+      v0[q] = s_x[wave][q][c0 + 0]; v1[q] = s_x[wave][q][c0 + 1];
+      v2[q] = s_x[wave][q][c0 + 2]; v3[q] = s_x[wave][q][c0 + 3];
+    }
+#pragma unroll
+    for (int q = 0; q < NR; ++q) {
+      const int mq = mr[q];
+      float amax = fmaxf(fmaxf(fabsf(v0[q]), fabsf(v1[q])), fmaxf(fabsf(v2[q]), fabsf(v3[q])));
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+      const float scale = pq_qscale<I8>(amax);
+      const float inv = 1.f / scale;
 
-    if constexpr (ROTOUT) {
-      __bf16 *xr = (__bf16 *)A + ((size_t)p * M + m) * K + (size_t)g * PQ_GROUP + c0;
-      xr[0] = (__bf16)v0; xr[1] = (__bf16)v1; xr[2] = (__bf16)v2; xr[3] = (__bf16)v3;
-      if (lane == 0) ASG[((size_t)p * M + m) * G + g] = scale;
-      continue;
+      if constexpr (ROTOUT) {
+        __bf16 *xr = (__bf16 *)A + ((size_t)p * M + mq) * K + (size_t)g * PQ_GROUP + c0;
+        xr[0] = (__bf16)v0[q]; xr[1] = (__bf16)v1[q]; xr[2] = (__bf16)v2[q]; xr[3] = (__bf16)v3[q];
+        if (lane == 0) ASG[((size_t)p * M + mq) * G + g] = scale;
+        continue;
+      }
+
+      float rs = 0.f;
+      const unsigned char b0 = pq_qenc<I8>(v0[q] * inv, rs), b1 = pq_qenc<I8>(v1[q] * inv, rs);
+      const unsigned char b2 = pq_qenc<I8>(v2[q] * inv, rs), b3 = pq_qenc<I8>(v3[q] * inv, rs);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1)
+        rs += __shfl_xor(rs, off, 32);
+      const unsigned int packed = (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) |
+                                  ((unsigned int)b3 << 24);
+      if constexpr (TILED)
+        *(unsigned int *)(A + (size_t)p * Mt * 16 * K + pq_tiled_off(mq, g * PQ_GROUP + c0, K)) = packed;
+      else
+        *(unsigned int *)(A + ((size_t)p * M + mq) * K + (size_t)g * PQ_GROUP + c0) = packed;
+      if (lane == 0) {
+        ASG[((size_t)p * M + mq) * G + g] = scale;
+        RS[((size_t)p * M + mq) * G + g] = rs * scale;
+      }
+    }
+  }
+}
+
+// ---------------------------------------- conflict-free rotation producer (pq_rotate_quant3)
+//
+// The prefill producer is LDS-bank-conflict-bound: with the checkpoint's random Givens pairs a
+// layer's 4 reads + 4 writes per lane hit random banks (~3 cycles each), and the same kernel on a
+// bank-friendly pairing runs 2.2x faster (harness pg "LDS probe", M=2048 qkv: 478 -> 222 us).
+// quant3 keeps the row in a per-layer OWNERSHIP layout: in layer r the lane's two pairs sit at
+// slots {l, 32+l, 64+l, 96+l} (all bank l), so the 4 reads never conflict; the 4 writes go to the
+// NEXT layer's layout through four instructions whose destinations are a perfect matching of source
+// lanes onto destination lanes (a 4-regular bipartite multigraph always splits into 4 perfect
+// matchings -- Euler-tour split, done once at load), so they never conflict either. The fma
+// expressions and their order per pair are pq_rotate_quant2's, so the codes are byte-exact.
+//
+// Records R3 [P, krot, K/2, 4] u16 per pair t: {cos, sin, e_q, e_q'} where the pair t = l (< 32)
+// carries the lane's write entries for instructions q = 0, 1 and pair t = l + 32 those for q = 2, 3;
+// an entry is (src << 7) | addr with src in {0: i of pair 0, 1: j of pair 0, 2: i of pair 1,
+// 3: j of pair 1} and addr the slot in the next layout (the last layer's next layout is channel
+// order). INIT [P, G, 32, 4] u16 maps the lane's 4 contiguous channels into layer 0's layout the
+// same way (src = 0..3 = channel c0 + src).
+namespace pq_rot3 {
+struct Edge { int src, dst, k, addr; };
+// Split a 2d-regular bipartite multigraph (src nodes 0..31, dst nodes 0..31) into two d-regular
+// halves by alternating edges along Euler circuits.
+static inline void euler_split(const std::vector<Edge> &E, std::vector<Edge> &A, std::vector<Edge> &B) {
+  const int NN = 64;                        // src l -> node l, dst l -> node 32 + l
+  std::vector<std::vector<int>> adj(NN);
+  for (int e = 0; e < (int)E.size(); ++e) { adj[E[e].src].push_back(e); adj[32 + E[e].dst].push_back(e); }
+  std::vector<char> used(E.size(), 0);
+  std::vector<int> pos(NN, 0);
+  for (int start = 0; start < NN; ++start) {
+    if (pos[start] >= (int)adj[start].size()) continue;
+    // Hierholzer: circuit as a sequence of edge ids
+    std::vector<int> stack_v{start}, stack_e{-1}, circuit;
+    while (!stack_v.empty()) {
+      const int v = stack_v.back();
+      bool advanced = false;
+      while (pos[v] < (int)adj[v].size()) {
+        const int e = adj[v][pos[v]++];
+        if (used[e]) continue;
+        used[e] = 1;
+        const int w = (v < 32) ? 32 + E[e].dst : E[e].src;
+        stack_v.push_back(w); stack_e.push_back(e); advanced = true; break;
+      }
+      if (!advanced) { if (stack_e.back() >= 0) circuit.push_back(stack_e.back()); stack_v.pop_back(); stack_e.pop_back(); }
+    }
+    for (size_t i = 0; i < circuit.size(); ++i) ((i & 1) ? B : A).push_back(E[circuit[i]]);
+  }
+}
+// 4 perfect matchings of a 4-regular bipartite multigraph on 32 + 32 nodes; out[q][src] = edge
+static inline bool decompose4(const std::vector<Edge> &E, Edge (&out)[4][32]) {
+  std::vector<Edge> A, B, A0, A1, B0, B1;
+  euler_split(E, A, B); euler_split(A, A0, A1); euler_split(B, B0, B1);
+  const std::vector<Edge> *M[4] = {&A0, &A1, &B0, &B1};
+  for (int q = 0; q < 4; ++q) {
+    if (M[q]->size() != 32) return false;
+    int seen_s = 0, seen_d = 0;
+    for (const Edge &e : *M[q]) { seen_s |= 1 << e.src; seen_d |= 1 << e.dst; out[q][e.src] = e; }
+    if (seen_s != -1 || seen_d != -1) return false;
+  }
+  return true;
+}
+}  // namespace pq_rot3
+
+// T [P, krot, K/2, 4] u16 {ij, cos, sin, -} (the pq_rotate_quant2 records) -> R3 (same shape) and
+// INIT [P, K/128, 32, 4] u16. Returns the number of (p, g, transition) tables that failed to
+// decompose (0 on success; a failure means the pair records were not a perfect matching).
+static inline int pq_build_rot3(const unsigned short *T, int P, int krot, int K,
+                                unsigned short *R3, unsigned short *INIT) {
+  const int G = K / 128, HK = K / 2;
+  int failures = 0;
+  std::vector<int> layout(129);                      // addr of channel c in the layout of layer r
+  std::vector<int> next(129);
+  for (int p = 0; p < P; ++p)
+    for (int g = 0; g < G; ++g) {
+      auto pair_ij = [&](int r, int t, int &i, int &j) {
+        const unsigned short ij = T[(((size_t)p * krot + r) * HK + (size_t)g * 64 + t) * 4 + 0];
+        i = ij & 0xFF; j = ij >> 8;
+      };
+      auto build_layout = [&](int r, std::vector<int> &L) {   // r == krot: channel order
+        if (r == krot) { for (int c = 0; c < 128; ++c) L[c] = c; return; }
+        for (int l = 0; l < 32; ++l) {
+          int i0, j0, i1, j1; pair_ij(r, l, i0, j0); pair_ij(r, l + 32, i1, j1);
+          L[i0] = l; L[j0] = 32 + l; L[i1] = 64 + l; L[j1] = 96 + l;
+        }
+      };
+      for (int r = -1; r < krot; ++r) {                // transition r -> r + 1 (r = -1: init)
+        build_layout(r + 1, next);
+        std::vector<pq_rot3::Edge> E;
+        for (int l = 0; l < 32; ++l) {
+          int ch[4];
+          if (r < 0) { for (int k = 0; k < 4; ++k) ch[k] = 4 * l + k; }
+          else { int i0, j0, i1, j1; pair_ij(r, l, i0, j0); pair_ij(r, l + 32, i1, j1); ch[0] = i0; ch[1] = j0; ch[2] = i1; ch[3] = j1; }
+          for (int k = 0; k < 4; ++k) E.push_back({l, next[ch[k]] & 31, k, next[ch[k]]});
+        }
+        pq_rot3::Edge Mq[4][32];
+        if (!pq_rot3::decompose4(E, Mq)) { ++failures; continue; }
+        for (int l = 0; l < 32; ++l)
+          for (int q = 0; q < 4; ++q) {
+            const unsigned short e = (unsigned short)((Mq[q][l].k << 7) | Mq[q][l].addr);
+            if (r < 0) INIT[(((size_t)p * G + g) * 32 + l) * 4 + q] = e;
+            else {
+              const int t = (q < 2) ? l : l + 32;
+              const size_t base = (((size_t)p * krot + r) * HK + (size_t)g * 64 + t) * 4;
+              R3[base + 2 + (q & 1)] = e;
+            }
+          }
+      }
+      for (int r = 0; r < krot; ++r)
+        for (int t = 0; t < 64; ++t) {
+          const size_t base = (((size_t)p * krot + r) * HK + (size_t)g * 64 + t) * 4;
+          R3[base + 0] = T[base + 1]; R3[base + 1] = T[base + 2];
+        }
+    }
+  return failures;
+}
+
+// R3/INIT as above; X, CS, A, ASG, RS as pq_rotate_quant2 (TILED store, per-group scales + rowsum*asg).
+template <bool I8 = false, bool TILED = true, int NR = 1>
+__global__ __launch_bounds__(PQ_ROT_WAVES * 32) void pq_rotate_quant3(
+    const __bf16 *__restrict__ X, const unsigned short *__restrict__ R3,
+    const unsigned short *__restrict__ INIT, const __half *__restrict__ CS,
+    unsigned char *__restrict__ A, float *__restrict__ ASG, float *__restrict__ RS,
+    int M, int K, int krot) {
+  const int g = blockIdx.x, p = blockIdx.z;
+  const int G = K / PQ_GROUP;
+  const int Mt = (M + 15) >> 4;
+  const int m_lo = blockIdx.y * PQ_ROT_TCHUNK;
+  const int m_hi = min(M, m_lo + PQ_ROT_TCHUNK);
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  __shared__ float s_x[PQ_ROT_WAVES][NR][PQ_GROUP];
+  const int c0 = lane * 4;
+
+  const unsigned long long *__restrict__ Rb =
+      (const unsigned long long *)R3 + ((size_t)p * krot) * (K / 2) + (size_t)g * 64;
+  unsigned long long rec[PQ_KROT_MAX][2];
+#pragma unroll
+  for (int r = 0; r < PQ_KROT_MAX; ++r) {
+    const int rc = r < krot ? r : krot - 1;
+    rec[r][0] = Rb[(size_t)rc * (K / 2) + lane];
+    rec[r][1] = Rb[(size_t)rc * (K / 2) + lane + 32];
+  }
+  const unsigned long long init = ((const unsigned long long *)INIT)[((size_t)p * G + g) * 32 + lane];
+  const uint2_t csv = *(const uint2_t *)(CS + (size_t)p * K + (size_t)g * PQ_GROUP + c0);
+  const float cs0 = __half2float(__ushort_as_half((unsigned short)(csv[0] & 0xFFFFu)));
+  const float cs1 = __half2float(__ushort_as_half((unsigned short)(csv[0] >> 16)));
+  const float cs2 = __half2float(__ushort_as_half((unsigned short)(csv[1] & 0xFFFFu)));
+  const float cs3 = __half2float(__ushort_as_half((unsigned short)(csv[1] >> 16)));
+
+  auto sel4 = [](float a0, float a1, float a2, float a3, int k) -> float {
+    const float lo = (k & 1) ? a1 : a0, hi = (k & 1) ? a3 : a2;
+    return (k & 2) ? hi : lo;
+  };
+
+  for (int m = m_lo + wave; m < m_hi; m += PQ_ROT_TPB * NR) {
+    int mr[NR];
+#pragma unroll
+    for (int q = 0; q < NR; ++q) { const int mm = m + q * PQ_ROT_TPB; mr[q] = mm < m_hi ? mm : m_hi - 1; }
+    // channel order -> layer-0 layout (4 matched scatter writes)
+#pragma unroll
+    for (int q = 0; q < NR; ++q) {
+      const uint2_t xv = *(const uint2_t *)(X + (size_t)mr[q] * K + (size_t)g * PQ_GROUP + c0);
+      const float v0 = __uint_as_float(xv[0] << 16) * cs0, v1 = __uint_as_float(xv[0] & 0xFFFF0000u) * cs1;
+      const float v2 = __uint_as_float(xv[1] << 16) * cs2, v3 = __uint_as_float(xv[1] & 0xFFFF0000u) * cs3;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        const unsigned int e = (unsigned int)(init >> (16 * w)) & 0xFFFFu;
+        s_x[wave][q][e & 127u] = sel4(v0, v1, v2, v3, (int)(e >> 7));
+      }
+    }
+    __asm__ volatile("s_waitcnt lgkmcnt(0)");
+
+#pragma unroll
+    for (int r = 0; r < PQ_KROT_MAX; ++r) {
+      if (r < krot) {
+        const unsigned long long r0 = rec[r][0], r1 = rec[r][1];
+        const float ca = __half2float(__ushort_as_half((unsigned short)(r0 & 0xFFFFu)));
+        const float sa = __half2float(__ushort_as_half((unsigned short)((r0 >> 16) & 0xFFFFu)));
+        const float cb = __half2float(__ushort_as_half((unsigned short)(r1 & 0xFFFFu)));
+        const float sb = __half2float(__ushort_as_half((unsigned short)((r1 >> 16) & 0xFFFFu)));
+        const unsigned int e0 = (unsigned int)(r0 >> 32) & 0xFFFFu, e1 = (unsigned int)(r0 >> 48) & 0xFFFFu;
+        const unsigned int e2 = (unsigned int)(r1 >> 32) & 0xFFFFu, e3 = (unsigned int)(r1 >> 48) & 0xFFFFu;
+        float a0[NR], a1[NR], a2[NR], a3[NR];
+#pragma unroll
+        for (int q = 0; q < NR; ++q) {
+          a0[q] = s_x[wave][q][lane]; a1[q] = s_x[wave][q][32 + lane];
+          a2[q] = s_x[wave][q][64 + lane]; a3[q] = s_x[wave][q][96 + lane];
+        }
+#pragma unroll
+        for (int q = 0; q < NR; ++q) {
+          const float xi = a0[q], xj = a1[q], xk = a2[q], xl = a3[q];
+          const float y0 = fmaf(ca, xi, sa * xj), y1 = fmaf(ca, xj, -sa * xi);
+          const float y2 = fmaf(cb, xk, sb * xl), y3 = fmaf(cb, xl, -sb * xk);
+          s_x[wave][q][e0 & 127u] = sel4(y0, y1, y2, y3, (int)(e0 >> 7));
+          s_x[wave][q][e1 & 127u] = sel4(y0, y1, y2, y3, (int)(e1 >> 7));
+          s_x[wave][q][e2 & 127u] = sel4(y0, y1, y2, y3, (int)(e2 >> 7));
+          s_x[wave][q][e3 & 127u] = sel4(y0, y1, y2, y3, (int)(e3 >> 7));
+        }
+        __asm__ volatile("s_waitcnt lgkmcnt(0)");
+      }
     }
 
-    float rs = 0.f;
-    const unsigned char b0 = pq_qenc<I8>(v0 * inv, rs), b1 = pq_qenc<I8>(v1 * inv, rs);
-    const unsigned char b2 = pq_qenc<I8>(v2 * inv, rs), b3 = pq_qenc<I8>(v3 * inv, rs);
+    // the last layer wrote channel order
 #pragma unroll
-    for (int off = 16; off >= 1; off >>= 1)
-      rs += __shfl_xor(rs, off, 32);
-    *(unsigned int *)(A + ((size_t)p * M + m) * K + (size_t)g * PQ_GROUP + c0) =
-        (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) |
-        ((unsigned int)b3 << 24);
-    if (lane == 0) {
-      ASG[((size_t)p * M + m) * G + g] = scale;
-      RS[((size_t)p * M + m) * G + g] = rs * scale;
+    for (int q = 0; q < NR; ++q) {
+      const int mq = mr[q];
+      const float4 f = *(const float4 *)&s_x[wave][q][c0];
+      const float v0 = f.x, v1 = f.y, v2 = f.z, v3 = f.w;
+      float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+      const float scale = pq_qscale<I8>(amax);
+      const float inv = 1.f / scale;
+      float rs = 0.f;
+      const unsigned char b0 = pq_qenc<I8>(v0 * inv, rs), b1 = pq_qenc<I8>(v1 * inv, rs);
+      const unsigned char b2 = pq_qenc<I8>(v2 * inv, rs), b3 = pq_qenc<I8>(v3 * inv, rs);
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1)
+        rs += __shfl_xor(rs, off, 32);
+      const unsigned int packed = (unsigned int)b0 | ((unsigned int)b1 << 8) | ((unsigned int)b2 << 16) |
+                                  ((unsigned int)b3 << 24);
+      if constexpr (TILED)
+        *(unsigned int *)(A + (size_t)p * Mt * 16 * K + pq_tiled_off(mq, g * PQ_GROUP + c0, K)) = packed;
+      else
+        *(unsigned int *)(A + ((size_t)p * M + mq) * K + (size_t)g * PQ_GROUP + c0) = packed;
+      if (lane == 0) {
+        ASG[((size_t)p * M + mq) * G + g] = scale;
+        RS[((size_t)p * M + mq) * G + g] = rs * scale;
+      }
     }
   }
 }
@@ -809,12 +1088,6 @@ __device__ __forceinline__ void pq_tok_rotate_park(float (&nv)[4], const float (
   __asm__ volatile("s_waitcnt lgkmcnt(0)");           // s_x reuse across groups
 }
 
-// Fragment-tiled A ([P][Mt][kstep][half][row16][8 B], what pq_token_quant_tiled writes and the
-// A-tiled GEMMs read): byte offset of element k of row m within the partition's tiled slab.
-__host__ __device__ __forceinline__ size_t pq_tiled_off(int m, int k, int K) {
-  const int ks = k >> 4, kk = k & 15;
-  return (size_t)(m >> 4) * (K / 16) * 256 + (size_t)ks * 256 + (size_t)(((kk >> 3) * 16 + (m & 15)) * 8) + (kk & 7);
-}
 
 // Two groups per wave, chains interleaved: each rotation layer issues both groups' LDS
 // read/fma/write pairs before the one s_waitcnt, so the second chain's LDS latency hides behind
@@ -1014,6 +1287,22 @@ __global__ __launch_bounds__(W * 32) void pq_rotate_groupquant(
       RS[((size_t)p * M + m) * G + g] = rs * scale;
     }
     __asm__ volatile("s_waitcnt lgkmcnt(0)");
+  }
+}
+
+// ZPE operand: RS [P, M, G] f32 -> RSH fp16 in WMMA fragment order [P][Mt][Gp/16][32 lanes x 8]
+// (Gp = G rounded up to 16, pads and rows >= M zero), the layout par_harness::build_rsh defines.
+// One thread per (p, mt, gs, lane, b) output element; reads are strided but the tensor is tiny.
+__global__ void pq_rs_to_rsh(const float *__restrict__ RS, __half *__restrict__ RSH, int M, int G, int P) {
+  const int Mt = (M + 15) >> 4, Gp = (G + 15) & ~15, gsteps = Gp / 16;
+  const size_t total = (size_t)P * Mt * gsteps * 256;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
+    const int b = (int)(i & 7), lane = (int)((i >> 3) & 31);
+    const size_t tile = i >> 8;                                   // (p * Mt + mt) * gsteps + gs
+    const int gs = (int)(tile % gsteps), mt = (int)((tile / gsteps) % Mt), p = (int)(tile / gsteps / Mt);
+    const int m = mt * 16 + (lane & 15), g = gs * 16 + (lane >> 4) * 8 + b;
+    const float v = (m < M && g < G) ? RS[((size_t)p * M + m) * G + g] : 0.f;
+    RSH[i] = __float2half(v);
   }
 }
 
@@ -1928,7 +2217,7 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
       }
       const int r = tid;
       const int rc = (m0 + r) < M ? (m0 + r) : (M > 0 ? M - 1 : 0);
-      s_rs[r] = RS[(size_t)rc * G + g];
+      if constexpr (!(ABL & 4) || (ABL & 8)) s_rs[r] = RS[(size_t)rc * G + g];   // ZPE: row-sums live in RSH
       if constexpr (PG) s_asg[r] = AS[(size_t)rc * G + g];
     }
     pq_stage_w<BNF_T, LBK, LWSTR, AR_NTHREADS, WPERM, false, 0, WSLOT_OVR, BITS, I8>(sW, W, n0, N, K, k0,
@@ -2027,33 +2316,42 @@ __global__ __launch_bounds__(AR_NTHREADS) void pq_int4_fp8_gemm_atiled(
     const int Gp = (G + 15) & ~15;
     const int gsteps = Gp / 16;
     typedef _Float16 halfx8 __attribute__((ext_vector_type(8)));
-    __half *sZ = (__half *)sW;                          // BNF_T * Gp halfs <= sW bytes for Gp <= 64
-    {
-      const int nz = BNF_T * Gp / 8;                    // 16-byte units
-      for (int u = tid; u < nz; u += AR_NTHREADS) {
-        const int r = u / (Gp / 8), c8 = u % (Gp / 8);
-        const int gn = n0 + r, gc = gn < N ? gn : N - 1;
-        *(uint4_t *)(sZ + (size_t)r * Gp + c8 * 8) = *(const uint4_t *)(ZSH + (size_t)gc * Gp + c8 * 8);
-      }
-    }
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < AR_TM; ++i) {
-      int mt = (m0 >> 4) + wm * AR_TM + i; mt = mt < Mt - 1 ? mt : Mt - 1;
-      const __half *rbase = RSH + (size_t)prt * Mt * Gp * 16 + (size_t)mt * gsteps * 256;
-#pragma unroll
-      for (int j = 0; j < TN; ++j) {
-        floatx8 corr;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) corr[e] = 0.f;
-        const __half *zrow = sZ + (size_t)(wn * TN * 16 + j * 16 + col) * Gp + kb8;
-        for (int gs = 0; gs < gsteps; ++gs) {
-          const halfx8 ra = *(const halfx8 *)(rbase + (size_t)gs * 256 + lane * 8);
-          const halfx8 zb = *(const halfx8 *)(zrow + gs * 16);
-          corr = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ra, zb, corr);
+    // Zero-scales are staged in chunks of GCH groups (BNF_T * GCH halfs fits the dead sW slab
+    // for any LBK), so any G works -- down_proj at TP=2 is G=68.
+    constexpr int GCH = 64;
+    static_assert(BNF_T * GCH * 2 <= BNF_T * LWSTR, "zero-scale chunk must fit the W slab");
+    __half *sZ = (__half *)sW;
+    for (int gc0 = 0; gc0 < Gp; gc0 += GCH) {
+      const int gw = (Gp - gc0 < GCH) ? (Gp - gc0) : GCH;   // groups in this chunk (multiple of 16)
+      __syncthreads();                                       // previous chunk's readers are done
+      {
+        const int nz = BNF_T * gw / 8;                       // 16-byte units
+        for (int u = tid; u < nz; u += AR_NTHREADS) {
+          const int r = u / (gw / 8), c8 = u % (gw / 8);
+          const int gn = n0 + r, gc = gn < N ? gn : N - 1;
+          *(uint4_t *)(sZ + (size_t)r * GCH + c8 * 8) =
+              *(const uint4_t *)(ZSH + (size_t)gc * Gp + gc0 + c8 * 8);
         }
+      }
+      __syncthreads();
 #pragma unroll
-        for (int e = 0; e < 8; ++e) acc[i][j][e] -= corr[e];
+      for (int i = 0; i < AR_TM; ++i) {
+        int mt = (m0 >> 4) + wm * AR_TM + i; mt = mt < Mt - 1 ? mt : Mt - 1;
+        const __half *rbase = RSH + (size_t)prt * Mt * Gp * 16 + (size_t)mt * gsteps * 256;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          floatx8 corr;
+#pragma unroll
+          for (int e = 0; e < 8; ++e) corr[e] = 0.f;
+          const __half *zrow = sZ + (size_t)(wn * TN * 16 + j * 16 + col) * GCH + kb8;
+          for (int gs = gc0 / 16; gs < (gc0 + gw) / 16; ++gs) {
+            const halfx8 ra = *(const halfx8 *)(rbase + (size_t)gs * 256 + lane * 8);
+            const halfx8 zb = *(const halfx8 *)(zrow + (gs - gc0 / 16) * 16);
+            corr = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ra, zb, corr);
+          }
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][j][e] -= corr[e];
+        }
       }
     }
   }

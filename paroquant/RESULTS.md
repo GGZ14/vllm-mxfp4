@@ -823,3 +823,97 @@ expected in MXFP4's class; not run.
 fp16 group scale (int4 PARO vs MXFP4-PARO): -32% KL; fifth bit: 0.0285 -> 0.0155; fine-tune: -> 0.0126;
 per-group int8 activations: -> 0.0097. GSM8K identical within noise on every row (97.2-98.0). Decode
 25.9-26.3 for every int5 variant (weight stream), MXFP4-PARO / int4 PARO 23.3-23.5.
+
+## 2026-09-12: zero-point epilogue (ZPE) shipped on the A-tiled band -- prefill +6.5%, no pow2
+
+The epilogue form of the zero-point correction (ABL bit 4, until now an ablation) is a shipped band:
+`RADIANCE_PQ_ZPE=1` (cache suffix `-zpe`). The loop keeps only the scale fold (`fma(sc, asg*t, acc)`); the
+term `sum_g rs[m,g] * sc*(zp-16)[g,n]` becomes Gp/16 fp16 WMMAs per output tile in the epilogue, with RSH
+= fp16 row-sums in fragment order (`pq_rs_to_rsh`, one launch per GEMM, byte-exact against the harness
+builder at G = 5/40/68/136) and ZSH = `sz[..., 1]` as `layer.zsh` [N, Gp]. The zero-scales are staged into
+the dead W slab in 64-group chunks, so any G works (down_proj at TP=2 is G=68; the ablation was limited to
+64). The row-sum slab stage is skipped under ZPE. No pow2 anywhere: the fp16 group scales that carry the
+fidelity are untouched.
+
+Harness `zpe` (int5, e4m3/int8 x per-token/per-group, M=200/1024/2048; reference rel identical to the
+in-loop form at 1.66e-3 on every row):
+
+| shape | in-loop -> ZPE (M=2048, int8 per-group) | ratio |
+|---|---|---|
+| qkv | 965 -> 891 us | 0.923 |
+| o_proj | ~395 -> ~381 us | 0.96 |
+| (qkv, e4m3 per-token) | 880 -> 810 us | 0.920 |
+
+Served, fine-tuned int5, I8 PG, TP=2, SPEC=7, same-stack reference:
+
+| int5 FT I8 PG | KL wiki top-5 / top-256 | top-1 | ms/step @25/8k/32k | prefill 2k/8k/32k/64k | GSM8K | KV |
+|---|---|---|---|---|---|---|
+| in-loop | 0.0067 / 0.0097 | 95.2 | 26.01 / 27.35 / 28.16 | 3328 / 3214 / 3211 / 3077 | 97.20 | 767k |
+| **+ ZPE** | **0.0069 / 0.0099** | **95.25** | 25.73 / 27.74 / 28.09 | **3550 / 3427 / 3416 / 3267** | 96.80, 97.80 | 769k |
+
++6.2-6.7% prefill at every context, TTFT 10.6 -> 9.9 s at 33k, decode unchanged (the decode band has no
+epilogue), in-loop vs ZPE mutual KL 0.004 (the fp16 row-sum rounding; under the 0.005 noise line), GSM8K
+two samples 96.8 / 97.8 around the in-loop 97.2. KV: the first ZPE boot read 547k -- a FRESH compile cache
+costs ~1 GiB of non-torch memory on the profiling boot; the warm reboot reads 769k. Never judge KV on a
+first boot. This is the prod candidate's configuration: `RADIANCE_PQ_I8=1 RADIANCE_PQ_PG=1 RADIANCE_PQ_ZPE=1`.
+
+Remaining int5 prefill levers (queued): the fifth-bit staging unpack (the 5-bit band runs 1.04-1.15x the
+4-bit band in the same mode, gate_up worst) and emitting the tiled int8 activations straight from the
+norm/silu producers above the decode band (one bf16 round trip per linear). The per-group fold (9%) is the
+fidelity price and the zero-VALU loop needs pow2 scales (rejected) -- both closed.
+
+## 2026-09-12: fifth-bit staging unpack -- byte-exact, small; the rest of the 5-bit gap is bytes
+
+The 5-bit unpack cost 44 VALU per 8 codes on the int8 path (int4: 19): the bit-plane spread was 11 ops per
+word and the sign-extension 7. Now: the spread is one 24-bit multiply (`(x & 0x55) * 0x00410410`, copies at
+shifts 4/10/16/22 whose only collisions carry into unused bits) and the sign-extension an xor plus a shift
+pair (`y = c ^ top; y | ((y & top) << 4) - ((y & top) << 1)`) -- 20 ops. A first version used the 24-bit
+multiply for the sign-extension too, which drops bit 28 (byte 3's sign): the new mixed-pattern probe
+(4.2M random words x 3 paths vs the shift/select forms) caught it; both probes now report 0 mismatches.
+5-bit vs 4-bit band time (harness int5, e4m3, A-tiled M=1024): qkv 1.04 -> 1.01x, o_proj 1.08 -> 1.04x,
+gate_up 1.15 -> 1.11x, down 1.07x, in_proj 1.04 -> 1.02x; int8 bands unchanged. What remains is the
+weight stream: 5.25 bits/weight is 23% more bytes than 4.25 and gate_up at M=1024 is weight-stream-bound.
+Closed.
+
+## 2026-09-12: the per-group prefill producer is LDS-bank-conflict-bound -- conflict-free layout, 1.9x
+
+Measured first (harness `pg` producer bandwidth, M=2048): `pq_rotate_groupquant` (one workgroup per row,
+the PG producer) moves 96 MB in 524 us on the qkv shape = 184 GB/s, under 30% of DRAM, and costs more
+than half the GEMM it feeds (891 us at M=2048). Ruling out the usual suspects, each byte-exact:
+
+| producer form | qkv (K=5120, P=3) | down (K=8704, P=1) |
+|---|---|---|
+| one workgroup per row (records re-read per row) | 508-524 us | 277-285 |
+| pass A, records resident over 256 rows | 502 | 279 |
+| pass A + tiled store | 489 | 274 |
+| pass A tiled, NR=2 / 4 / 8 rows per wave interleaved | 473 / 470 / 471 | 272 / 271 / 275 |
+| **LDS probe: same kernel, bank-friendly pairs (t, t+64)** | **222** | **138** |
+| LDS probe: adjacent pairs (2t, 2t+1), 2-way conflicts | 347 | 215 |
+| **conflict-free ownership layout (`pq_rotate_quant3`)** | **254** | **149** |
+
+Records, layout and latency chains all land at ~480 us; only the pair indices move it. With the
+checkpoint's random Givens pairs a layer's 4 LDS reads + 4 writes per lane hit random banks (~3 cycles
+each); the LDS unit, not memory, sets the time. `pq_rotate_quant3` keeps the row in a per-layer
+OWNERSHIP layout (in layer r the lane's two pairs sit at slots {l, 32+l, 64+l, 96+l}, all bank l: reads
+never conflict) and writes each layer's outputs into the next layer's layout through four instructions
+whose destinations are a perfect matching of source lanes onto destination lanes (a 4-regular bipartite
+multigraph splits into 4 perfect matchings -- Euler-tour split, `pq_build_rot3` on the CPU at load, the
+two destination entries carried in the record words the channel indices used to occupy; the same for the
+initial channel-order -> layer-0 scatter, and the last layer writes channel order back). The fma
+expressions and their per-pair order are pq_rotate_quant2's: code-diff 0, scale-diff 0, rs-diff 0 vs pass
+A on e4m3 and int8, 0 table failures. 254 us = 385 GB/s. `RADIANCE_PQ_PG_PRODUCER=3` is the launcher
+default (2 = pass A tiled, 1 = per-row, all byte-exact).
+
+Served, fine-tuned int5, I8 PG ZPE, TP=2, SPEC=7, same-stack reference, warm cache:
+
+| int5 FT I8 PG | KL wiki top-5 / top-256 | top-1 | ms/step @25/8k/32k | prefill 2k/8k/32k/64k | GSM8K | KV |
+|---|---|---|---|---|---|---|
+| in-loop, per-row producer (09-11) | 0.0067 / 0.0097 | 95.2 | 26.01 / 27.35 / 28.16 | 3328 / 3214 / 3211 / 3077 | 97.20 | 765k |
+| + ZPE | 0.0069 / 0.0099 | 95.25 | 25.73 / 27.74 / 28.09 | 3550 / 3427 / 3416 / 3267 | 96.8, 97.8 | 769k |
+| **+ ZPE + conflict-free producer** | **0.0070 / 0.0100** | **95.21** | 25.90 / 27.46 / 28.19 | **3941 / 3790 / 3616 / 3436** | 97.40 | 760k |
+
+The two 09-12 changes together: prefill +18% at 2k / +18% at 8k / +13% at 32k / +12% at 64k (the producer
+is a fixed cost per token, the GEMM share grows with context), TTFT at 33k 10.6 -> 9.4 s, decode unchanged
+(the decode band uses neither), KL unchanged (producer1 vs producer3 mutual KL 0.0002 / top-1 99.8%: the
+serving floor for identical codes), GSM8K in band. The tables cost ~1.2% of KV (the decode-band producers
+still need the original records). Gap to MXFP4-PARO at 2k: 4770 vs 3941 = 17% (was 30%).

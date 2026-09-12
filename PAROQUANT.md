@@ -209,6 +209,10 @@ extendable with `RADIANCE_PQ_SKIP`.
 | `RADIANCE_PQ_ATILED` | `1` | A-tiled prefill GEMM |
 | `RADIANCE_PQ_AT_LBK` | `128` | A-tiled K blocking |
 | `RADIANCE_PQ_AT_HOIST` | `1` | Hoist the scale load out of the A-tiled inner loop |
+| `RADIANCE_PQ_I8` | `0` | int8 activations on the int8 WMMA (scale amax/127, integer row-sums); per-group with `PG`. Keys the cache (`-i8`) |
+| `RADIANCE_PQ_PG` | `0` | Per-group activation scales on the A-tiled prefill band (fused rotate + group-quant producer). The best-fidelity configuration with `I8`; costs ~9% prefill vs per-token. Keys the cache (`-pg`) |
+| `RADIANCE_PQ_ZPE` | `0` | Zero-point correction as a rank-G fp16 WMMA epilogue on the A-tiled band instead of one FMA per element per group in the loop: +6.5% prefill, numerics within rounding noise, any G. Keys the cache (`-zpe`) |
+| `RADIANCE_PQ_PG_PRODUCER` | `3` | Per-group prefill producer: `3` = conflict-free ownership-layout rotate+quant (the Givens chain in LDS is bank-conflict-bound with the checkpoint's random pairs; this one is 1.9x, +11% prefill at 2k), `2` = pass-A records-resident, `1` = one workgroup per row. All byte-exact |
 | `RADIANCE_PQ_PTOK` | `1` | Per-token activation scales above the decode band. `0` forces per-group everywhere: ~7% slower prefill, finer-grained fp8 (GSM8K 98.0 per-group vs 97.4 per-token — inside binomial noise) |
 | `RADIANCE_PQ_ROT_V2` | `1` | Register-resident rotation records. Bit-exact against v1 |
 | `RADIANCE_PQ_ROT_STREAM` | `1` | Fused add + RMSNorm + rotate + quant producers. **Changes the traced graph**, so it keys the cache directory (`-rs`) |
@@ -456,9 +460,17 @@ comparable. Wikitext, 96 x 500-char chunks, top-256 support:
 | int4 PARO | 0.029 | 91.5% | 23.5 | 3808 | 854k |
 | int5 fine-tuned, e4m3 per-token | 0.013 | 94.3% | 26.3 | 3569 | 767k |
 | int5 fine-tuned, int8 per-group tiled (`RADIANCE_PQ_I8=1 RADIANCE_PQ_PG=1`) | **0.0097** | **95.2%** | 26.0 | 3328 | 767k |
+| int5 fine-tuned, int8 per-group tiled + zero-point epilogue (`... RADIANCE_PQ_ZPE=1`) | 0.0099 | 95.25% | 25.7 | 3550 | 769k |
+| **+ conflict-free producer (`RADIANCE_PQ_PG_PRODUCER=3`, default)** | **0.0100** | **95.21%** | 25.9 | **3941** | 760k |
 
-GSM8K is identical within noise on every row. Details, the I8 mode and the per-group tiled band:
-paroquant/RESULTS.md 2026-09-11.
+GSM8K is identical within noise on every row (int5 + ZPE: 96.8 and 97.8 on two samples). The zero-point
+epilogue (2026-09-12) moves the `sc*(zp-16)` row-sum term out of the loop into Gp/16 fp16 WMMAs per output
+tile, +6.2-6.7% prefill at 2k-64k with decode and KL unchanged. The per-group producer was
+LDS-bank-conflict-bound (the checkpoint's random Givens pairs; 478 -> 254 us per qkv linear at 2k rows
+with a per-layer ownership layout and load-time write matchings, byte-exact), another +11% at 2k. The last
+row is the prod candidate: 2k prefill 3328 -> 3941 (+18%) on 2026-09-12 with KL, decode and GSM8K
+unchanged. Details, the I8 mode, the per-group tiled band, the epilogue and the producer:
+paroquant/RESULTS.md 2026-09-11/12.
 
 ### Distribution-level quality: KL divergence against the FP8 serve (2026-09-09)
 

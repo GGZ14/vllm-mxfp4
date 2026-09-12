@@ -332,6 +332,36 @@ __global__ void k_i8_probe(unsigned char *out) {   // ar_unpack8_i8<5> over ever
   const uint2_t u = ar_unpack8_i8<5>(wv, hb);
   for (int i = 0; i < 4; ++i) { out[c * 8 + i] = (u[0] >> (8 * i)) & 0xFF; out[c * 8 + 4 + i] = (u[1] >> (8 * i)) & 0xFF; }
 }
+// Mixed-pattern probe for the 24-bit-multiply spread and the xor/multiply sign-extension: every
+// (nibble word, fifth-bit byte) pair the thread draws is unpacked by the shipped helpers and by the
+// plain shift/select forms they replaced; any byte mismatch (int8, 5-bit; int8, 4-bit; e4m3 5-bit)
+// is counted.
+__device__ unsigned int ref_spread4(unsigned int x) { return ((x & 1u) << 4) | ((x & 4u) << 10) | ((x & 16u) << 16) | ((x & 64u) << 22); }
+template <int BITS> __device__ unsigned int ref_i8_codes4(unsigned int c4) {
+  if constexpr (BITS == 5) { const unsigned int m = __builtin_amdgcn_perm(0u, 0x0000FF00u, ((c4 & 0x10101010u) ^ 0x10101010u) >> 4); return (c4 & 0x0F0F0F0Fu) | (m & 0xF0F0F0F0u); }
+  else { const unsigned int m = __builtin_amdgcn_perm(0u, 0x0000FF00u, ((c4 & 0x08080808u) ^ 0x08080808u) >> 3); return (c4 & 0x07070707u) | (m & 0xF8F8F8F8u); }
+}
+__global__ void k_unpack_probe(unsigned int *bad, unsigned int seed) {
+  unsigned int x = seed ^ (blockIdx.x * 977u + threadIdx.x * 7919u + 1u);
+  unsigned int nb = 0;
+  for (int it = 0; it < 64; ++it) {
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    const unsigned int wv = x * 2654435761u, hb = (x >> 24) & 0xFFu;
+    // int8, 5-bit
+    { const unsigned int be = ref_i8_codes4<5>((wv & 0x0F0F0F0Fu) | ref_spread4(hb)), bo = ref_i8_codes4<5>(((wv >> 4) & 0x0F0F0F0Fu) | ref_spread4(hb >> 1));
+      const uint2_t r{__builtin_amdgcn_perm(bo, be, 0x05010400u), __builtin_amdgcn_perm(bo, be, 0x07030602u)}, u = ar_unpack8_i8<5>(wv, hb);
+      nb += (r[0] != u[0]) + (r[1] != u[1]); }
+    // int8, 4-bit
+    { const unsigned int be = ref_i8_codes4<4>(wv & 0x0F0F0F0Fu), bo = ref_i8_codes4<4>((wv >> 4) & 0x0F0F0F0Fu);
+      const uint2_t r{__builtin_amdgcn_perm(bo, be, 0x05010400u), __builtin_amdgcn_perm(bo, be, 0x07030602u)}, u = ar_unpack8_i8<4>(wv, 0u);
+      nb += (r[0] != u[0]) + (r[1] != u[1]); }
+    // e4m3, 5-bit
+    { const unsigned int be = ar_lut5((wv & 0x0F0F0F0Fu) | ref_spread4(hb)), bo = ar_lut5(((wv >> 4) & 0x0F0F0F0Fu) | ref_spread4(hb >> 1));
+      const uint2_t r{__builtin_amdgcn_perm(bo, be, 0x05010400u), __builtin_amdgcn_perm(bo, be, 0x07030602u)}, u = ar_unpack8_5(wv, hb);
+      nb += (r[0] != u[0]) + (r[1] != u[1]); }
+  }
+  if (nb) atomicAdd(bad, nb);
+}
 
 // I8 gate (W5A8-int8): code probe, then decode / prefill (per-token + per-group) / A-tiled with int8
 // activations on the iu8 WMMA vs the double reference, with the fp8-activation int5 kernel time beside it.
@@ -410,9 +440,180 @@ static void bench_pg(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
     for (size_t i = 0; i < s1.size(); ++i) { ds += s1[i] != s2[i]; dr += memcmp(&r1[i], &r2[i], 4) != 0; }
     const bool ok = da == 0 && ds == 0 && dr == 0; if (!ok) ++fails;
     printf("  pg producer %s M=%d code-diff=%zu scale-diff=%zu rs-diff=%zu (groupquant tiled vs pass A mode 0 + host tiling) %s\n", i8 ? "int8" : "e4m3", M, da, ds, dr, ok ? "OK" : "FAIL");
+    // pass A with the tiled store (the shipped PG producer, RADIANCE_PQ_PG_PRODUCER=2) vs the same
+    HIP_CHECK(hipMemset(dA2, 0, (size_t)P * Mt * 16 * K)); HIP_CHECK(hipMemset(dASG2, 0, (size_t)P * M * G * 4)); HIP_CHECK(hipMemset(dRS2, 0, (size_t)P * M * G * 4));
+    if (i8) hipLaunchKernelGGL((pq_rotate_quant2<false, true, true, 4>), gA, blk, 0, 0, (const __bf16 *)dX, dT, dCS, dA2, dASG2, dRS2, M, K, krot);
+    else    hipLaunchKernelGGL((pq_rotate_quant2<false, false, true, 4>), gA, blk, 0, 0, (const __bf16 *)dX, dT, dCS, dA2, dASG2, dRS2, M, K, krot);
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipMemcpy(a2.data(), dA2, a2.size(), hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(s2.data(), dASG2, s2.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(r2.data(), dRS2, r2.size() * 4, hipMemcpyDeviceToHost));
+    size_t da2 = 0, ds2 = 0, dr2 = 0;
+    for (int pp = 0; pp < P; ++pp) for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k) { const size_t o = (size_t)pp * Mt * 16 * K + pq_tiled_off(m, k, K); da2 += a1t[o] != a2[o]; }
+    for (size_t i = 0; i < s1.size(); ++i) { ds2 += s1[i] != s2[i]; dr2 += memcmp(&r1[i], &r2[i], 4) != 0; }
+    const bool ok2 = da2 == 0 && ds2 == 0 && dr2 == 0; if (!ok2) ++fails;
+    printf("  pg producer %s M=%d code-diff=%zu scale-diff=%zu rs-diff=%zu (pass A TILED store, NR=4 interleave vs pass A row-major NR=1 + host tiling) %s\n", i8 ? "int8" : "e4m3", M, da2, ds2, dr2, ok2 ? "OK" : "FAIL");
+    // conflict-free ownership-layout producer (quant3) vs the same reference
+    {
+      std::vector<unsigned short> R3(T.size(), 0), INIT((size_t)P * G * 32 * 4, 0);
+      const int badt = pq_build_rot3(T.data(), P, krot, K, R3.data(), INIT.data());
+      unsigned short *dR3, *dI; HIP_CHECK(hipMalloc(&dR3, R3.size() * 2)); HIP_CHECK(hipMalloc(&dI, INIT.size() * 2));
+      HIP_CHECK(hipMemcpy(dR3, R3.data(), R3.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dI, INIT.data(), INIT.size() * 2, hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemset(dA2, 0, (size_t)P * Mt * 16 * K)); HIP_CHECK(hipMemset(dASG2, 0, (size_t)P * M * G * 4)); HIP_CHECK(hipMemset(dRS2, 0, (size_t)P * M * G * 4));
+      if (i8) hipLaunchKernelGGL((pq_rotate_quant3<true, true, 1>), gA, blk, 0, 0, (const __bf16 *)dX, dR3, dI, dCS, dA2, dASG2, dRS2, M, K, krot);
+      else    hipLaunchKernelGGL((pq_rotate_quant3<false, true, 1>), gA, blk, 0, 0, (const __bf16 *)dX, dR3, dI, dCS, dA2, dASG2, dRS2, M, K, krot);
+      HIP_CHECK(hipDeviceSynchronize());
+      HIP_CHECK(hipMemcpy(a2.data(), dA2, a2.size(), hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(s2.data(), dASG2, s2.size() * 4, hipMemcpyDeviceToHost)); HIP_CHECK(hipMemcpy(r2.data(), dRS2, r2.size() * 4, hipMemcpyDeviceToHost));
+      size_t da3 = 0, ds3 = 0, dr3 = 0;
+      for (int pp = 0; pp < P; ++pp) for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k) { const size_t o = (size_t)pp * Mt * 16 * K + pq_tiled_off(m, k, K); da3 += a1t[o] != a2[o]; }
+      for (size_t i = 0; i < s1.size(); ++i) { ds3 += s1[i] != s2[i]; dr3 += memcmp(&r1[i], &r2[i], 4) != 0; }
+      const bool ok3 = badt == 0 && da3 == 0 && ds3 == 0 && dr3 == 0; if (!ok3) ++fails;
+      printf("  pg producer %s M=%d code-diff=%zu scale-diff=%zu rs-diff=%zu table-failures=%d (conflict-free quant3 vs pass A row-major + host tiling) %s\n", i8 ? "int8" : "e4m3", M, da3, ds3, dr3, badt, ok3 ? "OK" : "FAIL");
+      hipFree(dR3); hipFree(dI);
+    }
     hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dA1); hipFree(dA2); hipFree(dASG1); hipFree(dASG2); hipFree(dRS1); hipFree(dRS2);
   }
+  // producer bandwidth at prefill size: the fused rotate + group-quant + tiled write (what the served PG
+  // path runs per linear above the decode band) at M=2048, qkv-shaped (K=5120, P=3) and down-shaped
+  // (K=8704, P=1). Bytes = P x (X read + A write) + ASG/RS; the DRAM ceiling here is ~635 GB/s.
+  for (const int shp : {0, 1}) {
+    const int M = 2048, K = shp ? 8704 : 5120, P = shp ? 1 : 3, krot = 8, G = K / PQ_GROUP, Mt = (M + 15) / 16;
+    std::vector<unsigned short> T((size_t)P * krot * (K / 2) * 4, 0); std::vector<__half> CS((size_t)P * K, __float2half(1.f));
+    std::mt19937 prng(77u); std::uniform_real_distribution<float> ud(-3.1f, 3.1f); std::vector<int> perm(PQ_GROUP);
+    for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g) {
+      for (int i = 0; i < PQ_GROUP; ++i) perm[i] = i; std::shuffle(perm.begin(), perm.end(), prng);
+      for (int t = 0; t < 64; ++t) { const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4; const float th = ud(prng); const __half c = __float2half(cosf(th)), sn = __float2half(sinf(th)); T[e] = (unsigned short)(perm[2 * t] | (perm[2 * t + 1] << 8)); memcpy(&T[e + 1], &c, 2); memcpy(&T[e + 2], &sn, 2); }
+    }
+    unsigned short *dX, *dT; __half *dCS; unsigned char *dA; float *dASG, *dRS;
+    HIP_CHECK(hipMalloc(&dX, (size_t)M * K * 2)); HIP_CHECK(hipMalloc(&dT, T.size() * 2)); HIP_CHECK(hipMalloc(&dCS, CS.size() * 2));
+    HIP_CHECK(hipMalloc(&dA, (size_t)P * Mt * 16 * K)); HIP_CHECK(hipMalloc(&dASG, (size_t)P * M * G * 4)); HIP_CHECK(hipMalloc(&dRS, (size_t)P * M * G * 4));
+    HIP_CHECK(hipMemset(dX, 0x3C, (size_t)M * K * 2)); HIP_CHECK(hipMemcpy(dT, T.data(), T.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dCS, CS.data(), CS.size() * 2, hipMemcpyHostToDevice));
+    const dim3 grid(M, P);
+    auto L16 = [&](int) { hipLaunchKernelGGL((pq_rotate_groupquant<16, true, true>), grid, dim3(512), 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    auto L32 = [&](int) { hipLaunchKernelGGL((pq_rotate_groupquant<32, true, true>), grid, dim3(1024), 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    auto L8 = [&](int) { hipLaunchKernelGGL((pq_rotate_groupquant<8, true, true>), grid, dim3(256), 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    double t8 = 1e30, t16 = 1e30, t32 = 1e30, tA = 1e30;
+    const dim3 gA(G, (M + PQ_ROT_TCHUNK - 1) / PQ_ROT_TCHUNK, P), blkA(PQ_ROT_WAVES * 32);
+    auto LA = [&](int) { hipLaunchKernelGGL((pq_rotate_quant2<false, true>), gA, blkA, 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    auto LT1 = [&](int) { hipLaunchKernelGGL((pq_rotate_quant2<false, true, true, 1>), gA, blkA, 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    auto LT2 = [&](int) { hipLaunchKernelGGL((pq_rotate_quant2<false, true, true, 2>), gA, blkA, 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    auto LT4 = [&](int) { hipLaunchKernelGGL((pq_rotate_quant2<false, true, true, 4>), gA, blkA, 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    auto LT8 = [&](int) { hipLaunchKernelGGL((pq_rotate_quant2<false, true, true, 8>), gA, blkA, 0, 0, (const __bf16 *)dX, dT, dCS, dA, dASG, dRS, M, K, krot); };
+    std::vector<unsigned short> R3(T.size(), 0), INIT((size_t)P * G * 32 * 4, 0);
+    const int badt = pq_build_rot3(T.data(), P, krot, K, R3.data(), INIT.data());
+    unsigned short *dR3, *dI; HIP_CHECK(hipMalloc(&dR3, R3.size() * 2)); HIP_CHECK(hipMalloc(&dI, INIT.size() * 2));
+    HIP_CHECK(hipMemcpy(dR3, R3.data(), R3.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dI, INIT.data(), INIT.size() * 2, hipMemcpyHostToDevice));
+    auto L3 = [&](int) { hipLaunchKernelGGL((pq_rotate_quant3<true, true, 1>), gA, blkA, 0, 0, (const __bf16 *)dX, dR3, dI, dCS, dA, dASG, dRS, M, K, krot); };
+    auto L3b = [&](int) { hipLaunchKernelGGL((pq_rotate_quant3<true, true, 2>), gA, blkA, 0, 0, (const __bf16 *)dX, dR3, dI, dCS, dA, dASG, dRS, M, K, krot); };
+    double t3 = 1e30, t3b = 1e30;
+    for (int rep = 0; rep < 3; ++rep) { t3 = std::min(t3, time_us(L3, 10, e0, e1)); t3b = std::min(t3b, time_us(L3b, 10, e0, e1)); }
+    printf("  pg producer bw M=%d K=%d P=%d conflict-free quant3 (tables: %d failures): NR=1 %.1f us  NR=2 %.1f us = %.0f GB/s\n", M, K, P, badt, t3, t3b,
+           ((double)P * M * K * 3 + (double)P * M * G * 8) / (std::min(t3, t3b) * 1e-6) / 1e9);
+    hipFree(dR3); hipFree(dI);
+    double tT1 = 1e30, tT2 = 1e30, tT4 = 1e30, tT8 = 1e30;
+    for (int rep = 0; rep < 3; ++rep) { t8 = std::min(t8, time_us(L8, 10, e0, e1)); t16 = std::min(t16, time_us(L16, 10, e0, e1)); t32 = std::min(t32, time_us(L32, 10, e0, e1)); tA = std::min(tA, time_us(LA, 10, e0, e1));
+      tT1 = std::min(tT1, time_us(LT1, 10, e0, e1)); tT2 = std::min(tT2, time_us(LT2, 10, e0, e1)); tT4 = std::min(tT4, time_us(LT4, 10, e0, e1)); tT8 = std::min(tT8, time_us(LT8, 10, e0, e1)); }
+    const double bytes = (double)P * M * K * 3 + (double)P * M * G * 8;
+    printf("  pg producer bw M=%d K=%d P=%d int8 tiled: per-row W=8 %.1f us  W=16 %.1f us  W=32 %.1f us (%.0f GB/s of %.1f MB); pass A row-major %.1f us; pass A TILED NR=1 %.1f  NR=2 %.1f  NR=4 %.1f  NR=8 %.1f us (NR=4 = %.0f GB/s)\n",
+           M, K, P, t8, t16, t32, bytes / (std::min(t8, std::min(t16, t32)) * 1e-6) / 1e9, bytes / 1e6, tA, tT1, tT2, tT4, tT8, bytes / (tT4 * 1e-6) / 1e9);
+    // LDS bank-conflict probe: the same kernel on a bank-friendly pairing (pair t = (t, t + 64): lane l's
+    // reads and writes all sit in bank l) and on the degenerate all-same pairing. A large gap to the
+    // random pairing above means the producer is LDS-conflict-bound, not memory- or latency-bound.
+    {
+      std::vector<unsigned short> Tf(T.size(), 0);
+      for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g)
+        for (int t = 0; t < 64; ++t) { const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4; Tf[e] = (unsigned short)(t | ((t + 64) << 8)); Tf[e + 1] = T[e + 1]; Tf[e + 2] = T[e + 2]; }
+      HIP_CHECK(hipMemcpy(dT, Tf.data(), Tf.size() * 2, hipMemcpyHostToDevice));
+      double tF = 1e30; for (int rep = 0; rep < 3; ++rep) tF = std::min(tF, time_us(LT1, 10, e0, e1));
+      for (int pp = 0; pp < P; ++pp) for (int r = 0; r < krot; ++r) for (int g = 0; g < G; ++g)
+        for (int t = 0; t < 64; ++t) { const size_t e = ((((size_t)pp * krot + r) * (K / 2)) + (size_t)g * 64 + t) * 4; Tf[e] = (unsigned short)((2 * t) | ((2 * t + 1) << 8)); }
+      HIP_CHECK(hipMemcpy(dT, Tf.data(), Tf.size() * 2, hipMemcpyHostToDevice));
+      double tS = 1e30; for (int rep = 0; rep < 3; ++rep) tS = std::min(tS, time_us(LT1, 10, e0, e1));
+      printf("  pg producer LDS probe M=%d K=%d P=%d pass A TILED NR=1: random pairs %.1f us, bank-friendly (t, t+64) %.1f us, adjacent (2t, 2t+1) %.1f us\n", M, K, P, tT1, tF, tS);
+    }
+    hipFree(dX); hipFree(dT); hipFree(dCS); hipFree(dA); hipFree(dASG); hipFree(dRS);
+  }
   printf("pg: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
+}
+
+// ---- zpe: zero-point epilogue as a shipped band (int5, e4m3/int8 x per-token/per-group) ----
+// pq_rs_to_rsh vs build_rsh byte-exact, then atiled ABL=4 vs the reference next to ABL=0 (the
+// in-loop form) so the fp16 row-sum rounding is visible, with the time of each.
+static void bench_zpe(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
+  int fails = 0;
+  for (const int G : {5, 40, 68, 136})
+    for (const int M : {1, 200, 1024}) {
+      const int P = 2, Mt = (M + 15) / 16, Gp = (G + 15) & ~15;
+      std::vector<float> RS((size_t)P * M * G);
+      std::uniform_real_distribution<float> u(-40000.f, 40000.f);
+      for (auto &v : RS) v = u(rng);
+      const std::vector<__half> ref = build_rsh(RS, P, M, G);
+      float *dRS; __half *dRSH;
+      HIP_CHECK(hipMalloc(&dRS, RS.size() * 4)); HIP_CHECK(hipMalloc(&dRSH, ref.size() * 2));
+      HIP_CHECK(hipMemcpy(dRS, RS.data(), RS.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemset(dRSH, 0x55, ref.size() * 2));
+      const size_t total = (size_t)P * Mt * (Gp / 16) * 256;
+      hipLaunchKernelGGL(pq_rs_to_rsh, dim3((int)std::min<size_t>((total + 255) / 256, 4096)), dim3(256), 0, 0, dRS, dRSH, M, G, P);
+      HIP_CHECK(hipDeviceSynchronize());
+      std::vector<__half> got(ref.size()); HIP_CHECK(hipMemcpy(got.data(), dRSH, got.size() * 2, hipMemcpyDeviceToHost));
+      const int diff = memcmp(got.data(), ref.data(), got.size() * 2) != 0;
+      if (diff) ++fails;
+      printf("  zpe rs_to_rsh G=%-3d M=%-4d P=%d %zu halfs %s\n", G, M, P, got.size(), diff ? "FAIL" : "byte-exact");
+      hipFree(dRS); hipFree(dRSH);
+    }
+  constexpr int TN = 2, BNF_T = AR_WN * TN * 16;
+  // The host reference dominates (scalar, ~1 min per 1k rows on gate_up): PQ_SHAPE=name and
+  // PQ_MS=200,1024 narrow a run.
+  const char *only = getenv("PQ_SHAPE"), *ms_env = getenv("PQ_MS");
+  std::vector<int> Ms = {200, 1024, 2048};
+  if (ms_env && *ms_env) { Ms.clear(); for (const char *q = ms_env; *q;) { Ms.push_back(atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; } }
+  for (const Shape &sh : SHAPES) {
+    if (std::string(sh.name) == "ragged" || (sh.K % 128) != 0) continue;
+    if (only && *only && std::string(sh.name) != only) continue;
+    Buffers b; b.N = sh.N; b.K = sh.K; b.P = sh.P; b.G = sh.K / PQ_GROUP;
+    fill_weights5(b, rng);
+    const std::vector<unsigned int> Wp = permute_w(b.W, b.N, b.K);
+    const std::vector<unsigned char> WHp = permute_wh(b.WH, b.N, b.K);
+    const std::vector<__half> ZSH = build_zsh(b.SZ, b.N, b.G);
+    unsigned int *dW; unsigned char *dWH; __half *dSZ, *dZSH;
+    HIP_CHECK(hipMalloc(&dW, Wp.size() * 4)); HIP_CHECK(hipMalloc(&dWH, WHp.size())); HIP_CHECK(hipMalloc(&dSZ, b.SZ.size() * 2)); HIP_CHECK(hipMalloc(&dZSH, ZSH.size() * 2));
+    HIP_CHECK(hipMemcpy(dW, Wp.data(), Wp.size() * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dWH, WHp.data(), WHp.size(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dSZ, b.SZ.data(), b.SZ.size() * 2, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dZSH, ZSH.data(), ZSH.size() * 2, hipMemcpyHostToDevice));
+    for (const int M : Ms)
+      for (const int pg : {0, 1})
+        for (const int i8 : {0, 1}) {
+          b.M = M;
+          if (i8) fill_acts_i8(b, rng, !pg); else fill_acts(b, rng, false, !pg);
+          std::vector<float> ref; ref_gemm2(b, sh.pb1, sh.pb2, ref, !pg);
+          const std::vector<unsigned char> At = tile_a(b.A, b.P, M, b.K);
+          const std::vector<float> &AS = pg ? b.ASG : b.AS;
+          const int Mt = (M + 15) / 16, Gp = (b.G + 15) & ~15;
+          unsigned char *dAT; float *dAS, *dRS; __half *dRSH; __bf16 *dC;
+          HIP_CHECK(hipMalloc(&dAT, At.size())); HIP_CHECK(hipMalloc(&dAS, AS.size() * 4)); HIP_CHECK(hipMalloc(&dRS, b.RS.size() * 4));
+          HIP_CHECK(hipMalloc(&dRSH, (size_t)b.P * Mt * Gp * 16 * 2)); HIP_CHECK(hipMalloc(&dC, (size_t)M * b.N * 2));
+          HIP_CHECK(hipMemcpy(dAT, At.data(), At.size(), hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dAS, AS.data(), AS.size() * 4, hipMemcpyHostToDevice));
+          HIP_CHECK(hipMemcpy(dRS, b.RS.data(), b.RS.size() * 4, hipMemcpyHostToDevice));
+          const size_t total = (size_t)b.P * Mt * (Gp / 16) * 256;
+          hipLaunchKernelGGL(pq_rs_to_rsh, dim3((int)std::min<size_t>((total + 255) / 256, 4096)), dim3(256), 0, 0, dRS, dRSH, M, b.G, b.P);
+          HIP_CHECK(hipDeviceSynchronize());
+          const dim3 grid((b.N + BNF_T - 1) / BNF_T, (M + AR_BMF - 1) / AR_BMF), block(AR_NTHREADS);
+#define ZPE_L(ABL_, I_, P_) hipLaunchKernelGGL((pq_int4_fp8_gemm_atiled<TN, true, 128, true, 0, ABL_, 5, I_, P_>), grid, block, 0, 0, dAT, dW, dSZ, dAS, dRS, dC, M, b.N, b.K, sh.pb1, sh.pb2, dRSH, dZSH, dWH)
+          auto L0 = [&](int) { if (i8) { if (pg) ZPE_L(0, true, true); else ZPE_L(0, true, false); } else { if (pg) ZPE_L(0, false, true); else ZPE_L(0, false, false); } };
+          auto L4 = [&](int) { if (i8) { if (pg) ZPE_L(4, true, true); else ZPE_L(4, true, false); } else { if (pg) ZPE_L(4, false, true); else ZPE_L(4, false, false); } };
+#undef ZPE_L
+          auto relof = [&](auto &&L) {
+            HIP_CHECK(hipMemset(dC, 0x7B, (size_t)M * b.N * 2)); L(0); HIP_CHECK(hipDeviceSynchronize());
+            std::vector<unsigned short> Ch((size_t)M * b.N); HIP_CHECK(hipMemcpy(Ch.data(), dC, Ch.size() * 2, hipMemcpyDeviceToHost));
+            double num = 0, den = 0; for (size_t i = 0; i < Ch.size(); ++i) { const double c = bf16_to_f(Ch[i]), r = ref[i]; num += (c - r) * (c - r); den += r * r; }
+            return sqrt(num / (den > 0 ? den : 1)); };
+          const double rel0 = relof(L0), rel4 = relof(L4);
+          double t0 = 1e30, t4 = 1e30;
+          for (int rep = 0; rep < 3; ++rep) { t0 = std::min(t0, time_us(L0, 10, e0, e1)); t4 = std::min(t4, time_us(L4, 10, e0, e1)); }
+          const bool ok = rel4 < 5e-3 && rel4 < 4 * rel0 + 1e-4; if (!ok) ++fails;
+          printf("  zpe atiled %-8s N=%-5d K=%-5d P=%d M=%-4d %s %-9s rel in-loop %.2e zpe %.2e  in-loop %8.2f us  zpe %8.2f us (%.3fx) %s\n",
+                 sh.name, b.N, b.K, b.P, M, i8 ? "int8" : "e4m3", pg ? "per-group" : "per-token", rel0, rel4, t0, t4, t4 / t0, ok ? "OK" : "FAIL");
+          hipFree(dAT); hipFree(dAS); hipFree(dRS); hipFree(dRSH); hipFree(dC);
+        }
+    hipFree(dW); hipFree(dWH); hipFree(dSZ); hipFree(dZSH);
+  }
+  printf("zpe: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails); if (fails) exit(1);
 }
 
 static void bench_i8(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
@@ -423,6 +624,10 @@ static void bench_i8(std::mt19937 &rng, hipEvent_t e0, hipEvent_t e1) {
     unsigned char h[256]; HIP_CHECK(hipMemcpy(h, d, 256, hipMemcpyDeviceToHost)); hipFree(d);
     int bad = 0; for (int c = 0; c < 32; ++c) for (int i = 0; i < 8; ++i) if ((signed char)h[c * 8 + i] != c - 16) ++bad;
     printf("i8 codes: %d/256 wrong %s\n", bad, bad ? "FAIL" : "OK"); if (bad) ++fails;
+    unsigned int *dbad; HIP_CHECK(hipMalloc(&dbad, 4)); HIP_CHECK(hipMemset(dbad, 0, 4));
+    hipLaunchKernelGGL(k_unpack_probe, dim3(256), dim3(256), 0, 0, dbad, 0x9E3779B9u); HIP_CHECK(hipDeviceSynchronize());
+    unsigned int nbad = 0; HIP_CHECK(hipMemcpy(&nbad, dbad, 4, hipMemcpyDeviceToHost)); hipFree(dbad);
+    printf("unpack probe (mul24 spread + xor/mul sign-extend vs shift/select forms, 4.2M words x 3 paths): %u mismatches %s\n", nbad, nbad ? "FAIL" : "OK"); if (nbad) ++fails;
   }
   constexpr int DWN = 8, BND = DWN * 16, TN = 2, BNF_T = AR_WN * TN * 16;
   for (const Shape &sh : SHAPES) {
@@ -671,6 +876,7 @@ static void bench2(std::mt19937 &rng, const std::string &what) {
   if (what == "int5") { bench_int5(rng, e0, e1); return; }
   if (what == "i8") { bench_i8(rng, e0, e1); return; }
   if (what == "pg") { bench_pg(rng, e0, e1); return; }
+  if (what == "zpe") { bench_zpe(rng, e0, e1); return; }
   const char *only = getenv("PQ_SHAPE");
   for (const Shape &sh : SHAPES) {
     if (std::string(sh.name) == "ragged" || std::string(sh.name) == "tiny2p") continue;

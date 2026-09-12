@@ -139,6 +139,7 @@ CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && 
 [ "${RADIANCE_SKINNY_GEMM:-1}" = all ] && CACHE_SUF="${CACHE_SUF}-sk"   # skinny in_proj_ba routing changes the compiled graph
 [ "${RADIANCE_PQ_I8:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-i8"
 [ "${RADIANCE_PQ_PG:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-pg"
+[ "${RADIANCE_PQ_ZPE:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-zpe"
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
@@ -219,6 +220,8 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_PQ_FUSED_TOKQ="${RADIANCE_PQ_FUSED_TOKQ:-1}" \
   -e RADIANCE_PQ_I8="${RADIANCE_PQ_I8:-0}" \
   -e RADIANCE_PQ_PG="${RADIANCE_PQ_PG:-0}" \
+  -e RADIANCE_PQ_ZPE="${RADIANCE_PQ_ZPE:-0}" \
+  -e RADIANCE_PQ_PG_PRODUCER="${RADIANCE_PQ_PG_PRODUCER:-3}" \
   -e RADIANCE_PQ_ROT_STREAM="$ROT_STREAM" -e RADIANCE_PQ_ROT_STREAM2="$ROT_STREAM2" \
   -e RADIANCE_PQ_ROT_STREAM3="$ROT_STREAM3" -e RADIANCE_PQ_AR_CHECK="${RADIANCE_PQ_AR_CHECK:-0}" \
   -e RADIANCE_PQ_AR_FALLBACK="${RADIANCE_PQ_AR_FALLBACK:-0}" \
