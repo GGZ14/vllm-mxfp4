@@ -149,6 +149,30 @@ mkdir -p "$CACHE"
 MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
 MODEL=/models/$MODEL_DIR
 [ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
+
+# Chat template. The default is the file every number in RESULTS.md was measured with: the GSM8K
+# band (97-98%) is template-bound, and the model's own bundled template scores 95-96% with runaway
+# answers, so this is a measurement-affecting knob, not a cosmetic one. Point CHAT_TEMPLATE at any
+# .jinja to override. It is mounted by path, so it must exist on the HOST, not just in the image.
+CHAT_TEMPLATE=${CHAT_TEMPLATE:-$HF_CACHE/qwen-fixed-v22.3.jinja}
+CHAT_TEMPLATE="$(realpath -m "$CHAT_TEMPLATE")"
+[ -r "$CHAT_TEMPLATE" ] || {
+  echo "chat template not readable: $CHAT_TEMPLATE" >&2
+  echo "  set CHAT_TEMPLATE=<path to a .jinja on the host>, or leave it unset for the default" >&2
+  echo "  ($HF_CACHE/qwen-fixed-v22.3.jinja -- what the measured GSM8K band needs)." >&2
+  exit 1
+}
+# Reuse an existing bind mount when the template already lives under one, so the common case adds
+# no mount; anything else is bound read-only at a fixed path.
+CT_MOUNT=()
+case "$CHAT_TEMPLATE" in
+  "$HF_CACHE"/*)    CT_PATH="/root/.cache/huggingface/${CHAT_TEMPLATE#"$HF_CACHE"/}" ;;
+  "$MODELS"/*)      CT_PATH="/models/${CHAT_TEMPLATE#"$MODELS"/}" ;;
+  "$SCRIPT_DIR"/*)  CT_PATH="/paro/${CHAT_TEMPLATE#"$SCRIPT_DIR"/}" ;;
+  "$PATCHES_DIR"/*) CT_PATH="/patches/${CHAT_TEMPLATE#"$PATCHES_DIR"/}" ;;
+  *) CT_PATH=/chat-template.jinja; CT_MOUNT=(-v "$CHAT_TEMPLATE:$CT_PATH:ro,z") ;;
+esac
+echo "[paro] chat-template=$CHAT_TEMPLATE -> $CT_PATH"
 # TP and the card set are overridable so a single-card CHECKALL boot can run beside another job.
 TP=${TP:-2}
 GPUS=${GPUS:-0,1}
@@ -240,6 +264,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -v "$PATCHES_DIR":/patches:z \
   -v "$SCRIPT_DIR":/paro:z \
   -v "$R4D_CACHE/$R4D_KEY":/r4d:z \
+  "${CT_MOUNT[@]}" \
   -e R4D_SO="$R4D_CACHE/$R4D_KEY" \
   --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
     set -e
@@ -309,6 +334,6 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   --mamba-cache-mode align \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
-  --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja \
+  --chat-template "$CT_PATH" \
   "${SPEC_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"

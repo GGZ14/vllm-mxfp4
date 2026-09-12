@@ -47,6 +47,26 @@ On a host with the systemd units installed, `vllm-switch paro` starts it as `qwe
 stops whatever else holds the GPUs. Both stacks want both cards and port 8080, so only one runs at
 a time.
 
+### Chat template
+
+`CHAT_TEMPLATE` points the serve at any `.jinja` on the host; unset, it uses
+`qwen-fixed-v22.3.jinja` from the HF cache, which is what every number below was measured with.
+
+```bash
+CHAT_TEMPLATE=/path/to/your.jinja MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+```
+
+Treat it as a measurement-affecting knob, not a cosmetic one: the GSM8K band here is
+**template-bound**. `qwen-fixed-v22.3.jinja` holds 97-98%; the model's own bundled template scores
+95-96% on the same weights, with runaway answers past the stop condition. Compare kernels only
+against a fixed template.
+
+The file is bind-mounted by path, so it has to exist on the *host*. One already under a mount the
+launcher makes (the HF cache, `models/`, the repo, `paroquant/`) is addressed through that mount;
+anything else is bound read-only at `/chat-template.jinja`. An unreadable path fails the launch
+rather than falling back silently, because a silent fallback here is a 2-point GSM8K drop that
+looks like a kernel regression.
+
 The kernel module is compiled inside the container at start (`hipcc --offload-arch=gfx1201` over
 `radiance_paroquant.hip`) from this directory, exactly as the MXFP4 kernel is. Nothing is baked
 into the image.
