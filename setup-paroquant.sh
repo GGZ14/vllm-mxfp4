@@ -1,6 +1,6 @@
 #!/bin/bash
-# One-time setup for the ParoQuant serve. Checks the host, pulls the image, fetches the PARO
-# checkpoint, fetches the drafter, and compiles libr4d -- then tells you the one command that
+# One-time setup for the ParoQuant serve (int4 W4A8 or int5 W5A8). Checks the host, pulls the
+# image, fetches the PARO checkpoint, fetches the drafter, and compiles libr4d -- then tells you the one command that
 # starts the server.
 #
 # Shares the image, the DFlash2 drafter and libr4d with setup-mxfp4.sh, so running both costs one
@@ -16,9 +16,11 @@ set -euo pipefail
 MODELS=${MODELS:-$HOME/models}
 HF_CACHE=${HF_CACHE:-$HOME/.cache/huggingface}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
-SRC_REPO=${SRC_REPO:-z-lab/Qwen3.8-27B-PARO}
 DRAFT_REPO=${DRAFT_REPO:-tcclaviger/Qwen3.8-27B-DFlash2-FP8}
-SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO}
+# QUANT picks which ParoQuant checkpoint to fetch. int4 is the z-lab release this stack started on;
+# int5 is the W5A8 build -- 4.2x lower KL against the same-stack bf16 reference for +2.6 ms/step and
+# ~12% less KV. Both run the same kernels, launcher and drafter.
+QUANT=${QUANT:-int4}
 DRAFTER=${DRAFTER:-$MODELS/Qwen3.8-27B-DFlash2-FP8}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
@@ -28,27 +30,42 @@ for a in "$@"; do
   case "$a" in
     -h|--help)
       cat <<'USAGE'
-setup-paroquant.sh -- one-time setup for the ParoQuant W4A8 serve
+setup-paroquant.sh -- one-time setup for the ParoQuant W4A8 / W5A8 serve
 
-  ./setup-paroquant.sh              run every step that is not already done
+  ./setup-paroquant.sh              run every step that is not already done (int4)
+  ./setup-paroquant.sh --int5       fetch the int5 W5A8 checkpoint instead
   ./setup-paroquant.sh --yes        don't ask before downloading (~21 GiB)
   ./setup-paroquant.sh --no-drafter skip the DFlash2 drafter (then serve with MODE=eval)
 
 Environment:
+  QUANT=int4|int5               which ParoQuant checkpoint (int5 = W5A8, best fidelity)
   MODELS=~/models               where the checkpoint is written
   HF_CACHE=~/.cache/huggingface where huggingface_hub keeps its cache
   IMAGE=...:0.9.3               container image to use
   RUNTIME=podman|docker         container runtime (auto-detected)
 
-Disk: ~19 GiB for the PARO checkpoint, 2 GiB for the drafter and ~10 GiB for the image. The
-checkpoint is downloaded straight into $MODELS, so there is no second copy to delete afterwards.
+Disk: ~19 GiB for the int4 checkpoint (~21 GiB for int5), 2 GiB for the drafter and ~10 GiB for
+the image. The checkpoint is downloaded straight into $MODELS, so there is no second copy to
+delete afterwards.
 USAGE
       exit 0 ;;
     --yes|-y)      ASSUME_YES=1 ;;
     --no-drafter)  WANT_DRAFTER=0 ;;
+    --int5|int5)   QUANT=int5 ;;
+    --int4|int4)   QUANT=int4 ;;
     *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
+
+case "$QUANT" in
+  int4) SRC_REPO=${SRC_REPO:-z-lab/Qwen3.8-27B-PARO}
+        SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO}
+        WANT_BITS=4; DL_SIZE="~19 GiB" ;;
+  int5) SRC_REPO=${SRC_REPO:-Launch80/Qwen3.8-27B-PARO-int5}
+        SNAP=${SNAP:-$MODELS/Qwen3.8-27B-PARO-int5}
+        WANT_BITS=5; DL_SIZE="~21 GiB" ;;
+  *) echo "unknown QUANT=$QUANT (want int4 or int5)" >&2; exit 2 ;;
+esac
 
 step() { echo; echo "=== $* ==="; }
 ok()   { echo "  ok: $*"; }
@@ -130,7 +147,7 @@ print(p)
 }
 
 # ------------------------------------------------------------------ 3. checkpoint
-step "3/5  PARO checkpoint ($SRC_REPO)"
+step "3/5  PARO $QUANT checkpoint ($SRC_REPO)"
 case "$SNAP" in
   "$MODELS"/*) CSNAP="/models/${SNAP#"$MODELS"/}" ;;
   *) die "SNAP ($SNAP) must live under MODELS ($MODELS)" ;;
@@ -138,7 +155,7 @@ esac
 if [ -f "$SNAP/config.json" ]; then
   ok "already present at $SNAP"
 else
-  echo "  downloading ~19 GiB straight into $SNAP (resumes if interrupted)"
+  echo "  downloading $DL_SIZE straight into $SNAP (resumes if interrupted)"
   hf_get "$SRC_REPO" "$CSNAP" >/dev/null
   [ -f "$SNAP/config.json" ] || die "download did not produce $SNAP/config.json"
   ok "downloaded"
@@ -147,13 +164,14 @@ fi
 # The kernels are built for exactly this shape: group 128 is baked into the slab structure, and
 # the prologue's rotation table is sized for krot <= 8. Fail here with the reason rather than at
 # model load with an assertion, or worse, at the first token.
-python3 - "$SNAP/config.json" <<'PY' || die "checkpoint is not servable by this stack" \
-    "the radiance ParoQuant kernels are built for quant_method=paroquant, bits=4, group_size=128, krot<=8"
+python3 - "$SNAP/config.json" "$WANT_BITS" <<'PY' || die "checkpoint is not servable by this stack" \
+    "the radiance ParoQuant kernels are built for quant_method=paroquant, bits=$WANT_BITS, group_size=128, krot<=8"
 import json, sys
 q = (json.load(open(sys.argv[1])).get("quantization_config") or {})
 m, b, g, k = q.get("quant_method"), q.get("bits"), q.get("group_size"), q.get("krot")
 print(f"  quantization_config: quant_method={m} bits={b} group_size={g} krot={k}")
-bad = [n for n, v, want in (("quant_method", m, "paroquant"), ("bits", b, 4), ("group_size", g, 128))
+want_bits = int(sys.argv[2])
+bad = [n for n, v, want in (("quant_method", m, "paroquant"), ("bits", b, want_bits), ("group_size", g, 128))
        if v != want]
 if not isinstance(k, int) or not 1 <= k <= 8:
     bad.append("krot")
@@ -197,7 +215,10 @@ cat <<EOF
 
 Start the server:
 
-    MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+    MODEL_DIR=$(basename "$SNAP") MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+
+The launcher reads the checkpoint's bit width and turns on the matching activation-quant defaults,
+so that is the whole command -- no RADIANCE_PQ_* flags to remember.
 
 It listens on http://localhost:8080/v1 as "Qwen3.8-PARO". The first start compiles the ParoQuant
 kernel, then Triton and inductor kernels, and takes several extra minutes; later starts reuse that
