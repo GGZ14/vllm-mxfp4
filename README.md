@@ -337,6 +337,36 @@ of overrides produces without running it.
 | `ASYNC` | `0` | Async scheduling. vLLM refuses it together with `disable_padded_drafter_batch`, so the two are one switch; the unpad lever is ~+50% single-stream under mtp |
 | `EXTRA` | empty | Extra `vllm serve` flags (or just pass them as arguments) |
 
+### Tool calling and reasoning
+
+The server is started with `--enable-auto-tool-choice --tool-call-parser qwen3_coder
+--reasoning-parser qwen3` and this repo's chat template. These are fixed, not `EXTRA`-tunable.
+
+`qwen3_coder` and `qwen3_xml` are **the same parser** in every image this repo builds or pulls. Both
+keys are registered and both resolve to `Qwen3EngineToolParser`, an 8-line shim over vLLM's Streaming
+Parser Engine:
+
+```python
+# vllm/tool_parsers/__init__.py
+    "qwen3_coder": ("qwen3_engine_tool_parser", "Qwen3EngineToolParser"),
+    "qwen3_xml":   ("qwen3_engine_tool_parser", "Qwen3EngineToolParser"),
+```
+
+They were once two implementations of the same XML grammar
+(`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`, which is what the
+chat template emits), and on the 0.22-era stack `qwen3_coder` leaked the closing `</tool_call>` tag
+into streaming content — which is why older scripts here pinned `qwen3_xml`. Upstream deleted both
+standalone parsers in 2026-06 in favour of the engine, so the distinction is gone; the scripts were
+standardised on the model card's name, `qwen3_coder`, on 2026-09-09. **Changing the flag between the
+two names does nothing** — if tool markup is leaking, it is not the parser name.
+
+What does matter is `patch_qwen3_toolparse.py`, applied when the image is built. It fixes
+streaming-vs-non-streaming divergence on a *truncated* tool call (vLLM #47137): a clipped opener
+surfaced `<tool_call>\n<function` as assistant content in non-streaming while streaming returned
+`None`, and a value cut off mid-parameter yielded `{}` non-streaming against `{"city": "San Fr`
+streaming. Both are resolved toward the streaming result — raw tool markup is never surfaced as
+content. The patch targets the engine, so it applies under either parser name.
+
 ### Kernels
 
 | Variable | Default | What it does |
@@ -385,6 +415,7 @@ as a one-line error rather than a traceback.
 | `no checkpoint at .../Qwen3.8-27B-MXFP4-mtpfp8` | Run `./setup-mxfp4.sh`. AMD's release cannot be served directly; see [why](#why-amds-checkpoint-needs-a-rewrite) |
 | `no dflash drafter at ...` | `./setup-mxfp4.sh` fetches it, or serve without it: `SPEC_METHOD=mtp ./serve-mxfp4.sh` |
 | `chat template not readable` | `CHAT_TEMPLATE=<path>`; unset uses this repo's `qwen-fixed-v22.3.jinja`. It is mounted by path, so it must exist **on the host** |
+| `<tool_call>` or `</tool_call>` leaking into assistant content | Not the parser name — `qwen3_coder` and `qwen3_xml` are the same parser. Confirm the image carries `patch_qwen3_toolparse.py` (`vllm/parser/engine/parser_engine.py` should mention `partial=True`) |
 | `/dev/kfd is missing` | The amdgpu kernel driver is not loaded. The image ships ROCm userspace, not the driver |
 | `AssertionError: Attempted to load weight (torch.Size([5120, 10240]))` | You pointed it at AMD's raw checkpoint instead of the one `fp8_mtp.py` builds |
 | Fluent but wrong output; perplexity in the hundreds of thousands | The stock libr4d NaNs the gated-delta-net. Confirm the launcher printed `[radiance] libr4d <pin> -> ...`; if you ran with `AUTO_R4D=0`, set `RADIANCE_MXFP4_SANITIZE=1` as a stopgap |

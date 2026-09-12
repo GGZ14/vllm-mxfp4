@@ -135,7 +135,7 @@ exec podman run --replace --name vllmminm --privileged --ipc=host --network=host
     --attention-backend ROCM_AITER_UNIFIED_ATTN \
     --speculative-config '{"method":"mtp","num_speculative_tokens":8,"attention_backend":"ROCM_AITER_UNIFIED_ATTN","disable_padded_drafter_batch":true}' \
     --no-async-scheduling \
-    --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+    --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     --chat-template /root/.cache/huggingface/qwen-fixed-v22.3.jinja
 # NOTE: this script is FROZEN at the 0.5.8 baseline, template included -- the numbers it reproduces
 # were measured with that exact file, so it is not switched to the repo template the way

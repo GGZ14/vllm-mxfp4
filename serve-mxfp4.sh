@@ -879,7 +879,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     --attention-backend "$ATTN" \
     --speculative-config "$SPEC_CFG" \
     $ASYNC_FLAG $EXTRA \
-    --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+    --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
     --chat-template "$CT_PATH" \
     ${PASSTHRU[@]+"${PASSTHRU[@]}"}
