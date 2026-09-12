@@ -133,6 +133,34 @@ ROT_STREAM=${RADIANCE_PQ_ROT_STREAM:-1}
 ROT_STREAM2=${RADIANCE_PQ_ROT_STREAM2:-1}
 # Stream 3: the two-rank all-reduce fused into the norm+rotate producers (default off until gated).
 ROT_STREAM3=${RADIANCE_PQ_ROT_STREAM3:-0}
+# MODEL_DIR names a directory under $MODELS. Overridable so the same launcher (same patches,
+# same patched libr4d, same template) can serve a pseudo-quantized checkpoint for an accuracy
+# gate -- keeping every variable but the weights fixed.
+MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
+MODEL=/models/$MODEL_DIR
+[ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
+
+# Bit width decides the activation-quant defaults. int5 checkpoints serve at their measured best
+# with int8 per-group activations and the zero-point epilogue (same-stack KL 0.0100 / top-1 95.2%
+# vs 0.0126 without), so reading the width off the checkpoint means MODEL_DIR is the only thing a
+# user has to set. An explicit RADIANCE_PQ_* in the environment still wins. This has to happen
+# BEFORE the cache suffix below, which is keyed on exactly these flags -- a mismatch here serves
+# the wrong compiled graph out of a stale cache dir.
+PQ_BITS=$(python3 -c '
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("quantization_config") or {}).get("bits", 4))
+except Exception:
+    print(4)
+' "$MODELS/$MODEL_DIR/config.json" 2>/dev/null || echo 4)
+if [ "$PQ_BITS" = 5 ]; then
+  RADIANCE_PQ_I8=${RADIANCE_PQ_I8:-1}
+  RADIANCE_PQ_PG=${RADIANCE_PQ_PG:-1}
+  RADIANCE_PQ_ZPE=${RADIANCE_PQ_ZPE:-1}
+  export RADIANCE_PQ_I8 RADIANCE_PQ_PG RADIANCE_PQ_ZPE
+  echo "[paro] int5 checkpoint -> W5A8 defaults I8=$RADIANCE_PQ_I8 PG=$RADIANCE_PQ_PG ZPE=$RADIANCE_PQ_ZPE (set them explicitly to override)"
+fi
+
 CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && CACHE_SUF="$CACHE_SUF-rs"
 [ "$ROT_STREAM2" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs2"
 [ "$ROT_STREAM3" = 1 ] && CACHE_SUF="${CACHE_SUF}-rs3"
@@ -143,12 +171,6 @@ CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && 
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
-# MODEL_DIR names a directory under $MODELS. Overridable so the same launcher (same patches,
-# same patched libr4d, same template) can serve a pseudo-quantized checkpoint for an accuracy
-# gate -- keeping every variable but the weights fixed.
-MODEL_DIR=${MODEL_DIR:-Qwen3.8-27B-PARO}
-MODEL=/models/$MODEL_DIR
-[ -d "$MODELS/$MODEL_DIR" ] || { echo "model missing at $MODELS/$MODEL_DIR; run setup-paroquant.sh" >&2; exit 1; }
 
 # Chat template. The default is the file every number in RESULTS.md was measured with: the GSM8K
 # band (97-98%) is template-bound, and the model's own bundled template scores 95-96% with runaway

@@ -22,7 +22,7 @@ git clone https://codeberg.org/ggz14/radiance-vllm-mxfp4 && cd radiance-vllm-mxf
 - [Setup](#setup)
 - [Checkpoints](#checkpoints)
 - [Running the server](#running-the-server)
-- [ParoQuant (int4 W4A8)](#paroquant-int4-w4a8)
+- [ParoQuant (int4 W4A8 and int5 W5A8)](#paroquant-int4-w4a8-and-int5-w5a8)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Performance](#performance)
@@ -259,7 +259,7 @@ editing it. With podman, `podman compose` takes the same file. The per-model not
 `--max-num-batched-tokens >= 2240`, Gemma-4-31B's template and drafter) are in
 [DOCKERHUB.md](DOCKERHUB.md#tested-so-far).
 
-## ParoQuant (int4 W4A8)
+## ParoQuant (int4 W4A8 and int5 W5A8)
 
 MXFP4 is not the only int4 format this stack serves. **ParoQuant** checkpoints
 (`z-lab/Qwen3.8-27B-PARO`: int4 group-128 asymmetric, plus learned pairwise Givens rotations and
@@ -285,7 +285,51 @@ Measured against MXFP4 production on 2 x R9700: GSM8K 500q **97.4-98.0%** (MXFP4
 decode **226 t/s** (MXFP4 186), conc-8 512 t/s, 24.19 ms/step, in-serve numerics gate rel = 0.00000
 on every gated shape on both TP ranks (<= 4e-5 at wider M).
 
-A second ParoQuant format keeps the learned rotations on **MXFP4 weights** (e2m1 + e8m0/32),
+### int5 (W5A8)
+
+The same path serves **5-bit** ParoQuant weights, which is where this stack's fidelity lives. Five
+bits and not six because the kernels are then unchanged: the int4 GEMM feeds the fp8 WMMA the
+signed code `c - 8`, exact in e4m3, and with 5-bit codes `c - 16` spans -16..15 where every integer
+is *also* exact in e4m3. The GEMM algebra, the zero-point fold, the activation quant, the
+rotation-stream producers and the split-K / A-tiled bands all carry over; only weight staging
+changes (low nibbles in the existing word layout, the fifth bit in a byte-per-(slot, lane) plane).
+int6 breaks that property and would need an int8-WMMA rewrite.
+
+```bash
+./setup-paroquant.sh --int5                                   # fetch the int5 checkpoint
+MODEL_DIR=Qwen3.8-27B-PARO-int5 MODE=prod SPEC=7 ./paroquant/run_paroquant.sh
+```
+
+That is the whole command. The launcher reads the checkpoint's bit width and turns on the
+activation-quant configuration these numbers were measured with -- int8 per-group activations and
+the zero-point epilogue -- so there are no `RADIANCE_PQ_*` flags to remember. Setting any of them
+explicitly still wins, and the compile-cache directory is keyed on them either way.
+
+Measured on 2 x R9700 (TP=2, fp8 KV, DFlash2-FP8 drafter, SPEC=7) against a same-stack bf16
+reference, wikitext, 96 x 500-char chunks:
+
+| | int4 PARO | PARO-MXFP4 | **int5 W5A8** |
+|---|---|---|---|
+| bits/weight | 4.25 | 4.25 | **5.25** |
+| KL top-5 / top-256 | 0.0195 / 0.0285 | 0.0296 / 0.0419 | **0.0070 / 0.0100** |
+| top-1 agreement | 91.5% | 90.3% | **95.21%** |
+| GSM8K 500q | 97.4-98.0% | 97.4-97.6% | **97.40%** |
+| decode @ctx 25 | 23.5 ms | 23.3 ms | **25.90 ms** |
+| prefill 2k / 64k | 3808 / 3349 | 4770 / 4273 | **3941 / 3436** |
+| KV cache | 854k | 862k | **760k** |
+
+**The bf16 reference has to be served on the same stack.** One collected on a different image
+charges quantization ~0.018 nats that belong to the serving stack's own numerics -- larger than
+int5's entire quantization KL, and enough to re-rank the builds. Two images' bf16 outputs differ
+by KL 0.0198 on their own.
+
+Pick int5 for fidelity-sensitive work (logprobs, draft acceptance, long agentic chains where
+per-token divergence compounds), MXFP4-PARO for maximum prefill and KV headroom. Task accuracy does
+not separate them: GSM8K is 97.4-97.8% for every variant, inside noise at 500 questions.
+
+### MXFP4 weights (W4A8)
+
+A third ParoQuant format keeps the learned rotations on **MXFP4 weights** (e2m1 + e8m0/32),
 which puts the GEMM on the zero-VALU fp8-WMMA loop AMD's MXFP4 runs on -- `quant_method:
 paroquant_mxfp4`, built by `paroquant/build_hybrid.py` from the bf16 base and z-lab's rotations,
 served by `paroquant/radiance_paroquant_mxfp4.py`. In-serve CHECKALL with real inputs holds rel 0.0012-0.0021 (bf16 rounding) on
