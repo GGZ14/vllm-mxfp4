@@ -160,7 +160,8 @@ def classify(p: subprocess.CompletedProcess) -> tuple[str, str]:
     fail = next((l.strip() for l in out.splitlines() if "FAIL" in l), "")
     if p.returncode == 0:
         if "NOOP" in out and "  OK" not in out:
-            return "NOOP", "sentinel already present -- upstream carries this change"
+            line = next((l.strip() for l in out.splitlines() if "NOOP" in l), "")
+            return "NOOP", line or "sentinel already present"
         return "OK", ""
     if "anchor matched" in fail:
         return "ANCHOR", fail
