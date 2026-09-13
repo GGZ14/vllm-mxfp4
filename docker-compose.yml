@@ -90,6 +90,8 @@ services:
     environment:
       # GPU visibility: select your two R9700s by HIP index (exclude any iGPU). Never CUDA_VISIBLE_DEVICES.
       HIP_VISIBLE_DEVICES: "0,1"
+      # vLLM usage telemetry. Off by default here; set VLLM_NO_USAGE_STATS=0 to re-enable.
+      VLLM_NO_USAGE_STATS: "${VLLM_NO_USAGE_STATS:-1}"
       # AITER: unified attention ON, every other AITER path OFF (LINEAR=1 crashes on gfx1201).
       VLLM_ROCM_USE_AITER: "1"
       VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"

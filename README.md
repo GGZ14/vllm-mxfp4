@@ -469,6 +469,28 @@ as a one-line error rather than a traceback.
 | `current platform does not support native MXFP4/MXFP6` | **False alarm.** It comes from a separate `supports_mx()` call. The line that matters is `[radiance] native MXFP4 enabled on gfx12x` |
 | Startup is slow and looks hung | First run compiles Triton/inductor kernels. Later runs reuse `$CACHE` |
 | OOM at startup after changing `MAXSEQS`, `CHUNK` or a graph-changing knob | The KV pin (`KV_MEM`) was derived at `MAXSEQS=8`. `KV_MEM=0` re-enables vLLM's own profiling |
+| `JSONDecodeError` from `_report_usage_worker` at startup | **Harmless, and already fixed.** vLLM's usage-stats thread builds its payload by shelling out to `cpuinfo`, and in a ParoQuant container that child imports vLLM through our `sitecustomize` hook and prints a `CUDA_VISIBLE_DEVICES on ROCm is deprecated` WARNING onto its own stdout, ahead of the JSON it is supposed to emit. The engine is unaffected and nothing was ever transmitted — the crash is at payload-build time, before the POST. The launchers now pass `VLLM_NO_USAGE_STATS=1`; `VLLM_NO_USAGE_STATS=0` brings back both the telemetry and the traceback |
+
+### Benign log lines
+
+Three lines come up often enough to be worth naming. None of them is a problem.
+
+`INFO ... [weight_utils.py:890] Auto-prefetch is disabled because the filesystem (EXT4) is not a
+recognized network FS (NFS/Lustre)` — informational, and the good case. vLLM only prefetches
+checkpoint shards into page cache when the weights sit on a network filesystem; on a local disk the
+mmap read is already optimal, and `--safetensors-load-strategy=prefetch` forces work that buys
+nothing.
+
+`Loading safetensors checkpoint shards: 80% Completed | 0/1` — cosmetic. There are two progress
+bars (the target's shards, then the DFlash2 drafter's single shard), and vLLM deliberately uses a
+newline-terminated bar format rather than a redrawing one so it stays readable under multiprocessing
+(`weight_utils.py`), so the per-line log prefixer can stitch a fragment of one bar onto the other.
+**`n/total` is the authoritative field, not the percentage** — `100% Completed | 1/1` follows.
+
+`WARNING ... [rocm.py] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated` — nothing sets that
+variable: on ParoQuant builds vLLM mirrors our `HIP_VISIBLE_DEVICES` into it at import and then warns
+about its own copy. Harmless in the server log; it was only load-bearing in the `cpuinfo` subprocess
+above.
 
 ## Performance
 
