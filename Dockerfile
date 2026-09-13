@@ -9,12 +9,12 @@
 #
 # stack: torch 2.11.0, triton 3.6.0, torchvision 0.24.1, aiter v0.1.17, vLLM v0.27.1,
 # all compiled for PYTORCH_ROCM_ARCH=gfx1201 against the base image's ROCm 7.14.
-ARG ROCM_BASE=rocm/dev-ubuntu-24.04:7.14.0-full@sha256:439edaa8f0c4be4a3728e528f87b8a2ea1f051f34cf10b27caa4bd94f562eda7
+ARG ROCM_BASE=docker.io/rocm/dev-ubuntu-24.04:7.14.0-full@sha256:439edaa8f0c4be4a3728e528f87b8a2ea1f051f34cf10b27caa4bd94f562eda7
 ARG GFX_ARCH=gfx1201
 # The release stage starts from a clean distro image rather than the ROCm base, and COPYs in only
 # the pruned ROCm tree plus the venv. Same Ubuntu release as the ROCm base (24.04), so the venv's
 # interpreter (python 3.12.3) matches.
-ARG RELEASE_BASE=ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506d312abe51acda354ff061
+ARG RELEASE_BASE=docker.io/library/ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506d312abe51acda354ff061
 
 # Component pins, in one place. Each is both the git tag that gets compiled and the version the
 # resulting wheel reports, so `pip show`, `importlib.metadata`, and the startup banner all agree
