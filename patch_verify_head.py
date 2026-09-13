@@ -16,7 +16,7 @@ Inert unless RADIANCE_VERIFY_HEAD=1; the module returns immediately. Idempotent.
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 F = (Path(sysconfig.get_paths()["purelib"])
      / "vllm/v1/worker/gpu/model_runner.py")
@@ -36,8 +36,27 @@ NEW = """        sample_hidden_states = hidden_states[input_batch.logits_indices
 """
 
 
+# --- vLLM 0.29 shape --------------------------------------------------------------------------
+# 0.29 added a vocab-sharded logits path (compute_logits_local + all_to_all_logits) and pushed the
+# ordinary one into the else branch, so the same two lines now sit one level deeper. Note the hook
+# rides the else branch only: with vocab sharding on, the verify head would silently not run.
+OLD_029 = """            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
+"""
+
+NEW_029 = """            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            # --- RADIANCE int2 verify head (patch_verify_head.py) ---
+            try:
+                import radiance_verifyhead as _radiance_vh
+                _radiance_vh.before_compute_logits(self, input_batch, grammar_output)
+            except Exception:
+                pass
+            logits = self.model.compute_logits(sample_hidden_states)
+"""
+
+
 def main():
-    apply(F, OLD, NEW, "RADIANCE int2 verify head",
+    apply_any(F, [(OLD, NEW), (OLD_029, NEW_029)], "RADIANCE int2 verify head",
           "verify head: evaluate the sampling-param gate before compute_logits")
 
 

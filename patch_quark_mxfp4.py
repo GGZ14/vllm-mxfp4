@@ -58,7 +58,7 @@ M>=64, and gfx1201's WMMA is 16x16x16 only, so those bands fail to compile with
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 SP = Path(sysconfig.get_paths()["purelib"])
 KL = SP / "vllm/model_executor/kernels/linear/__init__.py"
@@ -160,14 +160,32 @@ IMPORT_NEW = (
 )
 
 
+
+# --- vLLM 0.29 shapes -------------------------------------------------------------------------
+# Two moves. The kernel list no longer resolves `linear_backend` at that point (0.29 filters later
+# via _resolve_backend_kernels), and aiter's preshuffled entry point was renamed
+# gemm_afp4wfp4_preshuffled_weight_scales -> gemm_afp4wfp4_preshuffle. Our pinned aiter 0.1.17
+# carries both names, so only the module path still needs correcting; the arch relaxation is
+# unchanged.
+REGISTER_ANCHOR_029 = '    config = MxFp4LinearLayerConfig(\n        activation_quant_key=activation_quant_key,\n    )\n\n    platform = current_platform._enum\n    possible = list(_POSSIBLE_MXFP4_KERNELS.get(platform, []))\n'
+
+REGISTER_NEW_029 = '    config = MxFp4LinearLayerConfig(\n        activation_quant_key=activation_quant_key,\n    )\n\n    platform = current_platform._enum\n    possible = list(_POSSIBLE_MXFP4_KERNELS.get(platform, []))\n\n    # --- radiance (patch_quark_mxfp4.py): the gfx1201 W4A8 fp8-WMMA kernel ---\n    # Imported here, not at module scope: this runs in the worker at model load, whereas the\n    # module is imported in the parent during config parsing, where initialising HIP would\n    # force the engine core to spawn instead of fork. It declines via is_supported() unless\n    # RADIANCE_MXFP4_W4A8=1 on gfx12x, so the list is unchanged everywhere else.\n    try:\n        import radiance_mxfp4 as _radiance_mxfp4\n\n        _radiance_cls = _radiance_mxfp4.kernel_class()\n        if _radiance_cls is not None:\n            possible.insert(0, _radiance_cls)\n    except Exception as _radiance_exc:  # never block model load on our own kernel\n        logger.warning_once("[radiance] MXFP4 W4A8 kernel unavailable: %r", _radiance_exc)\n'
+
+IMPORT_ANCHOR_029 = '        from aiter.ops.triton.gemm_afp4wfp4 import (\n            gemm_afp4wfp4,\n            gemm_afp4wfp4_preshuffle,\n        )\n'
+
+IMPORT_NEW_029 = '        # --- radiance (patch_quark_mxfp4.py): aiter 0.1.17 moved this module ---\n        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (\n            gemm_afp4wfp4,\n            gemm_afp4wfp4_preshuffle,\n        )\n\n        # aiter allowlists gfx950/gfx1250 for fp4; gfx1201 lowers tl.dot_scaled correctly\n        # (verified bit-identical against the emulated path), so relax the assert. Done\n        # here, lazily, to keep aiter out of the plugin-load import graph.\n        import aiter.ops.triton.utils._triton.arch_info as _radiance_arch\n\n        if not _radiance_arch.is_fp4_avail():\n            _radiance_arch.is_fp4_avail = lambda: True\n'
+
+
 def main():
-    apply(KL, REGISTER_ANCHOR, REGISTER_NEW,
+    apply_any(KL, [(REGISTER_ANCHOR, REGISTER_NEW),
+                   (REGISTER_ANCHOR_029, REGISTER_NEW_029)],
           "[radiance] MXFP4 W4A8 kernel unavailable",
           "mxfp4: register the radiance W4A8 kernel")
     apply(KA, SUPPORTS_ANCHOR, SUPPORTS_NEW,
           "[radiance] native MXFP4 enabled on gfx12x",
           "mxfp4: relax aiter's CDNA4 gate")
-    apply(KA, IMPORT_ANCHOR, IMPORT_NEW,
+    apply_any(KA, [(IMPORT_ANCHOR, IMPORT_NEW),
+                   (IMPORT_ANCHOR_029, IMPORT_NEW_029)],
           "aiter 0.1.17 moved this module",
           "mxfp4: aiter moved-module + fp4 arch allowlist")
 

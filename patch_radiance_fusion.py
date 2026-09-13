@@ -66,6 +66,19 @@ MARKER = "RADIANCE: rms_norm(+fused_add) + group fp8 quant"
 
 
 def main():
+    # Superseded upstream from 0.29. This workaround exists because on gfx1201 the graph emits the
+    # native torch.ops._C.per_token_group_fp8_quant, so stock's aiter-quant matcher matched zero
+    # patterns. 0.29 derives the same thing properly -- `match_aiter_quant_op =
+    # not rocm_aiter_ops.is_rdna_aiter_enabled()`, commented "RDNA4 uses native quant ops and
+    # supports only Triton replacements" -- and threads it through every pattern constructor.
+    # Stand down there rather than abort: the shipped 0.27.1 image still needs this patch.
+    #
+    # Confirm once on a 0.29 boot that is_rdna_aiter_enabled() is actually true under our AITER
+    # flag set. If upstream's gate misses, this coverage fix has to come back.
+    if "is_rdna_aiter_enabled" in F.read_text():
+        print("  NOOP  rms+quant fusion coverage: upstream gates on is_rdna_aiter_enabled()")
+        return
+
     apply(F, ANCHOR, NEW, MARKER, "rms+quant fusion coverage fix")
 
 
