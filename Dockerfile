@@ -23,20 +23,27 @@ ARG RELEASE_BASE=docker.io/library/ubuntu:24.04@sha256:a08e551cb33850e4740772b38
 # pyproject.toml -- that is the CUDA build. The combination upstream actually tests on ROCm is the
 # one in its own docker/Dockerfile.rocm_base, and requirements/rocm.txt pins no torch at all.
 # For v0.29.0 that file builds PYTORCH_BRANCH=release/2.12 (ROCm/pytorch @ 6bbd260) with
-# torchvision v0.27.1, triton release/internal/3.7.x and aiter v0.1.19, and its PYTORCH_ROCM_ARCH
-# list includes gfx1201. We track those versions from the upstream tags rather than the ROCm
-# forks, which is what the 0.27.1-era pins did too (release/2.11 -> tag v2.11.0).
+# torchvision v0.27.1, triton release/internal/3.7.x and aiter v0.1.19, on BASE_IMAGE
+# rocm/dev-ubuntu-22.04:7.2.3-complete.
 #
-# What to avoid is bumping any of them ALONE. 0.5.0-0.5.4 ran torch 2.13 / triton 3.7.1 /
-# torchvision 0.28 -- a combination upstream never tested, reachable because
-# `use_existing_torch.py` strips the pin -- and hung the GPU under sustained load where the
-# sanctioned trio did not. This move is the whole trio at once, matched to the vLLM release being
-# built; the acceptance gate is therefore a SUSTAINED conc-8 TP=2 run, not a smoke test, because
-# that is the only condition under which the 0.5.x hang ever appeared.
-ARG TORCH_VERSION=2.12.1
-ARG TRITON_VERSION=3.7.1
-ARG TORCHVISION_VERSION=0.27.1
-ARG AITER_VERSION=0.1.19
+# That trio was tried here and does not build on this base. ROCm 7.14's RCCL advertises itself as
+# NCCL 2.30.4 (NCCL_VERSION_CODE 23004 in rccl.h), which is past the version gate torch 2.12 uses
+# to switch on NCCL symmetric memory -- but RCCL implements only ncclCommWindowRegister and ships
+# no ncclDevComm* API at all, so torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.cu
+# compiles its device-comm path and dies on `use of undeclared identifier NCCLDevCommManager`
+# (~7270 of 7591 objects in, roughly two hours). Upstream never meets this because it pairs the
+# ROCm pytorch FORK with the older ROCm 7.2.3, whose RCCL reports a lower version.
+#
+# So torch stays on the trio that is known good against ROCm 7.14. vLLM 0.29.0 is built against it
+# via use_existing_torch.py, which strips vLLM's own torch pin. Three ways forward if 0.29 turns
+# out to need 2.12 APIs, in increasing cost: build torch from ROCm/pytorch release/2.12 rather
+# than the upstream tag; patch the NCCL symmem version gate; or move the base to ROCm 7.2.3.
+# Do not bump torch/triton/torchvision singly -- 0.5.0-0.5.4 ran torch 2.13 / triton 3.7.1 /
+# torchvision 0.28 and hung the GPU under sustained load. They move together or not at all.
+ARG TORCH_VERSION=2.11.0
+ARG TRITON_VERSION=3.6.0
+ARG TORCHVISION_VERSION=0.24.1
+ARG AITER_VERSION=0.1.17
 ARG VLLM_VERSION=0.29.0
 # transformers is pinned here because vLLM does not pin it: requirements/common.txt asks only for
 # `transformers >= 5.5.3`, so an unpinned rebuild silently picks up whatever is newest and the
