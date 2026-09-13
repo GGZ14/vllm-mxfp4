@@ -20,19 +20,24 @@ ARG RELEASE_BASE=ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506
 # resulting wheel reports, so `pip show`, `importlib.metadata`, and the startup banner all agree
 # with what was actually built.
 # torch/triton/torchvision are NOT free choices, and the number to read is not the one in
-# pyproject.toml. vLLM 0.27.1's build-system asks for `torch == 2.13.0`, but that is the CUDA
-# build: upstream's own ROCm image (docker/Dockerfile.rocm_base) builds PYTORCH_BRANCH=release/2.11
-# with torchvision v0.24.1, and requirements/rocm.txt pins no torch at all. release/2.11 is
-# therefore the combination upstream actually tests on ROCm, unchanged from 0.26.0. torch 2.11.0
-# pins triton 3.6.0. Building against newer ones means running a combination upstream never tests:
-# 0.5.0-0.5.4 did exactly that (torch 2.13 / triton 3.7.1 / torchvision 0.28) because
-# `use_existing_torch.py` strips the pin, and those builds hang the GPU under load where 0.4.0 --
-# which used this sanctioned trio -- does not.
-ARG TORCH_VERSION=2.11.0
-ARG TRITON_VERSION=3.6.0
-ARG TORCHVISION_VERSION=0.24.1
-ARG AITER_VERSION=0.1.17
-ARG VLLM_VERSION=0.27.1
+# pyproject.toml -- that is the CUDA build. The combination upstream actually tests on ROCm is the
+# one in its own docker/Dockerfile.rocm_base, and requirements/rocm.txt pins no torch at all.
+# For v0.29.0 that file builds PYTORCH_BRANCH=release/2.12 (ROCm/pytorch @ 6bbd260) with
+# torchvision v0.27.1, triton release/internal/3.7.x and aiter v0.1.19, and its PYTORCH_ROCM_ARCH
+# list includes gfx1201. We track those versions from the upstream tags rather than the ROCm
+# forks, which is what the 0.27.1-era pins did too (release/2.11 -> tag v2.11.0).
+#
+# What to avoid is bumping any of them ALONE. 0.5.0-0.5.4 ran torch 2.13 / triton 3.7.1 /
+# torchvision 0.28 -- a combination upstream never tested, reachable because
+# `use_existing_torch.py` strips the pin -- and hung the GPU under sustained load where the
+# sanctioned trio did not. This move is the whole trio at once, matched to the vLLM release being
+# built; the acceptance gate is therefore a SUSTAINED conc-8 TP=2 run, not a smoke test, because
+# that is the only condition under which the 0.5.x hang ever appeared.
+ARG TORCH_VERSION=2.12.1
+ARG TRITON_VERSION=3.7.1
+ARG TORCHVISION_VERSION=0.27.1
+ARG AITER_VERSION=0.1.19
+ARG VLLM_VERSION=0.29.0
 # transformers is pinned here because vLLM does not pin it: requirements/common.txt asks only for
 # `transformers >= 5.5.3`, so an unpinned rebuild silently picks up whatever is newest and the
 # stack changes underneath the build. 5.15.0 made Gemma-4's head_dim a per-layer attribute and
