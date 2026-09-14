@@ -367,6 +367,16 @@ def install_modules():
         (here / "qwen3_dflash2.py", SP / "vllm/model_executor/models/qwen3_dflash2.py"),
         (here / "speculator.py", SP / "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py"),
     ]
+
+    # This patch backports vllm-project/vllm#52816, which merged ten days after 0.27.1 was cut.
+    # From 0.29 upstream ships both modules itself and every source hunk above NOOPs, so copying
+    # our 0.27-era pair over theirs would be a silent downgrade: their speculator passes
+    # IS_DRAFTING=True into gumbel_noised_argmax and keys the draw on position P-1, which ours
+    # does not. Never overwrite a file upstream provided.
+    if all(dst.exists() for _, dst in targets):
+        print("  NOOP  DFlash2 modules: upstream ships them, keeping upstream's copies")
+        return
+
     pkg = SP / "vllm/v1/worker/gpu/spec_decode/dflash2"
     pkg.mkdir(exist_ok=True)
     init = pkg / "__init__.py"

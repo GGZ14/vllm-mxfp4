@@ -178,6 +178,7 @@ docker run --rm -it \
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \
   -e VLLM_ROCM_USE_AITER_FP4BMM=0 -e VLLM_ROCM_USE_AITER_RMSNORM=0 \
   -e NCCL_PROTO=Simple \
+  -e VLLM_NO_USAGE_STATS=1 \
   -e RADIANCE_PRESHUFFLE=1 \
   -e RADIANCE_USE_R4D_AR=1 \
   -e RADIANCE_USE_R4D_AR_QUANT=1 \
@@ -225,6 +226,25 @@ With an empty cache the first start spends a few extra minutes compiling Triton 
   -e AITER_ROOT_DIR=/cache/aiter \
   -e TRITON_CACHE_AUTOTUNING=1
 ```
+
+## Benign startup log lines
+
+`Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS
+(NFS/Lustre)` — informational, and the good case: vLLM prefetches shards into page cache only on
+NFS/Lustre, and on a local disk the mmap read is already optimal.
+
+`Loading safetensors checkpoint shards: 80% Completed | 0/1` — cosmetic. Two bars (the target, then
+the drafter's single shard) and a newline-terminated bar format that stays safe under
+multiprocessing, so the log prefixer can stitch a fragment of one onto the other. `n/total` is the
+authoritative field, not the percentage.
+
+`Exception in thread Thread-1 (_report_usage_worker)` ending in `JSONDecodeError: Expecting value:
+line 1 column 1 (char 0)` — vLLM's usage-stats thread shells out to `cpuinfo` and parses that
+child's stdout as JSON; on ParoQuant builds the child inherits a `CUDA_VISIBLE_DEVICES` that vLLM
+set on itself and prints a deprecation WARNING onto stdout ahead of the JSON. The engine is
+unaffected, and the failure happens while building the payload, before anything is sent. The
+launchers pass `-e VLLM_NO_USAGE_STATS=1`; add it to your own `docker run` if you assembled one by
+hand. `VLLM_NO_USAGE_STATS=0` restores both the telemetry and the traceback.
 
 ## Flags
 
