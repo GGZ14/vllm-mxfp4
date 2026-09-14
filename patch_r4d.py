@@ -44,7 +44,7 @@ costs today. Left out rather than shipped on a guess."""
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 PURELIB = Path(sysconfig.get_paths()["purelib"])
 REG = PURELIB / "vllm/v1/attention/backends/registry.py"
@@ -77,6 +77,26 @@ LAYER_OLD = (
 )
 LAYER_NEW = (
     LAYER_OLD
+    + "\n"
+    + "        # --- RADIANCE all-R4D gated delta net (patch_r4d.py) ---\n"
+    + "        # conv_prep -> kkt_solve -> chunk_scan for a prefill step, conv_update ->\n"
+    + "        # recurrent_update for a speculative decode step. Returns False for any step it\n"
+    + "        # does not cover, which leaves the Triton body below exactly as it was.\n"
+    + "        if _radiance_gdn is not None and _radiance_gdn.ALL:\n"
+    + "            if _radiance_gdn.forward_core_fused(self, mixed_qkv, b, a, core_attn_out):\n"
+    + "                return\n"
+)
+
+
+# --- vLLM 0.29 shape --------------------------------------------------------------------------
+# 0.29 resolves the per-layer metadata before the guard (`attn_metadata_raw.get(self.prefix)`) and
+# tests that instead of the raw dict. It also grew two sibling cores,
+# _forward_core_fused_norm{,_packed}, whose guards are textually identical -- hence the extra
+# context line, so this anchors on _forward_core and nothing else.
+LAYER_OLD_029 = '        attn_metadata_raw = forward_context.attn_metadata\n\n        attn_metadata = None\n        if isinstance(attn_metadata_raw, dict):\n            attn_metadata = attn_metadata_raw.get(self.prefix)\n        if attn_metadata is None:\n            self._warmup_prefill_kernels(mixed_qkv, 0)\n            return\n'
+
+LAYER_NEW_029 = (
+    LAYER_OLD_029
     + "\n"
     + "        # --- RADIANCE all-R4D gated delta net (patch_r4d.py) ---\n"
     + "        # conv_prep -> kkt_solve -> chunk_scan for a prefill step, conv_update ->\n"
@@ -132,7 +152,8 @@ def main():
     apply(REG, REG_OLD, REG_NEW, "radiance_r4d_attn", "R4D attention backend enum")
     apply(L, LAYER_IMPORT_OLD, LAYER_IMPORT_NEW, "import radiance_gdn as _radiance_gdn",
           "RADIANCE all-R4D GDN import")
-    apply(L, LAYER_OLD, LAYER_NEW, "RADIANCE all-R4D gated delta net",
+    apply_any(L, [(LAYER_OLD, LAYER_NEW), (LAYER_OLD_029, LAYER_NEW_029)],
+              "RADIANCE all-R4D gated delta net",
           "route the whole GDN layer -> R4D kernels")
     apply(F, IMPORT_OLD, IMPORT_NEW, "import radiance_gdn as _radiance_gdn",
           "RADIANCE fused GDN import")

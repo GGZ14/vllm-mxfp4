@@ -26,3 +26,31 @@ def apply(path, anchor, new, sentinel, label):
     ast.parse(s)  # never write a file that would not parse
     path.write_text(s)
     print(f"  OK    {label}")
+
+
+def apply_any(path, variants, sentinel, label):
+    """`apply()` over several (anchor, new) shapes: the first that matches uniquely wins.
+
+    The launchers patch the *shipped* image at container start while the Dockerfile builds against
+    whatever vLLM is pinned, so one repo drives two versions at once. A patch re-anchored for a
+    new vLLM therefore has to keep the old shape working, or the next production restart dies on
+    an image that was fine a minute ago. Fatal only when no shape matches -- the counts are
+    reported so a genuine drift is distinguishable from a version we simply do not carry.
+    """
+    if not path.exists():
+        raise SystemExit(f"  FAIL  {label}: {path} missing")
+    s = path.read_text()
+    if sentinel in s:
+        print(f"  NOOP  {label} already applied")
+        return
+    counts = []
+    for i, (anchor, new) in enumerate(variants):
+        n = s.count(anchor)
+        counts.append(n)
+        if n == 1:
+            s = s.replace(anchor, new, 1)
+            ast.parse(s)
+            path.write_text(s)
+            print(f"  OK    {label}" + (f" (shape {i + 1})" if i else ""))
+            return
+    raise SystemExit(f"  FAIL  {label}: no shape matched, counts {counts} ({path})")

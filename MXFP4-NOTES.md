@@ -1,7 +1,7 @@
 # MXFP4 build notes
 
 Design notes, measurements and traps behind `serve-mxfp4.sh`. None of this is needed to run the
-server -- start at the [README quickstart](README.md#quickstart). It is kept because every default
+server -- start at the [README quick start](README.md#quick-start). It is kept because every default
 in the launcher was chosen against a measurement, and the reasoning is what makes those defaults
 re-derivable when something moves.
 

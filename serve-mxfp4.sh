@@ -95,7 +95,9 @@ Everything is an environment variable; these are the ones worth knowing.
   HIP_FORCE_DEV_KERNARG=1   ROCm runtime knobs passed through when set: kernargs in VRAM,
   HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
   MXFP4_CUMODE=1            compile the MXFP4 GEMM .hip with -mcumode (A/B; output-identical)
+  VLLM_NO_USAGE_STATS=1     vLLM usage telemetry (default off here); 0 re-enables it
   DRY_RUN=1                 print the container command instead of running it
+  DETACH=1                  start in the background and return (logs: RUNTIME logs -f NAME)
   PREPARE_ONLY=1            do the one-time work (image, libr4d) and stop before serving
 
 Full knob reference: README.md. Design notes and measurements: MXFP4-NOTES.md.
@@ -144,6 +146,12 @@ else
     if [ -n "$gid" ]; then GROUP_FLAGS+=(--group-add "$gid"); fi
   done
 fi
+# DETACH=1 starts the container in the background and returns once it is RUNNING -- which is not
+# the same as ready: the engine still has to load and compile, so anything waiting on the server
+# has to poll /health (docker-quickstart.sh does). Both runtimes take -d, and the container
+# NAME is the handle either way (`$RUNTIME logs -f $NAME`, `$RUNTIME stop $NAME`), so nothing
+# else in this file changes.
+if [ "${DETACH:-0}" = 1 ]; then RT_FLAGS+=(-d); fi
 
 # ---------------------------------------------------------------- host preflight
 # Every check here fails with the command that fixes it. They are cheap, and each one stands for a
@@ -738,6 +746,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
   -e ROCR_VISIBLE_DEVICES="$GPU_IDS" -e HIP_VISIBLE_DEVICES="$GPU_IDS" -e HF_HUB_OFFLINE=1 \
   -e VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}" \
+  -e VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}" \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \

@@ -26,7 +26,7 @@ the critical path, or inductor re-packs the custom-op inputs regardless.
 import sysconfig
 from pathlib import Path
 
-from _patchlib import apply
+from _patchlib import apply, apply_any
 
 PURELIB = Path(sysconfig.get_paths()["purelib"])
 L = PURELIB / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
@@ -76,6 +76,27 @@ ZEROS_NEW = (
     "        torch.ops.vllm.qwen_gdn_attention_core(\n"
 )
 
-apply(L, SPLIT_OLD, SPLIT_NEW, "patch_gdn_glue.py): the R4D core reads strided gates", "gdn strided gates")
+
+# --- vLLM 0.29 shape --------------------------------------------------------------------------
+# 0.29 dropped the two .contiguous() calls outright, so upstream now hands the core strided gates
+# unconditionally. We re-add them under the same knob rather than treating the hunk as superseded:
+# with RADIANCE_GDN_STRIDED_GATES=0 (the launcher default) the R4D core is entitled to assume
+# contiguous b/a, and inheriting upstream's new behaviour would quietly break that assumption.
+# With the knob on, this matches upstream exactly.
+SPLIT_OLD_029 = (
+    "            b, a = self.split_ba(ba)\n"
+)
+
+SPLIT_NEW_029 = (
+    "            b, a = self.split_ba(ba)\n"
+    "            # --- RADIANCE (patch_gdn_glue.py): the R4D core reads strided gates ---\n"
+    "            if not (_radiance_gdn is not None and _radiance_gdn.STRIDED_GATES):\n"
+    "                b = b.contiguous()\n"
+    "                a = a.contiguous()\n"
+)
+
+
+apply_any(L, [(SPLIT_OLD, SPLIT_NEW), (SPLIT_OLD_029, SPLIT_NEW_029)],
+          "patch_gdn_glue.py): the R4D core reads strided gates", "gdn strided gates")
 apply(L, HOOK_OLD, HOOK_NEW, "patch_gdn_glue.py: the Triton body below", "gdn fallback re-pack")
 apply(L, ZEROS_OLD, ZEROS_NEW, "the rx5 fused_update zeroes the pad rows itself", "gdn core_attn_out alloc")

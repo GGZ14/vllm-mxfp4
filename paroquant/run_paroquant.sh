@@ -29,6 +29,11 @@
 # Env knobs this script reads (the rest are passed through to the container unchanged):
 #   RUNTIME=podman|docker   container runtime; auto-detected, podman preferred
 #   MAXLEN= MAXSEQS=        --max-model-len / --max-num-seqs, in BOTH modes (defaults per mode)
+#   VLLM_NO_USAGE_STATS=1   vLLM usage telemetry, off by default here; 0 re-enables it. It
+#                           cannot work in this container anyway: the payload is built by
+#                           shelling out to cpuinfo, and the sitecustomize import below puts
+#                           a vLLM WARNING on that child stdout ahead of its JSON, which is
+#                           the JSONDecodeError users were seeing from _report_usage_worker.
 #
 # Port 8080 is prod's port and both need both GPUs: stop production first
 #   systemctl --user stop qwen_vllm_38        restore with: vllm-switch 38
@@ -233,6 +238,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
   -e ROCR_VISIBLE_DEVICES="$GPUS" -e HIP_VISIBLE_DEVICES="$HIP_IDX" \
   -e HF_HUB_OFFLINE=1 \
+  -e VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}" \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \
@@ -329,17 +335,21 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
     cp /patches/radiance_dflash_capture.py "$SP"/ 2>/dev/null || cp ../radiance_dflash_capture.py "$SP"/
     # NB: appended to the STDLIB sitecustomize, not written to site-packages -- Ubuntu ships
     # /usr/lib/python3.12/sitecustomize.py and it shadows any site-packages one, so a file
-    # dropped there is silently never imported. Each container run starts from the pristine image,
-    # so the append does not accumulate.
-    printf "%s\n" \
-      "try:" \
-      "    import radiance_paroquant  # registers the paroquant quantization config" \
-      "    import radiance_paroquant_mxfp4  # and the MXFP4-weights variant (paroquant_mxfp4)" \
-      "    import radiance_dflash_capture  # drafter training-data capture (inert unless RADIANCE_DFLASH_CAPTURE_DIR)" \
-      "except Exception as e:" \
-      "    import sys" \
-      "    sys.stderr.write(\"[radiance.paroquant] registration failed: %r\\n\" % (e,))" \
-      >> /usr/lib/python3.12/sitecustomize.py
+    # dropped there is silently never imported.
+    # Guarded: podman run --replace starts from the pristine image, but podman start on an
+    # EXISTING container re-runs this whole script in the same writable layer, and an unguarded
+    # >> then appends another copy of the block on every restart.
+    if ! grep -q radiance_paroquant /usr/lib/python3.12/sitecustomize.py; then
+      printf "%s\n" \
+        "try:" \
+        "    import radiance_paroquant  # registers the paroquant quantization config" \
+        "    import radiance_paroquant_mxfp4  # and the MXFP4-weights variant (paroquant_mxfp4)" \
+        "    import radiance_dflash_capture  # drafter training-data capture (inert unless RADIANCE_DFLASH_CAPTURE_DIR)" \
+        "except Exception as e:" \
+        "    import sys" \
+        "    sys.stderr.write(\"[radiance.paroquant] registration failed: %r\\n\" % (e,))" \
+        >> /usr/lib/python3.12/sitecustomize.py
+    fi
     # Leave the bind mounts before exec: a stale .so in the working dir precedes site-packages
     # on sys.path (see run_mxfp4_074 for the 17-hours-stale-kernel incident).
     cd /

@@ -52,6 +52,16 @@ NEW_DEFER = '''        # radiance (patch_dflash_mxfp4_kv.py): defer for ANY quan
 
 
 def main():
+    # Superseded, conditionally. patch_dflash_fused_kv_fp8 (baked into the image) used to stop at
+    # fp8 and leave this follow-on to widen it; since 1a70d1e it writes `_DFLASH_DENSE` and does
+    # the whole job itself, which also deletes the `_DFLASH_FP8` anchors below. Images built
+    # before that commit -- 0.9.3, the one in production -- still need this patch, so detect the
+    # newer shape and stand down rather than aborting the boot. Delete this file once no
+    # supported image predates 1a70d1e.
+    if "_DFLASH_DENSE" in DF.read_text():
+        print("  NOOP  dflash fused-KV: already widened by patch_dflash_fused_kv_fp8")
+        return
+
     apply(DF, ANCHOR_ROWS, NEW_ROWS, "the direct slice is valid only for a dense",
           "dflash: fused-KV rows for any quantized qkv_proj")
     apply(DF, ANCHOR_DEFER, NEW_DEFER, "defer for ANY quantized weight",

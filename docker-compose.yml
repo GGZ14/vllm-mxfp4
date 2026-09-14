@@ -1,8 +1,18 @@
 # Example serve for Qwen3.8-27B-FP8 on dual R9700 (gfx1201), managed by docker compose.
+#
+# Run ./docker-compose-setup.sh FIRST. It writes a .env with the three things that are properties
+# of your host and cannot be defaults in a committed file -- the numeric render/video group ids,
+# which HIP indices to serve on, and where the checkpoints live -- so nothing below has to be
+# edited. `--download` also fetches the checkpoint.
+#
 # Launch from this directory:
 #     docker compose up -d          # start (detached); poll `docker compose logs -f`
 #     docker compose down           # stop + remove
 #     docker compose restart        # restart in place
+#
+# This serves the plain FP8 checkpoint. For MXFP4 -- 4-bit weights, the speculative drafter and
+# every number in README.md -- use ./docker-quickstart.sh, which is script-shaped because the
+# MXFP4 path applies patches and compiles a kernel at container start.
 #
 # The image ENTRYPOINT is radiance_entrypoint.sh (RADIANCE banner + env prechecks, then
 # `exec vllm serve "$@"`); `command:` below supplies the args.
@@ -10,12 +20,15 @@
 # this file, e.g.:  MAX_NUM_SEQS=16 MAX_MODEL_LEN=32768 docker compose up -d
 services:
   vllm:
-    image: ${IMAGE:-vllm-radiance:0.9.3}
+    image: ${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
     container_name: vllm-radiance
     restart: unless-stopped
     command:
-      - /models/Qwen/Qwen3.8-27B-FP8
-      - --served-model-name=qwen3.8-27b
+      # The checkpoint, as a path inside the container: $MODELS is mounted at /models, so this is
+      # $MODELS/Qwen/Qwen3.8-27B-FP8 on the host. ./docker-compose-setup.sh writes both, so
+      # serving a different checkpoint is a .env change rather than an edit here.
+      - ${MODEL_PATH:-/models/Qwen/Qwen3.8-27B-FP8}
+      - --served-model-name=${SERVED_NAME:-qwen3.8-27b}
       - --quantization=fp8
       - --tensor-parallel-size=${TP:-2}
       # --- defaults: 8 concurrent seqs, 200K ctx/seq ---
@@ -88,8 +101,11 @@ services:
       - --host=0.0.0.0
       - --port=8000
     environment:
-      # GPU visibility: select your two R9700s by HIP index (exclude any iGPU). Never CUDA_VISIBLE_DEVICES.
-      HIP_VISIBLE_DEVICES: "0,1"
+      # GPU visibility: the HIP indices to serve on, excluding any iGPU. Never CUDA_VISIBLE_DEVICES.
+      # ./docker-compose-setup.sh writes GPUS after scanning the host; ./gpu-detect.sh prints it.
+      HIP_VISIBLE_DEVICES: "${GPUS:-0,1}"
+      # vLLM usage telemetry. Off by default here; set VLLM_NO_USAGE_STATS=0 to re-enable.
+      VLLM_NO_USAGE_STATS: "${VLLM_NO_USAGE_STATS:-1}"
       # AITER: unified attention ON, every other AITER path OFF (LINEAR=1 crashes on gfx1201).
       VLLM_ROCM_USE_AITER: "1"
       VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"
@@ -152,9 +168,13 @@ services:
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
-    group_add:                # GPU access: set to YOUR host's GIDs:
-      - "RENDER_GID"          #   getent group render | cut -d: -f3
-      - "VIDEO_GID"           #   getent group video  | cut -d: -f3
+    group_add:                # GPU access. docker has no `--group-add keep-groups`, so these
+                              # must be YOUR host's numeric gids. ./docker-compose-setup.sh
+                              # detects and writes them; the manual equivalent is
+                              #   getent group render | cut -d: -f3   -> RENDER_GID
+                              #   getent group video  | cut -d: -f3   -> VIDEO_GID
+      - "${RENDER_GID:?run ./docker-compose-setup.sh to write .env, or set RENDER_GID yourself}"
+      - "${VIDEO_GID:?run ./docker-compose-setup.sh to write .env, or set VIDEO_GID yourself}"
     cap_add:
       - SYS_PTRACE            # py-spy
       - SYS_NICE              # numactl mempolicy syscalls (only needed if you enable RADIANCE_NUMA_BIND)

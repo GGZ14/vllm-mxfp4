@@ -5,19 +5,28 @@ container image. It bundles a working ROCm + PyTorch + Triton + AITER + vLLM sta
 patches and custom kernels needed to run vLLM on this card, plus RDNA4-tuned GEMM / attention /
 all-reduce paths and a speculative draft controller.
 
-Two commands after the clone get you a server. You do not build an image, and you do not edit
+One command after the clone gets you a server. You do not build an image, and you do not edit
 anything for a different card count.
 
 ```bash
 git clone https://codeberg.org/ggz14/radiance-vllm-mxfp4 && cd radiance-vllm-mxfp4
+./docker-quickstart.sh   # checks the host, fetches ~40 GiB, starts the server, sends a test request
+```
+
+Or drive the two scripts it wraps, on podman or docker:
+
+```bash
 ./setup-mxfp4.sh      # host check, image pull, checkpoints, kernels (~40 GiB, mostly download)
 ./serve-mxfp4.sh      # serve on http://localhost:8080/v1
 ```
 
+Either way you end up at `http://localhost:8080/v1`. [Quick start](#quick-start) walks the whole
+path, with what each step costs and what to do when one of them stops.
+
 ## Contents
 
 - [Status](#status)
-- [Quickstart](#quickstart)
+- [Quick start](#quick-start)
 - [Requirements](#requirements)
 - [Setup](#setup)
 - [Checkpoints](#checkpoints)
@@ -52,10 +61,68 @@ This repository carries the MXFP4 work on top of
 applies this repo's patches and kernels at container start, so **running the MXFP4 stack never
 requires building an image**.
 
-## Quickstart
+## Quick start
 
-Run the commands at the top of this file. `setup-mxfp4.sh` is idempotent: re-run it any time
-and it skips whatever is already done. Then test the server:
+### What you need
+
+| | |
+|---|---|
+| **A card** | Any AMD RDNA4 (gfx1201); the image is compiled for that architecture only. One card works, four work — the card count and the tensor-parallel size are detected, not configured |
+| **A host** | Linux with the amdgpu kernel driver loaded, so `/dev/kfd` and `/dev/dri` exist. ROCm userspace ships inside the image |
+| **A runtime** | `docker` or `podman`, and nothing else. No host Python, no ROCm install, no `huggingface-cli` |
+| **Disk** | ~60 GiB for a full setup, ~40 GiB of it downloaded once. 19 GiB of that is the source checkpoint, deletable when setup finishes — it prints the command |
+
+### Docker: one command
+
+```bash
+./docker-quickstart.sh
+```
+
+It runs the same two scripts as the manual path, adds the checks that only bite Docker users, and
+does not hand the terminal back until the server has answered a real request:
+
+| Step | What happens | How long |
+|---|---|---|
+| 1. host | Is the Docker daemon reachable by *your* user; `/dev/kfd` and `/dev/dri`; which GPUs are usable and what tensor-parallel size they imply; free space on **both** filesystems that matter (the checkpoints and the Docker data directory); is the port free | seconds |
+| 2. fetch | Image, AMD's MXFP4 checkpoint, the MTP-head rewrite that makes it loadable, the speculative drafter, the pinned libr4d kernels. This is `setup-mxfp4.sh` | one ~40 GiB download |
+| 3. start | The server, in the background | seconds |
+| 4. wait | Polls `/health`, and says what the log is doing meanwhile — building kernels, loading weights, compiling, capturing graphs | several minutes on a cold cache |
+| 5. test | Sends a chat completion and prints the answer | seconds |
+
+Interrupt it whenever you like: re-running skips every step already done and downloads resume.
+`--yes` skips the download prompt, `--no-drafter` skips the 2 GiB drafter, `--port 8081` moves the
+port, `--foreground` runs the server in your terminal instead of behind it, and `--help` lists the
+rest.
+
+Once it is up, the same script is the front end for everything routine:
+
+| | |
+|---|---|
+| `./docker-quickstart.sh status` | Is it up, what is it serving, and if not — what is it doing |
+| `./docker-quickstart.sh logs` | Follow the log. Ctrl-C stops watching, not the server |
+| `./docker-quickstart.sh test` | Send another request and print the reply |
+| `./docker-quickstart.sh stop` | Stop the server |
+| `./docker-quickstart.sh restart` | Start it again. Quick: the compile cache is warm |
+| `./docker-quickstart.sh clean` | Remove the container. Checkpoints and caches stay |
+
+Two things are true of Docker and not of podman, and both surface as confusing failures if nobody
+says them first. Your user has to be able to reach the daemon socket — `sudo usermod -aG docker
+$USER` then `newgrp docker`, which is what the script tells you if it cannot. And Docker runs
+containers as root, so the checkpoints and the compile cache end up root-owned on the host and
+want `sudo` to delete. Rootless podman has neither property, which is why it is the preferred
+runtime here; `RUNTIME=podman ./docker-quickstart.sh` gets the same guided run on it.
+
+### Or drive it yourself
+
+`docker-quickstart.sh` is a wrapper, not a dependency. These are the two scripts it calls, and
+both take `RUNTIME=docker` or `RUNTIME=podman`:
+
+```bash
+./setup-mxfp4.sh      # idempotent: re-run any time, it skips whatever is already done
+./serve-mxfp4.sh      # runs in the foreground; DETACH=1 puts it in the background
+```
+
+### Check it works
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -63,7 +130,12 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"Qwen3.8","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-You get **Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter. On two R9700:
+An OpenAI-compatible endpoint, so any client that speaks that API works against it unchanged. The
+served model name is `Qwen3.8` (`Qwen3.6` and `Qwen3.8-MXFP4` are aliases for the same one).
+
+### What you get
+
+**Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter. On two R9700:
 
 | | |
 |---|--:|
@@ -77,7 +149,7 @@ You get **Qwen3.8-27B in native 4-bit MXFP4** with an FP8 speculative drafter. O
 
 Full numbers in [Performance](#performance).
 
-Useful next commands:
+### Useful next commands
 
 ```bash
 ./serve-mxfp4.sh --help     # every knob, short form
@@ -87,13 +159,16 @@ DRY_RUN=1 ./serve-mxfp4.sh  # print the container command without running it
 
 Any argument `serve-mxfp4.sh` does not recognise is passed straight through to `vllm serve`.
 
+Serving the plain FP8 checkpoint instead, through `docker compose`, is
+[its own short path](#serving-something-other-than-mxfp4).
+
 ## Requirements
 
 | | |
 |---|---|
 | **GPU** | An AMD RDNA4 (gfx1201) card. The image is compiled for gfx1201 only. One card works; four work. See [GPU and TP detection](#gpu-and-tp-detection) |
 | **Host OS** | Linux with the amdgpu kernel driver, exposing `/dev/kfd` and `/dev/dri`. ROCm userspace lives inside the image |
-| **Runtime** | podman (preferred and best exercised; the launcher uses `--replace` and `keep-groups`) or docker. Auto-detected |
+| **Runtime** | podman (preferred and best exercised; the launcher uses `--replace` and `keep-groups`) or docker. Auto-detected, and `RUNTIME=` overrides. Docker users have [`docker-quickstart.sh`](#docker-one-command) |
 | **Disk** | ~60 GiB for a full setup: 19 source + 19 built checkpoint + 2 drafter + ~10 image. The source download is deletable afterwards, and setup prints the command |
 | **Host Python / ROCm / HF CLI** | Not needed. Setup runs everything that needs them inside the image |
 
@@ -246,16 +321,26 @@ the shape it was measured at.
 ### Serving something other than MXFP4
 
 `docker-compose.yml` serves **Qwen3.8-27B-FP8** and is the path for the FP8 and Gemma checkpoints.
-It is a plain `vllm serve` with no patch prelude, so it is compose-shaped rather than script-shaped.
+It is a plain `vllm serve` with no patch prelude, so it is compose-shaped rather than
+script-shaped.
 
 ```bash
-# put your model at ./models/Qwen/Qwen3.8-27B-FP8  (or set MODELS=/your/model/dir)
-docker compose up -d          # start; follow with: docker compose logs -f
-docker compose down           # stop
+./docker-compose-setup.sh --download   # write .env for this host, fetch the checkpoint
+docker compose up -d                   # start; follow with: docker compose logs -f
+docker compose down                    # stop
 ```
 
-All of its tunables are `${VAR:-default}`, so override them from the shell or a `.env` file without
-editing it. With podman, `podman compose` takes the same file. The per-model notes (35B-A3B's
+Three of its settings are properties of *your* host and so cannot be committed defaults: the
+numeric `render` and `video` group ids (docker has no `--group-add keep-groups`, and without them
+the container sees the device nodes but cannot open them), the HIP indices to serve on, and where
+the checkpoints live. `docker-compose-setup.sh` detects all three and writes them to `.env`, which
+compose reads on its own — so the file needs no editing. Without a `.env`, compose stops with the
+name of the missing variable rather than starting a server that cannot reach a GPU.
+`--show` prints what it would write and changes nothing; `--download` also fetches the checkpoint,
+using the image's own `huggingface_hub` so the host needs no Python.
+
+Everything else is `${VAR:-default}`, so override it in `.env` or the shell without editing the
+file. With podman, `podman compose` takes the same file. The per-model notes (35B-A3B's
 `--max-num-batched-tokens >= 2240`, Gemma-4-31B's template and drafter) are in
 [DOCKERHUB.md](DOCKERHUB.md#tested-so-far).
 
@@ -461,6 +546,9 @@ as a one-line error rather than a traceback.
 | `chat template not readable` | `CHAT_TEMPLATE=<path>`; unset uses this repo's `qwen-fixed-v22.3.jinja`. It is mounted by path, so it must exist **on the host** |
 | `<tool_call>` or `</tool_call>` leaking into assistant content | Not the parser name — `qwen3_coder` and `qwen3_xml` are the same parser. Confirm the image carries `patch_qwen3_toolparse.py` (`vllm/parser/engine/parser_engine.py` should mention `partial=True`) |
 | `/dev/kfd is missing` | The amdgpu kernel driver is not loaded. The image ships ROCm userspace, not the driver |
+| `permission denied` talking to the Docker daemon | Your user is not in the `docker` group: `sudo usermod -aG docker $USER`, then `newgrp docker` in this shell. Already in it? The shell predates the change — `newgrp docker` is still the fix |
+| `required variable RENDER_GID is missing` from `docker compose` | Run `./docker-compose-setup.sh`. Those ids are per-host and deliberately have no default; see [Serving something other than MXFP4](#serving-something-other-than-mxfp4) |
+| Checkpoints or `~/.radiance-cache-*` cannot be deleted without `sudo` | Docker runs containers as root, so everything written into a bind mount is root-owned. Expected; rootless podman does not do it |
 | `AssertionError: Attempted to load weight (torch.Size([5120, 10240]))` | You pointed it at AMD's raw checkpoint instead of the one `fp8_mtp.py` builds |
 | Fluent but wrong output; perplexity in the hundreds of thousands | The stock libr4d NaNs the gated-delta-net. Confirm the launcher printed `[radiance] libr4d <pin> -> ...`; if you ran with `AUTO_R4D=0`, set `RADIANCE_MXFP4_SANITIZE=1` as a stopgap |
 | `IndexError` in `rocm_unquantized_gemm_impl` at load | The int2 draft head against a libr4d that ships `r4d_gemm_w4a16_nt_m64`. Set `FAST_DRAFT=0` |
@@ -469,6 +557,28 @@ as a one-line error rather than a traceback.
 | `current platform does not support native MXFP4/MXFP6` | **False alarm.** It comes from a separate `supports_mx()` call. The line that matters is `[radiance] native MXFP4 enabled on gfx12x` |
 | Startup is slow and looks hung | First run compiles Triton/inductor kernels. Later runs reuse `$CACHE` |
 | OOM at startup after changing `MAXSEQS`, `CHUNK` or a graph-changing knob | The KV pin (`KV_MEM`) was derived at `MAXSEQS=8`. `KV_MEM=0` re-enables vLLM's own profiling |
+| `JSONDecodeError` from `_report_usage_worker` at startup | **Harmless, and already fixed.** vLLM's usage-stats thread builds its payload by shelling out to `cpuinfo`, and in a ParoQuant container that child imports vLLM through our `sitecustomize` hook and prints a `CUDA_VISIBLE_DEVICES on ROCm is deprecated` WARNING onto its own stdout, ahead of the JSON it is supposed to emit. The engine is unaffected and nothing was ever transmitted — the crash is at payload-build time, before the POST. The launchers now pass `VLLM_NO_USAGE_STATS=1`; `VLLM_NO_USAGE_STATS=0` brings back both the telemetry and the traceback |
+
+### Benign log lines
+
+Three lines come up often enough to be worth naming. None of them is a problem.
+
+`INFO ... [weight_utils.py:890] Auto-prefetch is disabled because the filesystem (EXT4) is not a
+recognized network FS (NFS/Lustre)` — informational, and the good case. vLLM only prefetches
+checkpoint shards into page cache when the weights sit on a network filesystem; on a local disk the
+mmap read is already optimal, and `--safetensors-load-strategy=prefetch` forces work that buys
+nothing.
+
+`Loading safetensors checkpoint shards: 80% Completed | 0/1` — cosmetic. There are two progress
+bars (the target's shards, then the DFlash2 drafter's single shard), and vLLM deliberately uses a
+newline-terminated bar format rather than a redrawing one so it stays readable under multiprocessing
+(`weight_utils.py`), so the per-line log prefixer can stitch a fragment of one bar onto the other.
+**`n/total` is the authoritative field, not the percentage** — `100% Completed | 1/1` follows.
+
+`WARNING ... [rocm.py] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated` — nothing sets that
+variable: on ParoQuant builds vLLM mirrors our `HIP_VISIBLE_DEVICES` into it at import and then warns
+about its own copy. Harmless in the server log; it was only load-bearing in the `cpuinfo` subprocess
+above.
 
 ## Performance
 
@@ -719,8 +829,10 @@ and hipcc must still link a HIP shared object, since AITER JITs at runtime.
 
 | File | What it is |
 |---|---|
+| `docker-quickstart.sh` | The guided path: host checks, setup, start, wait for `/health`, test request. Also `status` / `logs` / `test` / `stop` / `restart` / `clean`. Wraps the two scripts below |
 | `setup-mxfp4.sh` | One-time setup: host check, image, checkpoints, kernels. Idempotent |
-| `serve-mxfp4.sh` | The launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds |
+| `serve-mxfp4.sh` | The launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds, `DETACH=1` to background it |
+| `docker-compose-setup.sh` | Writes the `.env` `docker-compose.yml` needs on this host (GPU group ids, HIP indices, paths), and optionally fetches the FP8 checkpoint |
 | `gpu-detect.sh` | GPU/TP/KV detection, sourced by the launcher. Run it directly to see what it finds |
 | `calibrate-kv.sh` | Measures a `--kv-cache-memory` pin for your hardware and saves it |
 | `kv-profiles.tsv` | Pins measured so far, keyed on hardware and batch shape |
