@@ -529,6 +529,8 @@ COPY paroquant/radiance_paroquant_mxfp4.py /build/
 # pinned commit with this repo's extras patch, and replace. Same hipcc as the stage 3
 # build (same venv, same base), so the .so loads identically.
 RUN set -e; \
+  # The base ships no git (pruned) -- get it first if absent.
+  command -v git >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git); \
   cd "$(mktemp -d)"; \
   git clone "$R4D_REPO" libr4d; \
   git -C libr4d checkout -q "$R4D_BAKE_PIN"; \

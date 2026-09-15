@@ -56,6 +56,8 @@ ARG R4D_PIN
 ARG GFX_ARCH
 COPY r4d_radiance_extras.patch /tmp/r4d_radiance_extras.patch
 RUN set -e; \
+  # The published base is a pruned shipping image -- no git. Get it if absent.
+  command -v git >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git); \
   git clone "$R4D_REPO" /src/libr4d; \
   git -C /src/libr4d checkout -q "$R4D_PIN"; \
   git -C /src/libr4d apply /tmp/r4d_radiance_extras.patch; \
