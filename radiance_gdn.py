@@ -57,8 +57,47 @@ _CONV_PREP = _bind("gdn_conv_prep", conv_width=CONV_WIDTH, head_k=HEAD_K, head_v
                    chunk=CHUNK)
 _CONV_UPDATE = _bind("gdn_conv_update", conv_width=CONV_WIDTH, head_k=HEAD_K, head_v=HEAD_V)
 _KKT_SOLVE = _bind("gdn_kkt_solve", head_k=HEAD_K, chunk=CHUNK)
-_RECURRENT_UPDATE = _bind("gdn_recurrent_update", head_k=HEAD_K, head_v=HEAD_V)
-_FUSED_UPDATE = _bind("gdn_fused_update", conv_width=CONV_WIDTH, head_k=HEAD_K, head_v=HEAD_V)
+_RECURRENT_UPDATE = _bind("gdn_recurrent_update", head_k=HEAD_K, head_v=HEAD_V,
+                          state_dtype="fp32")
+_FUSED_UPDATE = _bind("gdn_fused_update", conv_width=CONV_WIDTH, head_k=HEAD_K, head_v=HEAD_V,
+                      state_dtype="fp32")
+
+
+# The select() key and the entry-point spelling are not the same string: the registry asks for
+# state_dtype="fp16" but names the kernel ..._f16state. Keep the pair explicit rather than deriving
+# one from the other -- a near-miss here does not fail loudly, it silently keeps the fp32 handle.
+_STATE_TAGS = {torch.bfloat16: ("bf16", "_bf16state"), torch.float16: ("fp16", "_f16state")}
+
+
+def _bind_narrow_state(op: str, tag: str, fragment: str, **geometry):
+    """The narrow-state entry point for `tag`, or None if this build has no such kernel.
+
+    A build predating the narrow state does not merely lack the kernel: its registry rows carry no
+    state_dtype constraint at all, so select() IGNORES the key and cheerfully returns the fp32
+    entry. Handing that a 16-bit cache makes it read twice the bytes the buffer holds, which faults
+    the queue rather than raising -- so trust the NAME, not the lookup.
+    """
+    if _r4d is None or not USE_R4D:
+        return None
+    name = _r4d.select(op, state_dtype=tag, **geometry)
+    if not name or fragment not in name:
+        return None
+    return getattr(_r4d, name, None)
+
+
+# One handle per (stage, state dtype). fp16 is the better 16-bit state on gfx1201 -- 10 mantissa
+# bits to bf16's 7, and one convert instruction per pair instead of three of software rounding --
+# so it is preferred where both exist, but the dispatch is by the CACHE's dtype, which vLLM decides
+# from --mamba-ssm-cache-dtype. bf16 stays for anything that needs fp32's exponent range.
+_RECURRENT_UPDATE_NARROW = {
+    dt: _bind_narrow_state("gdn_recurrent_update", tag, frag, head_k=HEAD_K, head_v=HEAD_V)
+    for dt, (tag, frag) in _STATE_TAGS.items()
+}
+_FUSED_UPDATE_NARROW = {
+    dt: _bind_narrow_state("gdn_fused_update", tag, frag, conv_width=CONV_WIDTH,
+                           head_k=HEAD_K, head_v=HEAD_V)
+    for dt, (tag, frag) in _STATE_TAGS.items()
+}
 # The fused decode step (conv -> grid barrier -> recurrent in ONE launch) removes one kernel
 # boundary per GDN layer per forward. Bit-identical to the pair by construction. Off by default
 # until the serving A/B has run; needs a build whose registry has gdn_fused_update.
@@ -347,7 +386,8 @@ def fused_update(x, conv_w, conv_bias, conv_state, state_len_max, cache_idx, num
     q = torch.empty((T, Hg, HEAD_K), device=dev, dtype=dt)
     k = torch.empty((T, Hg, HEAD_K), device=dev, dtype=dt)
     v = torch.empty((T, H, HEAD_V), device=dev, dtype=dt)
-    _FUSED_UPDATE(
+    _FU = _FUSED_UPDATE_NARROW.get(ssm_state.dtype) or _FUSED_UPDATE
+    _FU(
         x.data_ptr(), x.stride(0), conv_w.data_ptr(),
         conv_bias.data_ptr() if conv_bias is not None else 0,
         conv_state.data_ptr(), conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
@@ -373,10 +413,11 @@ def kkt_solve(k, beta, g, cu, num_seqs, T, H, Hg):
 
 def recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx, num_accepted,
                      num_seqs, H, Hg, scale, z_gate=None, norm=None):
+    _RU = _RECURRENT_UPDATE_NARROW.get(ssm_state.dtype) or _RECURRENT_UPDATE
     # The slot and head strides come from the tensor: vLLM pads the mamba page to the attention
     # page size, so a slot is wider than H*V*K and deriving it from the shape reads the wrong
     # memory for every slot but the first.
-    _RECURRENT_UPDATE(
+    _RU(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
         a.stride(0), a.dtype == torch.bfloat16, A_log.data_ptr(), dt_bias.data_ptr(),
         ssm_state.data_ptr(), ssm_state.stride(0), ssm_state.stride(1),
@@ -413,7 +454,16 @@ def _plan(self, mixed_qkv, b, a, core_attn_out):
     kv = self.kv_cache
     conv_state = kv[0] if _conv_state_dim_first() else kv[0].transpose(-1, -2)
     ssm_state = kv[1]
-    if ssm_state.dtype != torch.float32:
+    # The temporal state may be fp32 (the HF config's mamba_ssm_dtype) or 16-bit
+    # (--mamba-ssm-cache-dtype=float16/bfloat16, which halves the state traffic that is the whole
+    # cost of the decode kernels). Each width needs a kernel compiled for it; decline rather than
+    # fault if this libr4d has only the fp32 one.
+    if ssm_state.dtype in (torch.bfloat16, torch.float16):
+        if (_RECURRENT_UPDATE_NARROW.get(ssm_state.dtype) is None
+                or _FUSED_UPDATE_NARROW.get(ssm_state.dtype) is None):
+            return no(f"ssm state is {ssm_state.dtype} but this libr4d has no matching "
+                      f"narrow-state kernel")
+    elif ssm_state.dtype != torch.float32:
         return no(f"ssm state dtype {ssm_state.dtype}")
     if ssm_state.stride(2) != ssm_state.shape[3] or ssm_state.stride(3) != 1:
         return no(f"ssm state [V,K] block is not packed: strides {tuple(ssm_state.stride())}")
@@ -543,7 +593,9 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         conv_w=conv_w, conv_state=conv_state)
     A = kkt_solve(k, beta, g, cu, nseq, tp, H, Hg)
     _nt("kkt_solve.out", A=A)
-    initial_state = ssm_state[md.prefill_state_indices]
+    # chunk_scan takes an fp32 initial state (it bails otherwise); the paged cache may be
+    # bf16, and the write-back below already narrows with .to(ssm_state.dtype).
+    initial_state = ssm_state[md.prefill_state_indices].float()
     initial_state[~md.prefill_has_initial_state, ...] = 0
     o_buf = (core_attn_out[:tp].view(1, tp, H, HEAD_V) if spec_o is None
              else torch.empty((1, tp, H, HEAD_V), device=mixed_qkv.device,

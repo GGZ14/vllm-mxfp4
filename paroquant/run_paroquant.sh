@@ -82,6 +82,11 @@ fi
 MODE=${MODE:-eval}
 PORT=${PORT:-8080}
 NAME=${NAME:-vllmparo}
+# The image was hardcoded at the podman run below, which made the documented
+# "IMAGE and CACHE move together" rule unenforceable here and an image A/B impossible:
+# CACHE was overridable, the image it is keyed to was not. Same default and same
+# spelling as serve-mxfp4.sh.
+IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 # Space-separated served ids. Eval default answers ONLY to Qwen3.8-PARO so nothing pinned to the
 # prod ids routes here by accident; the qwen_vllm_paro systemd unit (vllm-switch paro) overrides
 # with the prod ids so clients like the Pi (model id Qwen3.6) work unchanged.
@@ -118,7 +123,41 @@ GDN_FUSED=${RADIANCE_GDN_FUSED_UPDATE:-1}
 # b9e42ab-rx6 from r4d_radiance_extras.patch (rx6 adds the 3-rank all-reduce for TP=3); rx5 is not
 # reproducible from the current patch, so a fresh box has to use rx6 and re-gate GSM8K for this
 # stack. Override with R4D_KEY=.
-R4D_KEY=${R4D_KEY:-b9e42ab-rx5}
+# The temporal (ssm) state cache dtype: float16 | bfloat16 | float32 | empty (= the model config's
+# mamba_ssm_dtype, which is float32 here).
+#
+# A 16-bit state halves the snapshot each candidate token writes, and that snapshot IS the cost of
+# the GDN decode kernels -- one [V,K] per candidate per head, because which candidate survives
+# verification is unknown until after the layer. Measured on the conv+recurrent pair (us/layer):
+#
+#             N=1 T=8    N=8 T=5 (conc-8)    N=8 T=8
+#   float32     31.6          61.0            169.8
+#   bfloat16    26.7          44.8             61.2
+#   float16     28.7          43.9             59.8
+#
+# The N=8 T=8 column is the cliff: at fp32 that is 100.7 MB of state against a 64 MB last level.
+#
+# PREFER float16: same two bytes as bfloat16, 10 mantissa bits to bf16's 7, at the same cost
+# (3 VALU per pair either way -- gfx1201 has no bf16 convert AND no packed round-to-nearest f16
+# convert). Measured against the fp32 reference: rms error 2.2e-4 vs bf16's 1.7e-3, and signed
+# bias -1.2e-5 vs -4.2e-5.
+#
+# The f16 store deliberately uses two v_cvt_f16_f32 (round-to-nearest) rather than the ONE-
+# instruction v_cvt_pkrtz, which rounds toward ZERO. That is not a free instruction: a biased
+# rounding does not decay out of a leaky integrator, it changes the effective decay from d to
+# d(1-b), and with pkrtz's measured -2.4e-4 per-step magnitude loss the longest-memory heads here
+# (decay 0.9973) settle ~8% deflated. RTNE measures -0.00%. See r4d_gdn_state.h.
+#
+# bfloat16 remains for anything needing fp32 exponent range; this state peaks at ~0.19.
+#
+# Needs a libr4d carrying the matching narrow-state kernels (rx7+); radiance_gdn declines to a slow
+# FLA fallback rather than faulting without one, so the default below follows the knob.
+GDN_SSM_DTYPE=${GDN_SSM_DTYPE:-}
+if [ -n "$GDN_SSM_DTYPE" ] && [ "$GDN_SSM_DTYPE" != float32 ]; then
+  R4D_KEY=${R4D_KEY:-b9e42ab-rx7}
+else
+  R4D_KEY=${R4D_KEY:-b9e42ab-rx5}
+fi
 R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # The image's own libr4d predates the gated-delta-net overflow fix and NaNs this model, and the
 # in-container copy is guarded by [ -f /r4d/r4d.so ] -- a missing build there is a silent fallback
@@ -173,6 +212,9 @@ CACHE_SUF=""; [ "$GDN_FUSED" = 1 ] && CACHE_SUF="-fu"; [ "$ROT_STREAM" = 1 ] && 
 [ "${RADIANCE_PQ_I8:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-i8"
 [ "${RADIANCE_PQ_PG:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-pg"
 [ "${RADIANCE_PQ_ZPE:-0}" = 1 ] && CACHE_SUF="${CACHE_SUF}-zpe"
+# The ssm state width changes the mamba cache spec, so the warm/compile cache must not be
+# shared with a serve of the other width.
+[ -n "$GDN_SSM_DTYPE" ] && CACHE_SUF="${CACHE_SUF}-ssm${GDN_SSM_DTYPE}"
 CACHE=${CACHE:-$HOME/.radiance-cache-paro-093$CACHE_SUF}
 mkdir -p "$CACHE"
 
@@ -223,6 +265,7 @@ else
   PROF_ARGS=(); [ "$PROFILE" = 1 ] && PROF_ARGS=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/cache/prof --profiler-config.torch_profiler_with_stack=false); [ "$PROFILE" = 1 ] && mkdir -p "$CACHE/prof"
   EXTRA_ARGS=("${PROF_ARGS[@]}" --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --max-logprobs "$MAX_LOGPROBS" --max-num-batched-tokens "$CHUNK"
               $([ "$PREFIX_CACHE" = 1 ] && echo --enable-prefix-caching || echo --no-enable-prefix-caching)
+              ${GDN_SSM_DTYPE:+--mamba-ssm-cache-dtype $GDN_SSM_DTYPE}
               --compilation-config
               '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true},"compile_sizes":[1,2,4,8],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false,"combo_kernels":true,"benchmark_combo_kernel":true,"triton.cooperative_reductions":true}}')
   CHECKALL=${CHECKALL:-}
@@ -278,6 +321,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -e RADIANCE_PQ_ROT_STREAM3="$ROT_STREAM3" -e RADIANCE_PQ_AR_CHECK="${RADIANCE_PQ_AR_CHECK:-0}" \
   -e RADIANCE_PQ_AR_FALLBACK="${RADIANCE_PQ_AR_FALLBACK:-0}" \
   -e RADIANCE_PQ_ROT_V2="${RADIANCE_PQ_ROT_V2:-1}" \
+  -e RADIANCE_PQ_HIPCC_FLAGS="${RADIANCE_PQ_HIPCC_FLAGS:-}" \
   -e RADIANCE_FAST_DRAFT=1 -e RADIANCE_DRAFT_TAU=0.20 -e RADIANCE_DRAFT_RERANK=80 \
   -e RADIANCE_VERIFY_HEAD=1 -e RADIANCE_VERIFY_HEAD_MAX_M=32 \
   -e RADIANCE_TOPK_TRITON_MIN_ROWS=1 -e RADIANCE_SKINNY_GEMM="${RADIANCE_SKINNY_GEMM:-1}" \
@@ -294,7 +338,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
   -v "$R4D_CACHE/$R4D_KEY":/r4d:z \
   "${CT_MOUNT[@]}" \
   -e R4D_SO="$R4D_CACHE/$R4D_KEY" \
-  --entrypoint bash stilldeadcode/vllm-radiance:0.9.3 -lc '
+  --entrypoint bash "$IMAGE" -lc '
     set -e
     SP=/opt/vllm/lib/python3.12/site-packages
     cd /patches
@@ -317,6 +361,7 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
     python3 patch_gdn_merge_inproj.py
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply"
+    cp radiance_preamble.py /opt/radiance_preamble.py      # banner/preamble from the repo, not the baked copy
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
     cp radiance_mxfp4.py radiance_gemm.py radiance_gdn.py radiance_gdnmerge.py radiance_rmsquant.py \
        radiance_drafthead.py radiance_verifyhead.py radiance_aroverlap.py radiance_topk.py \
@@ -329,8 +374,10 @@ exec "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --ne
     fi
     # ---- paroquant: build the kernel module and register the quant method in every process ----
     cd /paro
+    # RADIANCE_PQ_HIPCC_FLAGS: extra compile flags for A/B builds of the kernel module only
+    # (e.g. -DPQ_HW_CVT=0 to fall back to the software e4m3 encoder). Empty in prod.
     hipcc -O3 -w -std=c++17 -fPIC -shared --offload-arch=gfx1201 $(python3 -m pybind11 --includes) \
-      radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so
+      ${RADIANCE_PQ_HIPCC_FLAGS:-} radiance_paroquant.hip -o "$SP"/radiance_paroquant_kernel.so
     cp radiance_paroquant.py radiance_paroquant_mxfp4.py "$SP"/
     cp /patches/radiance_dflash_capture.py "$SP"/ 2>/dev/null || cp ../radiance_dflash_capture.py "$SP"/
     # NB: appended to the STDLIB sitecustomize, not written to site-packages -- Ubuntu ships
