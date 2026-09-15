@@ -94,6 +94,7 @@ COPY radiance_gemm.py \
 COPY paroquant/radiance_paroquant.hip     /build/
 COPY paroquant/radiance_paroquant.py      /build/
 COPY paroquant/radiance_paroquant_mxfp4.py /build/
+COPY paroquant/par_kernels.h              /build/
 
 # The patched libr4d.so from the builder stage.
 COPY --from=r4d_builder /src/libr4d/r4d.so \

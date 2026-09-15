@@ -523,6 +523,7 @@ COPY radiance_entrypoint.sh          /build/radiance_entrypoint.sh
 COPY paroquant/radiance_paroquant.hip     /build/
 COPY paroquant/radiance_paroquant.py      /build/
 COPY paroquant/radiance_paroquant_mxfp4.py /build/
+COPY paroquant/par_kernels.h              /build/
 
 # ----------------------------------------------------------- the patched libr4d ----
 # The base's stage 3 built $SP/r4d.so from the v0.5.0 release tag. Rebuild from the
