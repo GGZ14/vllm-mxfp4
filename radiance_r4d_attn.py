@@ -268,7 +268,27 @@ class R4DAttentionBackend(TritonAttentionBackend):
     def get_required_kv_cache_layout(cls) -> str:
         # (num_blocks, num_kv_heads, block_size, 2 * head_size), K and V packed per slot. The
         # kernels index a key by block, head and slot, so the slot stride has to be 2 * head_size.
+        # vLLM <= 0.27 asks this way; 0.29 asks via supported_kv_cache_layouts below and never
+        # calls this, so both are defined and each version uses the one it knows.
         return "HND"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        """vLLM 0.29+ replacement for get_required_kv_cache_layout (RFC #42082).
+
+        Layouts are now KVCacheLayout enum members carrying a stride permutation over the logical
+        [L, B, H, N, C] shape, rather than the old "HND"/"NHD" strings. LBHNC is the identity, so
+        its per-layer view is [B, H, N, C] -- block, head, slot, content -- which is what "HND"
+        meant and what the kernels index. Without this, 0.29 allocates its own choice and R4D
+        rejects it at cache-init with "needs a K/V-packed HND cache with contiguous slots".
+
+        Imported lazily: vllm.v1.kv_cache_interface.KVCacheLayout does not exist before 0.29.
+        """
+        try:
+            from vllm.v1.kv_cache_interface import KVCacheLayout
+        except ImportError:
+            return None
+        return (KVCacheLayout.LBHNC,)
 
     @classmethod
     def supports_combination(cls, *args, **kwargs) -> str | None:
