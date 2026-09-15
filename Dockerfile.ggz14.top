@@ -30,9 +30,11 @@
 # vLLM's quant-method plugin dispatch handles all three, so no envvar
 # "personality" switch is needed in the image.
 #
-# Setup / tagging lives in build.sh (reads VERSION, builds Dockerfile.ggz14
-# with --target base for the platform base, tags radiance:* + radiance-mxfp4:*
-# + radiance-paro:*, optionally --push).
+# Setup / tagging lives in build.sh (pulls the published base, pins it by
+# live digest, builds this top variant in minutes, tags
+# ggz14/vllm-radiance-mxfp4:$VERSION-$SHA + latest + v$VERSION, optionally
+# --push). The full from-source base is an explicit request: --base-only /
+# --full.
 
 # NB: the published 0.9.3 base carries vLLM 0.27.1 (the 0.29.0 base upgrade was
 # still in progress when it shipped); the patch set carries both shapes.
