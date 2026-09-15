@@ -4,7 +4,7 @@
 # Pulls the published radiance image, fetches the checkpoint for the chosen
 # quant format, and (optionally) the DFlash2-FP8 drafter. That's it. No git
 # clone, no host build, no libr4d, no hipcc. Everything is baked into the
-# image at build time (see setup-radiance-image.sh + Dockerfile on the
+# image at build time (see build.sh + Dockerfile.ggz14 on the
 # maintainer side).
 #
 # Usage:

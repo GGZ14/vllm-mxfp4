@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1.7
 #
-# Dockerfile.radiance — the prod-bake of the radiance stack.
+# Dockerfile.ggz14.top -- the top-only build variant (dev loop).
 #
 # NOT the base-image build (that is the plain `Dockerfile` in this repo:
-# torch/triton/aiter/vLLM from source, four stages, hours). This file takes
-# the published base image and bakes in everything the container would
-# otherwise do at every start (the launcher scripts' in-container work), so
-# `docker run` goes straight to `vllm serve`:
+# torch/triton/aiter/vLLM from source, four stages, hours). It is the
+# top-only variant of stage 5 of Dockerfile.ggz14: it sits on the PUBLISHED
+# base image, so it bakes the patch layer in a few minutes with NO stack
+# rebuild. Use it to iterate the patch chain / kernels against a published
+# base. It bakes in everything the container would otherwise do at every
+# start (the launcher scripts' in-container work), so `docker run` goes
+# straight to `vllm serve`:
 #
 #   - the patched libr4d (the base's own externally-linked `r4d.so` segfaults
 #     on this kernel; the image's own r4d.so path is re-linked here at build
@@ -27,14 +30,16 @@
 # vLLM's quant-method plugin dispatch handles all three, so no envvar
 # "personality" switch is needed in the image.
 #
-# Setup / tagging lives in setup-radiance-image.sh (reads VERSION, pins the
-# base by live digest, tags radiance:* + radiance-mxfp4:* + radiance-paro:*).
+# Setup / tagging lives in build.sh (reads VERSION, builds Dockerfile.ggz14
+# with --target base for the platform base, tags radiance:* + radiance-mxfp4:*
+# + radiance-paro:*, optionally --push).
 
 ARG BASE_REPO=stilldeadcode/vllm-radiance
 ARG BASE_TAG=0.9.3
-# Default is the digest at the v0.13.0 base; setup-radiance-image.sh
-# re-pins from the live image before every build. Change BASE_TAG and
-# BASE_DIGEST together if you move the base.
+# Default is the digest at the v0.13.0 base. When building this top variant,
+# `docker pull` the base first and pass its live digest via
+# --build-arg BASE_DIGEST=<hex> so a base repaint can't slip in.
+# Change BASE_TAG and BASE_DIGEST together if you move the base.
 ARG BASE_DIGEST=45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
 ARG R4D_REPO=https://codeberg.org/StillDeadcode/libr4d.git
 ARG R4D_PIN=b9e42ab
