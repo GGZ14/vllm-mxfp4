@@ -483,8 +483,12 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # (RADIANCE_GDN_FUSED_UPDATE). The build cache key carries a suffix so patched and stock builds
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
-R4D_KEY="$R4D_PIN"
-if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx6"; fi   # rx6: + ar_oneshot_3rank_exact (TP=3 all-reduce); rx5: fused_update zeroes the pad rows
+# R4D_KEY=<key> in the environment selects a specific libr4d build (e.g. b9e42ab-rx7, what the
+# ParoQuant units serve on) instead of the launcher's default below.
+if [ -z "${R4D_KEY:-}" ]; then
+  R4D_KEY="$R4D_PIN"
+  if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx6"; fi   # rx6: + ar_oneshot_3rank_exact (TP=3 all-reduce); rx5: fused_update zeroes the pad rows
+fi
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -809,6 +813,8 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_RMS_QUANT_FUSION="${RADIANCE_RMS_QUANT_FUSION:-$NQF}" \
   -e RADIANCE_MXFP4_SHADOW="${RADIANCE_MXFP4_SHADOW:-}" \
   -e RADIANCE_MXFP4_SANITIZE="${RADIANCE_MXFP4_SANITIZE:-0}" \
+  -e RADIANCE_NVFP4_MXFP4="${RADIANCE_NVFP4_MXFP4:-0}" -e RADIANCE_NVFP4_EXP="${RADIANCE_NVFP4_EXP:-mse}" \
+  -e RADIANCE_NVFP4_FP8_LAYERS="${RADIANCE_NVFP4_FP8_LAYERS:-mxfp4}" -e RADIANCE_NVFP4_BF16_LAYERS="${RADIANCE_NVFP4_BF16_LAYERS:-in_proj_ba}" -e RADIANCE_NVFP4_LMHEAD="${RADIANCE_NVFP4_LMHEAD:-bf16}" \
   -e RADIANCE_GDN_PATHS="${RADIANCE_GDN_PATHS:-both}" \
   -e RADIANCE_GDN_NANTRACE="${RADIANCE_GDN_NANTRACE:-0}" \
   -e RADIANCE_MXFP4_KERNEL_N="${RADIANCE_MXFP4_KERNEL_N:-}" \
@@ -835,6 +841,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     SP=/opt/vllm/lib/python3.12/site-packages
     cd /patches
     python3 patch_quark_mxfp4.py
+    python3 patch_nvfp4_mxfp4.py      # NVFP4 checkpoints -> MXFP4 at load (RADIANCE_NVFP4_MXFP4=1)
     python3 patch_tp3_pad.py
     python3 patch_ar_maxbytes.py
     python3 patch_topk_triton_rows.py
@@ -859,7 +866,8 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
-    cp radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
+    cp radiance_preamble.py /opt/radiance_preamble.py      # banner/preamble from the repo, not the baked copy
+    cp radiance_nvfp4.py radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
        radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py \
        radiance_arnq.py radiance_tp3pad.py "$SP"/
     # MXFP4_CUMODE=1 builds the GEMM TU in CU mode (waves of a workgroup confined to one CU of the
@@ -880,7 +888,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     # its own source, producing fluent-looking garbage with no error anywhere in the log.
     cd /
     exec /opt/radiance_entrypoint.sh "$@"' _ \
-    "$CSNAP" --served-model-name Qwen3.8 Qwen3.6 Qwen3.8-MXFP4 --host 0.0.0.0 --port "$PORT" \
+    "$CSNAP" --served-model-name ${SERVED_NAMES:-Qwen3.8 Qwen3.6 Qwen3.8-MXFP4} --host 0.0.0.0 --port "$PORT" \
     --kv-cache-dtype fp8 --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$GPU_UTIL" \
     ${KV_MEM:+--kv-cache-memory "$KV_MEM"} \
