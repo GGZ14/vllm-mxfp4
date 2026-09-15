@@ -69,7 +69,7 @@ BUILD_ARGS=(--file Dockerfile.ggz14
 
 # --------------------------------------------------------- the build -----------
 echo "=== $RUNTIME build: $( [ "$WANT_BASE" = 1 ] && echo "--target base" || echo "full" ) -t $NAME:$VERSION-$SHA ==="
-"$RUNTIME" build "${BUILD_ARGS[@]}" ${TARGET[@]+"${TARGET[@]}"}
+"$RUNTIME" build "${BUILD_ARGS[@]}" ${TARGET[@]+"${TARGET[@]}"} .
 
 # --------------------------------------------------------- the base byproduct --
 # The base is a build product of the same file: re-tag the stage-4 output so
@@ -78,7 +78,7 @@ echo "=== $RUNTIME build: $( [ "$WANT_BASE" = 1 ] && echo "--target base" || ech
 if [ "$WANT_BASE" != 1 ]; then
   "$RUNTIME" build --file Dockerfile.ggz14 --target base \
     -t "${BASE_NAME:-ggz14/vllm-radiance}:${VERSION}-${SHA}" \
-    -t "${BASE_NAME:-ggz14/vllm-radiance}:latest" >/dev/null 2>&1 || \
+    -t "${BASE_NAME:-ggz14/vllm-radiance}:latest" . >/dev/null 2>&1 || \
   echo "  note: the base is not separately available with $RUNTIME; the full build is the source of truth"
 fi
 
