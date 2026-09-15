@@ -185,8 +185,8 @@ RUN set -e; \
 # The 0.9.3 image's entrypoint script loses its +x bit (the tracker keeps it
 # 100644). Replace it with this repo's clean preamble + banner and chmod it in
 # at build time so the runtime can never hit the "not executable" class again.
-COPY /build/radiance_entrypoint.sh  /opt/radiance_entrypoint.sh
-COPY /build/radiance_preamble.py    /opt/radiance_preamble.py
+RUN install -m 755 /build/radiance_entrypoint.sh /opt/radiance_entrypoint.sh \
+ && install -m 644 /build/radiance_preamble.py   /opt/radiance_preamble.py
 RUN chmod +x /opt/radiance_entrypoint.sh
 
 # --------------------------------------------------------- the measured profile --

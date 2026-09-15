@@ -614,8 +614,8 @@ RUN set -e; \
 # --------------------------------------------------------- entrypoint + preamble --
 # The base ships the entrypoint as it was at the base's build. Install the repo's
 # current pair and enforce +x so the "not executable" class dies at bake time.
-COPY /build/radiance_entrypoint.sh  /opt/radiance_entrypoint.sh
-COPY /build/radiance_preamble.py    /opt/radiance_preamble.py
+RUN install -m 755 /build/radiance_entrypoint.sh /opt/radiance_entrypoint.sh \
+ && install -m 644 /build/radiance_preamble.py   /opt/radiance_preamble.py
 RUN chmod +x /opt/radiance_entrypoint.sh
 
 # --------------------------------------------------------- the measured profile --
