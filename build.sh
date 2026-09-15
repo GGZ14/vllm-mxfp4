@@ -34,6 +34,13 @@ if [ -z "$RUNTIME" ]; then
   fi
 fi
 
+# docker >= 29 aliases `docker build` to the buildkit gateway frontend, which on
+# 29.1.3 fails this file at the parse stage with a swallowed "exit code: 1".
+# The classic builder parses and runs it fine; pin it. BUILDKIT=1 opts back in.
+if [ "$RUNTIME" = docker ] && [ "${BUILDKIT:-0}" != 1 ]; then
+  export DOCKER_BUILDKIT=0
+fi
+
 PUSH=0; JOBS=; WANT_BASE=0
 for a in "$@"; do
   case "$a" in
