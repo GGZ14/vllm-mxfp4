@@ -505,7 +505,7 @@ ARG GFX_ARCH
 ARG MAX_JOBS
 
 COPY r4d_radiance_extras.patch        /tmp/r4d_radiance_extras.patch
-COPY patch_*.py                       /build/
+COPY patch_*.py _patchlib.py install_radiance_hooks.py /build/
 COPY radiance_gemm.py \
      radiance_mxfp4.py \
      radiance_rmsquant.py \

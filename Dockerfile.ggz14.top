@@ -74,7 +74,7 @@ ARG GFX_ARCH
 # — the documented 17-hours-stale-kernel incident, where a `make`-left .so in
 # the working directory silently served a kernel older than its own source.
 COPY r4d_radiance_extras.patch        /build/r4d_radiance_extras.patch
-COPY patch_*.py                        /build/
+COPY patch_*.py _patchlib.py install_radiance_hooks.py /build/
 COPY radiance_mxfp4_fp8.hip           /build/
 COPY radiance_preamble.py             /build/radiance_preamble.py
 COPY radiance_entrypoint.sh           /build/radiance_entrypoint.sh
