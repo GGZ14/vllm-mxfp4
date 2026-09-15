@@ -1,55 +1,31 @@
 #!/usr/bin/env bash
-# build.sh -- the radiance build orchestrator. One file builds both images:
+# build.sh -- build the radiance ggz14 images.
 #
-#   ./build.sh                          bake the release image (base + ggz14 layer)
-#   ./build.sh --base-only              publish the platform base only
-#                                       (docker build --target base)
-#   ./build.sh --push                  also push (needs --registry=host/path, or $REGISTRY)
-#   ./build.sh --jobs=N                MAX_JOBS for the from-source compile stage
-#   ./build.sh --help                  this text
+# One build for both images, from one file (Dockerfile.ggz14):
 #
-# Reads VERSION from this repo, builds Dockerfile.ggz14, and tags:
+#   ./build.sh               build the radiance image (base + the ggz14 bake layer)
+#                           -> ggz14/vllm-radiance-mxfp4:$VERSION-$SHA
+#                              e.g.  ggz14/vllm-radiance-mxfp4:0.13.0-3368c48
+#   ./build.sh --base-only  build the platform base only (--target base)
+#                           -> ggz14/vllm-radiance:$VERSION-$SHA
+#   ./build.sh --push       also push (needs --registry=host/path or $REGISTRY)
+#   ./build.sh --jobs=N     MAX_JOBS for the from-source compile stage
 #
-#   radiance:vX.Y.Z           version tag (primary)
-#   radiance:latest           latest pointer
-#   radiance-mxfp4:vX.Y.Z     alias, same id (downstream tooling that references
-#   radiance-mxfp4:latest     the older name keeps working)
-#   radiance-paro:vX.Y.Z
-#   radiance-paro:latest
+# Tags (every build):
+#   $VERSION-$SHA    primary (VERSION from the VERSION file, SHA7 of the commit
+#                    being built -- the full recipe is in the file, so the tag
+#                    fully identifies the image)
+#   latest          moved to the build, every time
+#   v$VERSION       the version alias (0.13.0 rebase can be found without the SHA)
 #
-# The base stages (1-4) are cached between runs on the same machine: a patch or
-# kernel change re-runs only the bake stage. On a cold machine the full build
-# includes the from-source stack compile (hours) -- the same reality as every
-# base build in this repo's history. Dev-loop against the PUBLISHED base only:
-# Dockerfile.ggz14.top (a few minutes, no stack rebuild).
-#
-# NB: the base recipe in Dockerfile.ggz14 is a verbatim copy of this repo's
-# Dockerfile. When the upstream file changes, re-sync that copy before
-# publishing --target base output.
+# A dirty tree warns; the tag does not change (the SHA is the recipe id, a
+# dirty build is a dev-only thing and the tag lies either way).
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
-REGISTRY=${REGISTRY:-}
-PUSH=0
-BASE_ONLY=0
-JOBS=
-for a in "$@"; do
-  case "$a" in
-    --base-only)        BASE_ONLY=1 ;;
-    --push)             PUSH=1 ;;
-    --registry=*)       REGISTRY="${a#*=}" ;;
-    --jobs=*)           JOBS="${a#*=}" ;;
-    -h|--help)
-      sed -n '2,28p' "$0" | sed 's/^# \?//'
-      exit 0 ;;
-    *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
-  esac
-done
-
-# --------------------------------------------------------------- runtime + version
 RUNTIME=${RUNTIME:-}
 if [ -z "$RUNTIME" ]; then
   if   command -v docker >/dev/null 2>&1; then RUNTIME=docker
@@ -58,60 +34,78 @@ if [ -z "$RUNTIME" ]; then
   fi
 fi
 
-VERSION=$(tr -d '[:space:]' <VERSION 2>/dev/null || true)
-if [ -z "$VERSION" ]; then echo "ERROR: no VERSION file" >&2; exit 1; fi
-
-IMAGE_ARGS=(--file Dockerfile.ggz14)
-if [ -n "$JOBS" ]; then IMAGE_ARGS+=(--build-arg "MAX_JOBS=$JOBS"); fi
-
-# --------------------------------------------------------------- build
-if [ "$BASE_ONLY" = 1 ]; then
-  TARGET_ARG=(--target base)
-  TAGS=(-b -t base)
-else
-  TARGET_ARG=()
-  TAGS=(-t "radiance:v${VERSION}" -t "radiance:latest")
-fi
-
-echo "=== ${RUNTIME} build${TARGET_ARG[*]+" (${TARGET_ARG[*]})"} ==="
-"$RUNTIME" build "${IMAGE_ARGS[@]}" "${TARGET_ARG[@]+"${TARGET_ARG[@]}"}" "${TAGS[@]}"
-
-if [ "$BASE_ONLY" = 1 ]; then
-  cat <<EOF
-
-=== base published ===
-  base   (the platform base, --target base)
-To build the release image:  ./build.sh
-EOF
-  exit 0
-fi
-
-NEW_ID=$("$RUNTIME" inspect --format '{{.Id}}' "radiance:v${VERSION}")
-for alias in radiance-mxfp4:v${VERSION} radiance-mxfp4:latest \
-             radiance-paro:v${VERSION}  radiance-paro:latest; do
-  "$RUNTIME" tag "radiance:v${VERSION}" "$alias"
+PUSH=0; JOBS=; WANT_BASE=0
+for a in "$@"; do
+  case "$a" in
+    --push) PUSH=1 ;;
+    --base-only) WANT_BASE=1 ;;
+    --jobs=*) JOBS="${a#*=}" ;;
+    --registry=*) REGISTRY="${a#*=}" ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//' ; exit 0 ;;
+    *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
+  esac
 done
 
-# --------------------------------------------------------------- optional push
+# --------------------------------------------------------- version + commit ----
+VERSION=$(tr -d '[:space:]' <VERSION 2>/dev/null || true)
+[ -n "$VERSION" ] || { echo "ERROR: no VERSION file" >&2; exit 1; }
+SHA=$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
+[ -z "$(git status --porcelain 2>/dev/null)" ] || \
+  echo "NOTE: the working tree is dirty; the tag $VERSION-$SHA will refer to the committed recipe, not the worktree"
+
+if [ "$WANT_BASE" = 1 ]; then
+  NAME=${BASE_NAME:-ggz14/vllm-radiance}
+  TARGET=(--target base)
+else
+  NAME=${NAME:-ggz14/vllm-radiance-mxfp4}
+  TARGET=()
+fi
+
+BUILD_ARGS=(--file Dockerfile.ggz14
+  -t "${NAME}:${VERSION}-${SHA}"
+  -t "${NAME}:latest"
+  -t "${NAME}:v${VERSION}")
+[ -n "$JOBS" ] && BUILD_ARGS+=(--build-arg "MAX_JOBS=$JOBS")
+
+# --------------------------------------------------------- the build -----------
+echo "=== $RUNTIME build: $( [ "$WANT_BASE" = 1 ] && echo "--target base" || echo "full" ) -t $NAME:$VERSION-$SHA ==="
+"$RUNTIME" build "${BUILD_ARGS[@]}" ${TARGET[@]+"${TARGET[@]}"}
+
+# --------------------------------------------------------- the base byproduct --
+# The base is a build product of the same file: re-tag the stage-4 output so
+# the next bake can ride on it without a fresh from-source compile (same for
+# a standalone --base-only, just not re-run).
+if [ "$WANT_BASE" != 1 ]; then
+  "$RUNTIME" build --file Dockerfile.ggz14 --target base \
+    -t "${BASE_NAME:-ggz14/vllm-radiance}:${VERSION}-${SHA}" \
+    -t "${BASE_NAME:-ggz14/vllm-radiance}:latest" >/dev/null 2>&1 || \
+  echo "  note: the base is not separately available with $RUNTIME; the full build is the source of truth"
+fi
+
+# --------------------------------------------------------- optional push -------
 if [ "$PUSH" = 1 ]; then
-  [ -n "$REGISTRY" ] || { echo "ERROR: --push needs --registry=host/path (or \$REGISTRY)" >&2; exit 1; }
+  [ -n "${REGISTRY:-}" ] || { echo "ERROR: --push needs --registry=host/path (or \$REGISTRY)" >&2; exit 1; }
   echo "=== pushing to ${REGISTRY}"
-  for repo in radiance radiance-mxfp4 radiance-paro; do
-    "$RUNTIME" push "${REGISTRY}/${repo}:v${VERSION}"
-    "$RUNTIME" push "${REGISTRY}/${repo}:latest"
+  for n in "$NAME" "${BASE_NAME:-ggz14/vllm-radiance}"; do
+    for t in "${VERSION}-${SHA}" latest "v${VERSION}"; do
+      if "$RUNTIME" inspect "$n:$t" >/dev/null 2>&1; then
+        "$RUNTIME" tag "$n:$t" "${REGISTRY}/${n}:$t"
+        "$RUNTIME" push "${REGISTRY}/${n}:$t"
+      fi
+    done
   done
 fi
 
 cat <<EOF
 
-=== baked ===
-  image   ${NEW_ID}
-  tags    radiance:v${VERSION}  radiance:latest
-          radiance-mxfp4:v${VERSION}  radiance-mxfp4:latest
-          radiance-paro:v${VERSION}   radiance-paro:latest
+=== done ===
+  primary  ${NAME}:${VERSION}-${SHA}
+  latest   ${NAME}:latest
+  version  ${NAME}:v${VERSION}
 
-Smoke test (the checkpoint must be on the host; ./setup.sh fetches it):
+Compose consumes:
 
-    ./serve.sh
-    # single-card host:  TP=1 ./serve.sh
+  services:
+    vllm:
+      image: ${NAME}:${VERSION}-${SHA}
 EOF

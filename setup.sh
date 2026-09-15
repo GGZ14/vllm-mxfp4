@@ -14,7 +14,7 @@
 #   ./setup.sh --no-drafter             # skip the drafter (then --mtp-mode)
 #
 # Environment:
-#   IMAGE=...                           # image to pull (default: radiance:latest)
+#   IMAGE=ggz14/vllm-radiance-mxfp4:latest  # image to pull (from build.sh)
 #   MODELS=~/models                     # where checkpoints land
 #
 # Disk: 19-21 GiB checkpoint + 2 GiB drafter + ~10 GiB image. The
@@ -42,7 +42,7 @@ done
 
 MODELS=${MODELS:-$HOME/models}
 HF_CACHE=${HF_CACHE:-$HOME/.cache/huggingface}
-IMAGE=${IMAGE:-radiance:latest}
+IMAGE=${IMAGE:-ggz14/vllm-radiance-mxfp4:latest}
 DRAFT_REPO=${DRAFT_REPO:-tcclaviger/Qwen3.8-27B-DFlash2-FP8}
 DRAFTER=${DRAFTER:-$MODELS/Qwen3.8-27B-DFlash2-FP8}
 

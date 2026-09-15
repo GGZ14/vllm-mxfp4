@@ -24,7 +24,7 @@
 #   QUANT=int5 ./serve.sh               # ParoQuant int5 W5A8
 #
 # Environment:
-#   IMAGE=radiance:latest                # image to run (the prod-bake image)
+#   IMAGE=ggz14/vllm-radiance-mxfp4:latest  # image to run (the prod-bake image)
 #   MODELS=~/models                      # where the checkpoints are
 #   PORT=8080                            # host port to expose
 #   GPU_UTIL=(unset: 0.98 mxfp4, 0.92 ParoQuant)
@@ -43,7 +43,7 @@ set -euo pipefail
 
 QUANT=${QUANT:-mxfp4}
 MODELS=${MODELS:-$HOME/models}
-IMAGE=${IMAGE:-radiance:latest}
+IMAGE=${IMAGE:-ggz14/vllm-radiance-mxfp4:latest}
 PORT=${PORT:-8080}
 KV_MEM=${KV_MEM:-}
 CHUNK=${CHUNK:-8192}
