@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
 # build.sh -- build the radiance ggz14 images.
 #
-# One build for both images, from one file (Dockerfile.ggz14):
+# Default (the normal one):
 #
-#   ./build.sh               build the radiance image (base + the ggz14 bake layer)
-#                           -> ggz14/vllm-radiance-mxfp4:$VERSION-$SHA
-#                              e.g.  ggz14/vllm-radiance-mxfp4:0.13.0-3368c48
-#   ./build.sh --base-only  build the platform base only (--target base)
+#   ./build.sh         quick boot image = the PUBLISHED deadcode base
+#                     (stilldeadcode/vllm-radiance:0.9.3) + the ggz14 bake layer
+#                     (Dockerfile.ggz14.top: ~a few minutes -- the patch chain,
+#                     2 hipcc kernel compiles, dispatch registration)
+#                     -> ggz14/vllm-radiance-mxfp4:$VERSION-$SHA
+#                        e.g.  ggz14/vllm-radiance-mxfp4:0.13.0-3f8e21a
+#
+# Building the base from source (only when the upstream base moves, e.g. a
+# new vLLM/torch - that is the base recipe's purpose, not a bake input):
+#
+#   ./build.sh --base-only   the platform base, from source (--target base)
 #                           -> ggz14/vllm-radiance:$VERSION-$SHA
+#   ./build.sh --full       base from source AND the bake layer (hours)
+#
+# Other:
 #   ./build.sh --push       also push (needs --registry=host/path or $REGISTRY)
 #   ./build.sh --jobs=N     MAX_JOBS for the from-source compile stage
+#   ./build.sh --base-repo=stilldeadcode/vllm-radiance --base-tag=0.9.3
+#   ./build.sh --base-digest=HEX64   pin explicitly instead of the pulled one
 #
 # Tags (every build):
 #   $VERSION-$SHA    primary (VERSION from the VERSION file, SHA7 of the commit
-#                    being built -- the full recipe is in the file, so the tag
-#                    fully identifies the image)
+#                    being built -- the full recipe is in this repo, so the tag
+#                    identifies the image)
 #   latest          moved to the build, every time
-#   v$VERSION       the version alias (0.13.0 rebase can be found without the SHA)
+#   v$VERSION       the version alias (a 0.13.0 rebuild can be found by eye)
 #
-# A dirty tree warns; the tag does not change (the SHA is the recipe id, a
-# dirty build is a dev-only thing and the tag lies either way).
+# A dirty tree warns; the tag does not change (the SHA is the recipe id).
 
 set -euo pipefail
 
@@ -34,81 +45,106 @@ if [ -z "$RUNTIME" ]; then
   fi
 fi
 
-# docker >= 29 aliases `docker build` to the buildkit gateway frontend, which on
-# 29.1.3 fails this file at the parse stage with a swallowed "exit code: 1".
-# The classic builder parses and runs it fine; pin it. BUILDKIT=1 opts back in.
+# docker >= 29 aliases `docker build` to the buildkit gateway front-end, which on 29.1.3
+# fails this file at parse time with a swallowed "exit code: 1". The classic builder
+# parses and runs fine. Pin it; BUILDKIT=1 opts back in.
 if [ "$RUNTIME" = docker ] && [ "${BUILDKIT:-0}" != 1 ]; then
   export DOCKER_BUILDKIT=0
 fi
 
-PUSH=0; JOBS=; WANT_BASE=0
+WANT_BASE=0; WANT_FULL=0; PUSH=0; JOBS=
+BASE_REPO=${BASE_REPO:-stilldeadcode/vllm-radiance}
+BASE_TAG=${BASE_TAG:-0.9.3}
+BASE_DIGEST=
+BASE_PIN_OVERRIDE=1
 for a in "$@"; do
   case "$a" in
-    --push) PUSH=1 ;;
     --base-only) WANT_BASE=1 ;;
+    --full) WANT_FULL=1 ;;
+    --push) PUSH=1 ;;
     --jobs=*) JOBS="${a#*=}" ;;
     --registry=*) REGISTRY="${a#*=}" ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//' ; exit 0 ;;
+    --base-repo=*) BASE_REPO="${a#*=}" ;;
+    --base-tag=*) BASE_TAG="${a#*=}" ;;
+    --base-digest=*) BASE_DIGEST="${a#*=}" ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \?//' ; exit 0 ;;
     *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
 
 # --------------------------------------------------------- version + commit ----
-VERSION=$(tr -d '[:space:]' <VERSION 2>/dev/null || true)
+VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || true)
 [ -n "$VERSION" ] || { echo "ERROR: no VERSION file" >&2; exit 1; }
 SHA=$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git status --porcelain 2>/dev/null)" ] || \
   echo "NOTE: the working tree is dirty; the tag $VERSION-$SHA will refer to the committed recipe, not the worktree"
 
+# --------------------------------------------------------- which recipe --------
+# default = quick boot on the published base. base from source only when asked.
 if [ "$WANT_BASE" = 1 ]; then
   NAME=${BASE_NAME:-ggz14/vllm-radiance}
+  DF=Dockerfile.ggz14
   TARGET=(--target base)
+elif [ "$WANT_FULL" = 1 ]; then
+  NAME=${NAME:-ggz14/vllm-radiance-mxfp4}
+  DF=Dockerfile.ggz14
+  TARGET=()
 else
   NAME=${NAME:-ggz14/vllm-radiance-mxfp4}
+  DF=Dockerfile.ggz14.top
   TARGET=()
 fi
 
-BUILD_ARGS=(--file Dockerfile.ggz14
+# --------------------------------------------------------- base pin (top/full) -
+# The top rides the published base: pull it, pin by live digest, warn on drift
+# from the recipe's default. (For --full the base is source by definition; the
+# pin is a reference only.)
+BUILDARG=()
+if [ "$WANT_BASE" != 1 ] && [ -z "$BASE_DIGEST" ]; then
+  echo "=== pulling base ${BASE_REPO}:${BASE_TAG}"
+  "$RUNTIME" pull "${BASE_REPO}:${BASE_TAG}" >/dev/null
+  BASE_DIGEST=$("$RUNTIME" inspect --format '{{index .RepoDigests 0}}' "${BASE_REPO}:${BASE_TAG}" 2>/dev/null | sed 's|^.*@||' | sed 's|^sha256:||')
+  if ! [[ "$BASE_DIGEST" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "NOTE: no manifest digest readable for ${BASE_REPO}:${BASE_TAG}; using the recipe's default pin" >&2
+  else
+    DEFPIN=$(grep -m1 -oP 'ARG BASE_DIGEST=\K[0-9a-f]{64}' $DF)
+    [ -n "$DEFPIN" ] && [ "$DEFPIN" != "$BASE_DIGEST" ] && \
+      echo "NOTE: the published base has moved since the recipe was written (default pin ${DEFPIN} != live ${BASE_DIGEST}); building against the live base"
+  fi
+fi
+[ -n "$BASE_DIGEST" ] && BUILDARG=(--build-arg "BASE_DIGEST=${BASE_DIGEST}")
+
+BUILD_ARGS=(--file $DF
   -t "${NAME}:${VERSION}-${SHA}"
   -t "${NAME}:latest"
-  -t "${NAME}:v${VERSION}")
+  -t "${NAME}:v${VERSION}"
+  "${BUILDARG[@]}")
 [ -n "$JOBS" ] && BUILD_ARGS+=(--build-arg "MAX_JOBS=$JOBS")
 
 # --------------------------------------------------------- the build -----------
-echo "=== $RUNTIME build: $( [ "$WANT_BASE" = 1 ] && echo "--target base" || echo "full" ) -t $NAME:$VERSION-$SHA ==="
+echo "=== $RUNTIME build: [ $DF ${TARGET[*]:-no --target} ] -t $NAME:$VERSION-$SHA ==="
 "$RUNTIME" build "${BUILD_ARGS[@]}" ${TARGET[@]+"${TARGET[@]}"} .
-
-# --------------------------------------------------------- the base byproduct --
-# The base is a build product of the same file: re-tag the stage-4 output so
-# the next bake can ride on it without a fresh from-source compile (same for
-# a standalone --base-only, just not re-run).
-if [ "$WANT_BASE" != 1 ]; then
-  "$RUNTIME" build --file Dockerfile.ggz14 --target base \
-    -t "${BASE_NAME:-ggz14/vllm-radiance}:${VERSION}-${SHA}" \
-    -t "${BASE_NAME:-ggz14/vllm-radiance}:latest" . >/dev/null 2>&1 || \
-  echo "  note: the base is not separately available with $RUNTIME; the full build is the source of truth"
-fi
 
 # --------------------------------------------------------- optional push -------
 if [ "$PUSH" = 1 ]; then
   [ -n "${REGISTRY:-}" ] || { echo "ERROR: --push needs --registry=host/path (or \$REGISTRY)" >&2; exit 1; }
   echo "=== pushing to ${REGISTRY}"
-  for n in "$NAME" "${BASE_NAME:-ggz14/vllm-radiance}"; do
-    for t in "${VERSION}-${SHA}" latest "v${VERSION}"; do
-      if "$RUNTIME" inspect "$n:$t" >/dev/null 2>&1; then
-        "$RUNTIME" tag "$n:$t" "${REGISTRY}/${n}:$t"
-        "$RUNTIME" push "${REGISTRY}/${n}:$t"
-      fi
-    done
+  for t in "${VERSION}-${SHA}" latest "v${VERSION}"; do
+    if "$RUNTIME" inspect "$NAME:$t" >/dev/null 2>&1; then
+      "$RUNTIME" tag "$NAME:$t" "${REGISTRY}/${NAME}:$t"
+      "$RUNTIME" push "${REGISTRY}/${NAME}:$t"
+    fi
   done
 fi
 
+base_digest="$( [ -n "${BASE_DIGEST}" ] && echo "${BASE_DIGEST}" || echo "recipe default" )"
 cat <<EOF
 
 === done ===
   primary  ${NAME}:${VERSION}-${SHA}
   latest   ${NAME}:latest
   version  ${NAME}:v${VERSION}
+$( [ "$WANT_BASE" = 0 ] && [ "$WANT_FULL" = 0 ] && echo "  base     ${BASE_REPO}:${BASE_TAG} (published, pinned at $base_digest)" )
 
 Compose consumes:
 
