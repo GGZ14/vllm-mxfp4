@@ -269,13 +269,22 @@ __device__ __forceinline__ void pq_stage_w(unsigned char *__restrict__ sW,
 
 // ---------------------------------------------------------------- e4m3 encode/decode (OCP)
 //
-// Software, not the v_cvt_pk_fp8 path, for two reasons: the builtin's availability/semantics on
-// gfx1201 under this image's clang is unverified, and the row-sum MUST be the sum of the values
-// the codes actually decode to -- deriving it from the same decode function makes that true by
-// construction. Both functions are gated exhaustively (256 codes round-trip + RNE boundary cases)
-// in par_harness before anything downstream is trusted. The prologue is ~15 VALU per element
-// against a GEMM that streams 4.25 bits/weight; this is not the place to spend cleverness.
-__host__ __device__ __forceinline__ float pq_e4m3_decode(unsigned char b) {
+// Two implementations, selected by PQ_HW_CVT (default 1):
+//   1: device code uses the hardware v_cvt_pk_fp8_f32 / v_cvt_f32_fp8 (gfx12 has both; the
+//      radiance_mxfp4_fp8 producers already ran them on this image). Gated exhaustively on
+//      2026-09-15 (paroquant/cvt_probe.hip): over ALL 2^32 float bit patterns the wrapped hardware
+//      encode is byte-identical to the software encoder below -- the wrapper supplies the three
+//      things the raw instruction does not: NaN -> 0, -0 -> +0, and saturation to +-448 (the
+//      raw cvt returns the NaN code past 448). Decode is bit-identical on all 254 finite codes;
+//      it differs only on the two NaN codes 0x7F/0xFF, which the encoder never produces
+//      (software says +-480 there, hardware says NaN).
+//   0: the software form (RNE, OCP, saturating) on the device too. Host code ALWAYS uses the
+//      software form, so par_harness's host references gate the hardware path byte-for-byte.
+// The row-sum contract is unchanged either way: RS is the sum of what the codes decode to.
+#ifndef PQ_HW_CVT
+#define PQ_HW_CVT 1
+#endif
+__host__ __device__ __forceinline__ float pq_e4m3_decode_sw(unsigned char b) {
   const float s = (b >> 7) ? -1.f : 1.f;
   const int E = (b >> 3) & 0xF, m = b & 7;
   // subnormal step 2^-9; normal (1 + m/8) * 2^(E-7)
@@ -285,7 +294,7 @@ __host__ __device__ __forceinline__ float pq_e4m3_decode(unsigned char b) {
 
 // Round-to-nearest-even, saturating to +-448 (no NaN/inf is ever produced; input is finite by
 // construction -- amax/448 scaling puts |v| <= 448 up to roundoff).
-__host__ __device__ __forceinline__ unsigned char pq_e4m3_encode(float v) {
+__host__ __device__ __forceinline__ unsigned char pq_e4m3_encode_sw(float v) {
   const unsigned char sign = v < 0.f ? 0x80 : 0x00;
   float a = fabsf(v);
   if (!(a > 0.f)) return 0;                       // covers +-0 and any stray NaN
@@ -301,6 +310,23 @@ __host__ __device__ __forceinline__ unsigned char pq_e4m3_encode(float v) {
   if (q >= 16.f) { q = 8.f; ++E; }                // mantissa carry
   if (E > 15 || (E == 15 && q > 14.f)) return sign | 0x7E;   // saturate (0xF6 is 448; 0xF7 NaN)
   return sign | (unsigned char)((E << 3) | ((int)q - 8));
+}
+
+__host__ __device__ __forceinline__ float pq_e4m3_decode(unsigned char b) {
+#if PQ_HW_CVT && defined(__HIP_DEVICE_COMPILE__)
+  return __builtin_amdgcn_cvt_f32_fp8((int)b, 0);
+#else
+  return pq_e4m3_decode_sw(b);
+#endif
+}
+__host__ __device__ __forceinline__ unsigned char pq_e4m3_encode(float v) {
+#if PQ_HW_CVT && defined(__HIP_DEVICE_COMPILE__)
+  v = (v == v) ? v : 0.f;                                   // NaN -> 0, as the software form
+  const float c = fminf(fmaxf(v, -448.f), 448.f) + 0.f;    // saturate; "+ 0.f" folds -0 into +0
+  return (unsigned char)__builtin_amdgcn_cvt_pk_fp8_f32(c, c, 0, false);
+#else
+  return pq_e4m3_encode_sw(v);
+#endif
 }
 
 // Activation quantizer element: e4m3 (scale amax/448, code-domain row-sum of the decoded values) or,

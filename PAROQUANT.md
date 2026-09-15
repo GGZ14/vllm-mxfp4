@@ -124,9 +124,13 @@ on a stack whose launch gap is ~20% of decode. One workgroup per (partition, gro
 held in registers (`unsigned long long rec[8][2]`) instead of staged through LDS, and no
 `__syncthreads` at all. Bit-exact against v1.
 
-The e4m3 encode and decode are **software** (RNE, OCP, saturating) rather than `v_cvt_pk_fp8`, so
-the code-domain row-sum is by construction the sum of exactly what the codes decode to. Gated
-exhaustively: 256-code round-trip plus nearest-value optimality.
+The e4m3 encode and decode use the hardware `v_cvt_pk_fp8_f32` / `v_cvt_f32_fp8` on the device
+(`PQ_HW_CVT=1`, the default since 2026-09-15; `-DPQ_HW_CVT=0` via `RADIANCE_PQ_HIPCC_FLAGS`
+restores the software form). The wrapper adds what the raw instruction lacks -- NaN -> 0, -0 -> +0,
+saturation to +-448 -- and was gated against the software encoder over ALL 2^32 float bit patterns
+(byte-identical) and all 254 finite codes (bit-identical decode). Host code keeps the software
+(RNE, OCP, saturating) form, so par_harness's host references gate the device path byte-for-byte,
+and the code-domain row-sum is still by construction the sum of exactly what the codes decode to.
 
 Four more producers fuse the rotation into whatever computed the activation, so the rotation stops
 being its own launch:
