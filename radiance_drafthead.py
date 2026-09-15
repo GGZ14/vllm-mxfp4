@@ -164,18 +164,58 @@ if triton is not None:
         _emit(acc, mask_n, BM, BI, offs_m, pid, NBLK, KC, BLOCK_N)
 
     @triton.jit
-    def _rerank_exact(X, W, IDX, OUT, K: tl.constexpr, stride_w, R: tl.constexpr,
-                      BLOCK_K: tl.constexpr):
-        """Exact logit for R candidate rows per draft row, straight off the bf16 weight."""
+    def _rerank_exact(X, W, S, IDX, OUT, K: tl.constexpr, stride_w, R: tl.constexpr,
+                      BLOCK_K: tl.constexpr, FP8: tl.constexpr):
+        """Exact logit for R candidate rows per draft row, straight off the head's own weight:
+        bf16 rows, or (FP8) e4m3 rows as raw bytes decoded here times the per-row fp32 scale S --
+        the compressed-tensors per-channel FP8 lm_head of the NVFP4 checkpoints. The decode is
+        exact bit arithmetic (no Triton fp8 cast, whose gfx12 lowering is not relied on)."""
         m = tl.program_id(0)
         j = tl.program_id(1)
         n = tl.load(IDX + m * R + j)
         acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        if FP8:
+            sc = tl.load(S + n).to(tl.float32)
         for k0 in range(0, K, BLOCK_K):
             offs = k0 + tl.arange(0, BLOCK_K)
-            acc += (tl.load(X + m * K + offs).to(tl.float32)
-                    * tl.load(W + n * stride_w + offs).to(tl.float32))
+            if FP8:
+                b = tl.load(W + n * stride_w + offs).to(tl.int32)
+                e = (b >> 3) & 15
+                mant = (b & 7).to(tl.float32)
+                mag = tl.where(e == 0, mant * 0.001953125,
+                               (1.0 + mant * 0.125) * tl.exp2((e - 7).to(tl.float32)))
+                wv = tl.where((b & 128) != 0, -mag, mag) * sc
+            else:
+                wv = tl.load(W + n * stride_w + offs).to(tl.float32)
+            acc += tl.load(X + m * K + offs).to(tl.float32) * wv
         tl.store(OUT + m * R + j, tl.sum(acc, axis=0))
+
+
+def _head_matrix(lm_head):
+    """(rows [N, K], per-row scale [N] fp32 or None) for the head's weight. A compressed-tensors
+    FP8 per-channel lm_head keeps its [N, K] e4m3 storage but exposes it TRANSPOSED ([K, N] view)
+    after process_weights_after_loading, with weight_scale [N, 1]; undo the view here."""
+    w = getattr(lm_head, "weight", None)
+    if w is None or w.dim() != 2:
+        return w, None
+    if w.dtype == torch.float8_e4m3fn:
+        sc = getattr(lm_head, "weight_scale", None)
+        if sc is None:
+            return None, None
+        rows = w if w.shape[0] == sc.numel() else w.t()
+        if not rows.is_contiguous() or rows.shape[0] != sc.numel():
+            return None, None
+        return rows, sc.detach().reshape(-1).float()
+    return w, None
+
+
+def _head_is_empty(rows, scale):
+    if scale is None:
+        return float(rows.data.abs().max()) == 0.0
+    for i in range(0, rows.shape[0], 8192):          # fp8 has no abs(); bytes are enough
+        if bool((rows.data[i:i + 8192].view(torch.uint8) != 0).any()):
+            return False
+    return True
 
 
 def _pow2_at_least(m):
@@ -207,12 +247,17 @@ def _apply_head_int2(self, lm_head, hidden_states, embedding_bias):
         k, n, self._radiance_wq.stride(0), self._radiance_scale.stride(0), xs.stride(0),
         nblk, KCAND, G=GROUP, BLOCK_M=M, BLOCK_N=BLOCK_N, **_cfg_for(M))
 
-    w = getattr(lm_head, "weight", None)
-    if w is not None and w.dtype in (torch.bfloat16, torch.float16) and w.shape == (n, k):
+    w, wsc = _head_matrix(lm_head)
+    if w is not None and w.shape == (n, k) and \
+            (wsc is not None or w.dtype in (torch.bfloat16, torch.float16)):
         idx = bi.gather(1, bm.topk(RERANK, dim=1).indices).contiguous()
         ex = torch.empty(M, RERANK, dtype=torch.float32, device=x.device)
-        _rerank_exact[(M, RERANK)](x, w, idx, ex, k, w.stride(0), R=RERANK, BLOCK_K=512,
-                                   num_warps=4)
+        if wsc is not None:
+            _rerank_exact[(M, RERANK)](x, w.view(torch.uint8), wsc, idx, ex, k, w.stride(0),
+                                       R=RERANK, BLOCK_K=512, FP8=True, num_warps=4)
+        else:
+            _rerank_exact[(M, RERANK)](x, w, x, idx, ex, k, w.stride(0), R=RERANK, BLOCK_K=512,
+                                       FP8=False, num_warps=4)
         if getattr(self, "_radiance_topk_only", False):
             # A top-k caller ranks the whole row against itself, so the ~124k entries the rerank
             # did NOT touch are still coarse 2-bit values competing with exact ones -- and a
@@ -246,7 +291,8 @@ def _apply_head_lazy(self, lm_head, hidden_states, embedding_bias):
     Needed because the weight a drafter scores against may not exist yet when load_weights
     returns; here it is the argument, so it is guaranteed populated.
     """
-    if float(lm_head.weight.data.abs().max()) == 0.0:
+    _rows, _sc = _head_matrix(lm_head)
+    if _rows is None or _head_is_empty(_rows, _sc):
         # Still empty on a real call: something is wrong, but a coarse head would be silently
         # catastrophic, so fall back to the stock GEMM rather than guess.
         return type(self)._apply_head(self, lm_head, hidden_states, embedding_bias)
@@ -270,7 +316,9 @@ def _quantize_draft_head(mtp, lp_attr="logits_processor"):
     if lm_head is None or lp is None or not hasattr(lm_head, "weight"):
         return f"no lm_head/{lp_attr}"
     w = lm_head.weight
-    if w.dim() != 2 or w.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+    rows, rsc = _head_matrix(lm_head)
+    if rows is None or w.dim() != 2 or \
+            (rsc is None and w.dtype not in (torch.bfloat16, torch.float16, torch.float32)):
         return f"unsupported draft-head weight {tuple(w.shape)} {w.dtype}"
     lp._radiance_topk_only = lp_attr == "candidate_logits_processor"
     # A drafter whose checkpoint carries no lm_head (DFlash2) gets the target's tensor shared in
@@ -278,7 +326,7 @@ def _quantize_draft_head(mtp, lp_attr="logits_processor"):
     # Quantising that yields an all-zero head, and the failure is silent and total: the serve comes
     # up, text stays coherent because the TARGET is fine, and only acceptance collapses to ~1.0 --
     # which reads as a plausible accuracy verdict on the quantisation. Defer instead.
-    if float(w.data.abs().max()) == 0.0:
+    if _head_is_empty(rows, rsc):
         lp._apply_head = types.MethodType(_apply_head_lazy, lp)
         return "lm_head empty at load_weights (shared in later); quantising on first use"
     return _quantize_head_now(lp, lm_head)
@@ -294,7 +342,7 @@ _HEAD_CACHE: dict = {}
 
 
 def _quantize_head_now(lp, lm_head):
-    w = lm_head.weight
+    w, wsc = _head_matrix(lm_head)          # [N, K] rows (bf16, or e4m3 + per-row scale)
     n, k = w.shape
     if k % (2 * GROUP):
         return f"hidden size {k} not a multiple of {2 * GROUP}"
@@ -320,7 +368,10 @@ def _quantize_head_now(lp, lm_head):
     CH = 8192
     for i in range(0, n, CH):
         j = min(i + CH, n)
-        wg = w.data[i:j].float().reshape(j - i, k // GROUP, GROUP)
+        wg = w.data[i:j].to(torch.float32)
+        if wsc is not None:
+            wg = wg * wsc[i:j, None]
+        wg = wg.reshape(j - i, k // GROUP, GROUP)
         lo, hi = wg.amin(dim=2), wg.amax(dim=2)
         sc = ((hi - lo) / lv).clamp(min=1e-8)
         zp = torch.round(-lo / sc).clamp(0, lv)
@@ -357,7 +408,7 @@ def _quantize_head_now(lp, lm_head):
     # The bf16 weight is deliberately left in place: the rerank scores against it, and leaving it
     # lets vLLM's _maybe_share_lm_head point the MTP at the target's copy instead of keeping a
     # second one. Blanking it here (as the fp8 head did) defeats that share.
-    return (f"draft head ({n}, {k}) bf16 -> int{BITS} g{GROUP} asym "
+    return (f"draft head ({n}, {k}) {'fp8' if wsc is not None else 'bf16'} -> int{BITS} g{GROUP} asym "
             f"({stored / 2**30:.2f} GiB/rank), {KCAND} cand/block, rerank top-{RERANK} exact")
 
 

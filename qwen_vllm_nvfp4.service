@@ -1,0 +1,32 @@
+[Unit]
+Description=Qwen3.8-27B-NVFP4 (unsloth NVFP4 -> MXFP4 at load, all layers on the radiance W4A8 kernel, GDN merge, int2 heads) on stilldeadcode/vllm-radiance:0.9.3 (BOOT DEFAULT since 2026-09-15; dflash SPEC=7, fp8 attn, dynwidth)
+After=network-online.target
+Conflicts=qwen_vllm_38.service qwen_vllm_fp8mtp.service qwen_vllm_38unc.service qwen_vllm_awq.service qwen_vllm_35b.service qwen_vllm_mxfp4.service qwen_vllm_paro.service qwen_vllm_paro_mxfp4.service qwen_vllm_int5.service
+
+[Service]
+Type=simple
+TimeoutStartSec=1800
+# serve-mxfp4.sh with the NVFP4 requant on (radiance_nvfp4.py, patch_nvfp4_mxfp4.py). The three
+# RADIANCE_NVFP4_* conversion knobs are left at the module defaults (FP8 layers -> MXFP4, lm_head ->
+# bf16, in_proj_ba -> MXFP4): every one of them is load-bearing -- a layer left on vLLM's FP8 path
+# (hipBLASLt fp8) wedged the GPU under 8-way concurrency in 6/6 boots on 2026-09-15. The boot log
+# must say "[radiance.mxfp4] linear layers: 304/304" and "[radiance.gdnmerge] merged 48 GDN layers".
+# CACHE is the dir the final gate run was compiled in (same config): warm, and NOT shared with any
+# other env combination (a stale torch_aot_compile slot ignores env-only changes).
+# KV_MEM=0 = let vLLM profile; no measured pin exists for this weight footprint yet.
+Environment=RADIANCE_NVFP4_MXFP4=1
+Environment=SNAP=/home/brian/models/Qwen3.8-27B-NVFP4
+Environment=NAME=vllmnvfp4
+Environment=CACHE=/home/brian/.radiance-cache-nvfp4mxd-093
+Environment=KV_MEM=0
+Environment=GPU_UTIL=0.95
+Environment=SPEC_METHOD=dflash
+Environment=RADIANCE_NORMQUANT_FUSION=1
+Environment=RADIANCE_FP8_STREAM=1
+Environment="SERVED_NAMES=Qwen3.8 Qwen3.6 Qwen3.8-NVFP4 Qwen3.8-MXFP4"
+ExecStart=/home/brian/deadcode-vllm/serve-mxfp4.sh
+ExecStop=/usr/bin/podman stop -t 30 vllmnvfp4
+Restart=no
+
+[Install]
+WantedBy=default.target

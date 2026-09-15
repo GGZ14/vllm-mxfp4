@@ -732,6 +732,41 @@ every M.
 **4-bit weights leave far more room for KV.** On 2x R9700 the 27B MXFP4 body occupies 9.24 GiB/GPU
 against roughly 12.6 for the same model in FP8, and that headroom goes straight into context.
 
+### NVFP4 checkpoints: online requantization to MXFP4
+
+`RADIANCE_NVFP4_MXFP4=1` serves compressed-tensors NVFP4 checkpoints (e.g.
+`unsloth/Qwen3.8-27B-NVFP4`: e2m1 weights, e4m3 scale per 16, fp32 scale per tensor) on the same
+W4A8 fp8-WMMA kernel as the Quark MXFP4 release, the way AMD's ROCm blog does it for CDNA4 inside
+SGLang: each NVFP4 linear is loaded as stored, then dequantized and requantized to e2m1 + e8m0/32
+in `process_weights_after_loading` (`radiance_nvfp4.py`, hooked by `patch_nvfp4_mxfp4.py`), per
+partition of a merged linear so `gate_up_proj`'s two global scales are honoured instead of
+collapsed. The block exponent is chosen per 32-block by squared error between the no-clip rule
+and one binade finer (`RADIANCE_NVFP4_EXP=mse`, default; `ocp` and `noclip` are the fixed rules).
+Conversion takes ~10 s per rank for the whole model.
+
+The step is lossy: measured on the real tensors, NVFP4 sits 0.113 relRMS from the bf16 original
+(19 dB SQNR) and the requantized MXFP4 0.158 (16 dB) -- a direct bf16 -> MXFP4 quantization would
+be 0.112, so the cost is the double rounding, not the format. GSM8K does not see it (below).
+
+That checkpoint is mixed precision: only the first 56 layers' MLPs are NVFP4; attention, the GDN
+projections, `lm_head` and the last 8 MLPs are FP8 per-channel. `RADIANCE_NVFP4_FP8_LAYERS=mxfp4`
+(default) requantizes those too (never `lm_head`), which puts every linear on the radiance kernel
+and lets the fp8 residual stream and GDN norm+quant epilogues attach; GSM8K 500q scored 97.40%,
+the PARO-MXFP4 production number. `fp8` leaves them on vLLM's FP8 path (`torch._scaled_mm`, a
+real hipBLASLt fp8 GEMM on gfx1201, unfused scaling, no radiance fusions) and is diagnostic only:
+it wedged the GPU (driver reset) twice under sustained 8-way concurrency, minutes into GSM8K. The
+int2 draft head and verify head read the FP8 `lm_head` directly (e4m3 rows decoded in the rerank
+kernel). `RADIANCE_NVFP4_BF16_LAYERS=in_proj_ba` (default) also requantizes the bf16 GDN a/b gate
+projections so the GDN in_proj merge fuses all 48 layers. Measured on 2x R9700 against the PARO-MXFP4
+production unit the same day: GSM8K 500q 97.60% (vs 97.00 / 97.60 record), decode 22.2 / 23.8 / 24.7 ms/step
+at 25 / 8k / 32k context (vs 23.3 / 24.8 / 25.6), prefill 5072 / 4845 / 3900 tok/s at 8k / 26k / 104k
+(vs 4871 / 4679 / 3751), BetterBench quick conc-8 aggregate 597 t/s (vs 512). To serve it:
+
+```
+RADIANCE_NVFP4_MXFP4=1 SNAP=~/models/Qwen3.8-27B-NVFP4 NAME=vllmnvfp4 KV_MEM=0 GPU_UTIL=0.95 \
+  CACHE=~/.radiance-cache-nvfp4-093 SERVED_NAMES="Qwen3.8-NVFP4 Qwen3.8 Qwen3.6" ./serve-mxfp4.sh
+```
+
 ### Why the drafter is FP8, not MXFP4
 
 The target checkpoint is `Qwen3.8-27B-MXFP4-mtpfp8`: AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` body with

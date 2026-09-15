@@ -917,3 +917,101 @@ is a fixed cost per token, the GEMM share grows with context), TTFT at 33k 10.6 
 (the decode band uses neither), KL unchanged (producer1 vs producer3 mutual KL 0.0002 / top-1 99.8%: the
 serving floor for identical codes), GSM8K in band. The tables cost ~1.2% of KV (the decode-band producers
 still need the original records). Gap to MXFP4-PARO at 2k: 4770 vs 3941 = 17% (was 30%).
+
+## 2026-09-15: hardware e4m3 convert in the producers -- bit-identical, +0.5% (last software format step in prod)
+
+The activation quantizer (`pq_e4m3_encode`/`pq_e4m3_decode`, every rotate+quant producer) was the one
+remaining software format conversion on the prod hot path: ~15 VALU per element of frexpf/rintf, chosen
+because the builtin was "unverified on this image". It is verified now: `__builtin_amdgcn_cvt_pk_fp8_f32`
+and `__builtin_amdgcn_cvt_f32_fp8` compile and run on gfx1201 (the radiance_mxfp4_fp8 producers had
+been using the former all along). Exhaustive gate (`paroquant/cvt_probe.hip`): over all 2^32 float bit
+patterns the wrapped hardware encode (NaN -> 0, -0 -> +0, clamp +-448, then cvt) is byte-identical to
+the software encoder; raw cvt without the wrapper differs on 2.0e9 inputs (NaN codes past 448, -0,
+NaN). Decode is bit-identical on all 254 finite codes and differs only on the two NaN codes the
+encoder never emits. `PQ_HW_CVT` (default 1) selects it for device code; host code stays software,
+so the full par_harness gate (1470 checks, 0 failures) compares hardware device codes against
+software host references.
+
+Kernel level (`--bench2 tokqt`, 24 shapes): fused tiled prologue 1-5% faster (M=8192 K=8704 P=3
+3688 -> 3351 us; M=64 K=5120 P=1 10.9 -> 9.7 us), byte-exact.
+
+Serve (PARO-MXFP4 prod config, TP=2, SPEC=7, sw,hw,sw,hw boots):
+
+| | sw1 | hw1 | sw2 | hw2 |
+|---|--:|--:|--:|--:|
+| decode ms/step @ctx25 | 23.29 | 23.18 | 23.45 | 23.21 |
+| decode ms/step @8k | 25.06 | 24.90 | 24.93 | 25.04 |
+| decode ms/step @32k | 25.92 | (2-token sample) | 25.83 | 25.53 |
+| prefill tok/s @8k / 26k / 104k / 181k / 260k | 4846/4614/3735/3134/2702 | 4871/4679/3751/3147/2710 | 4906/4620/3715/3128/2701 | 4839/4675/3740/3148/2715 |
+
+Both hw boots beat both sw boots at ctx25 (-0.7%); prefill +0.4-1.3% from 26k up, noise at 8k.
+Acceptance identical at the fixed ctx-25 prompt (1.581 / 22.58% all four boots). Small, free,
+bit-identical: shipped as the default.
+
+Greedy fixed-prompt check (`greedy_cmp.py`, temperature 0, seed 7 prefix, 400 tokens, two runs per boot):
+
+| ctx | sw run a | sw run b | hw run a | hw run b |
+|---|---|---|---|---|
+| 45 | ed9bf304 | ed9bf304 | ed9bf304 | 43a56183 |
+| 8705 | 3d520259 | 03d90f57 | 03d90f57 | 03d90f57 |
+| 33853 | c45068c5 | c45068c5 | c45068c5 | c45068c5 |
+
+Every hw hash matches a sw hash except one, and the sw build itself produced two different 8k hashes:
+the second request of a prompt is served from the prefix cache with a different chunking, and the
+dynamic verify width carries state between requests, so greedy text is not run-to-run stable on this
+stack regardless of the encoder (the int2 verify-head lesson: a seeded-equivalence test needs a
+self-consistency control or it measures the scheduler). The bit-identity claim rests on the exhaustive
+2^32 gate and the harness, not on this table; the table shows the serve path is not worse than baseline.
+
+## 2026-09-15: NVFP4 checkpoints via load-time requant to MXFP4 (unsloth/Qwen3.8-27B-NVFP4)
+
+AMD's "NVFP4 -> MXFP4 online requantization" (SGLang, CDNA4) done for RDNA4 inside vLLM's compressed-tensors
+loader: `radiance_nvfp4.py` + `patch_nvfp4_mxfp4.py`, `RADIANCE_NVFP4_MXFP4=1` in `serve-mxfp4.sh`. Each NVFP4
+linear (e2m1, e4m3 per 16, fp32 global) is dequantized per partition and requantized to e2m1 + e8m0/32
+(`RADIANCE_NVFP4_EXP=mse`: no-clip vs one-binade-finer per block by squared error), then handed to the MXFP4
+kernel plugin = the radiance fp8-WMMA W4A8 kernel with the fp8 stream, decode band, WPERM. ~10 s/rank at load.
+Kernel vs exact fp32 reference on the converted layers: rel 0.0017 (CHECKALL, RADIANCE_NORMQUANT_FUSION=0).
+
+The checkpoint is mixed: NVFP4 only on MLPs 0-55; attention, GDN qkv/z/out, lm_head and MLPs 56-63 are FP8
+per-channel; in_proj_a/b bf16. Weight error vs the bf16 original (study_real.py, 15 tensors): NVFP4 0.113 relRMS
+(19.3 dB), NVFP4->MXFP4 0.158 (16.2 dB), direct bf16->MXFP4 0.112 -- the double rounding is the whole cost;
+`mse` beats the OCP rule (0.109 vs 0.115 vs NVFP4). No row hits the folded kernel's d>12 flush.
+
+**The FP8 layers must be requantized too (`RADIANCE_NVFP4_FP8_LAYERS=mxfp4`, default) and the lm_head
+dequantized to bf16 (`RADIANCE_NVFP4_LMHEAD=bf16`, default).** Any FP8 linear left on vLLM's CT path
+(`ChannelWiseTorchFP8ScaledMMLinearKernel` = torch._scaled_mm -> hipBLASLt fp8) wedged GPU 0 (driver "device
+wedged", MODE1 reset) in 6 of 6 boots, 1-8 min into GSM8K conc-8, and ran decode at ~32 ms/step with none of
+the radiance fusions attached. The all-MXFP4 form never hung. A PARO-MXFP4 control run in the same session
+reproduced its morning numbers exactly (23.29 ms/step, GSM8K 97.00), so the box was fine. Confirm
+`[radiance.mxfp4] linear layers: 256/256` in the boot log; 112/112 means the FP8 layers were left behind.
+
+Final config (TP=2, SPEC=7 dflash, int2 draft + verify heads, fresh cache dir), vs PARO-MXFP4 prod same day:
+
+| | NVFP4 -> MXFP4 | PARO-MXFP4 prod |
+|---|--:|--:|
+| GSM8K conc-8 | **97.30% (973/1000)**, 0 errors, 396 s; 97.40% (487/500) heads off | 97.00% (485/500) control today; 97.40 record |
+| decode ms/step @25 / 8k / 32k | 23.89 / 25.60 / 26.51 | 23.29 / 24.83 / 25.63 |
+| prefill tok/s @8k / 26k / 104k / 181k / 260k | 4695 / 4513 / 3684 / 3107 / 2676 (5013 / 4773 / 3840 / 3215 / 2759 on the cool morning boot) | 4871 / 4679 / 3751 / 3148 / 2715 |
+| BetterBench --quick single combined decode t/s | 201.9 | 203-209 (full passes, earlier) |
+| BetterBench --quick conc-8 aggregate t/s | 564.9 | 512 (int4 PARO record) |
+| BetterBench --quick prefill sweep @2k/8k/16k/32k/64k | 4621 / 4707 / 4666 / 4528 / 4276 | 4770 / 4827 / 4649 / 4495 / 4273 |
+
+**+ GDN in_proj merge (`RADIANCE_NVFP4_BF16_LAYERS=in_proj_ba`, now the default):** in_proj_a/b are bf16 in
+this checkpoint and radiance_gdnmerge only fuses a layer whose qkvz AND ba sides are on the radiance kernel;
+requantizing them (N=48 K=5120, relRMS ~0.114) merges all 48 GDN layers (96 launches/forward gone) and the fp8
+stream covers the whole model (64 mid, 63 down, 304/304 linears). Same session, fresh cache dir:
+
+| | NVFP4 -> MXFP4 + merge (FINAL) | PARO-MXFP4 prod |
+|---|--:|--:|
+| GSM8K 500q conc-8 | **97.60% (488/500)**, 0 errors, 200 s | 97.00 today / 97.60 record |
+| decode ms/step @25 / 8k / 32k | **22.16 / 23.84 / 24.71** | 23.29 / 24.83 / 25.63 |
+| prefill tok/s @8k / 26k / 104k / 181k / 260k | **5072 / 4845 / 3900 / 3246 / 2783** | 4871 / 4679 / 3751 / 3148 / 2715 |
+| BetterBench --quick single combined decode t/s | **213.4** | 203-209 |
+| BetterBench --quick conc-1/2/4/8 aggregate t/s | 183.9 / 319.5 / 456.7 / **597.5** | conc-8 512 (int4 PARO record) |
+| BetterBench --quick prefill @2k/8k/16k/32k/64k | **4883 / 5053 / 4987 / 4839 / 4552** | 4770 / 4827 / 4649 / 4495 / 4273 |
+
+The NVFP4 unit is now the fastest serve on this box at every metric (-4.9% step, +3-7% prefill, +17% conc-8
+vs PARO-MXFP4) at the same GSM8K, from a checkpoint downloaded as-is. Not a systemd unit yet (boot via
+`serve-mxfp4.sh` with the env in the README); nothing committed. The int2 draft/verify heads read the lm_head through `_head_matrix`
+(radiance_drafthead.py), which also supports an FP8 per-channel head with an in-kernel e4m3 decode in the
+exact rerank (byte-verified, same 0.3 ms as bf16) -- kept for checkpoints that need it.
