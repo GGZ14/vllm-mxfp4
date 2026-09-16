@@ -317,75 +317,15 @@ ENV VLLM_LOGGING_LEVEL=INFO \
 # Cost: tens of minutes added to a one-time image build; every boot after
 # paid it before (and still pays for any of the ~113 other aiter modules this
 # workload does not use -- those stay on the first-use lazy path, correct).
-# (Docker 20.10+ inline heredoc -- keep UNBACKSLASHED; the venv's python runs
-# the script, whose asserts / exceptions decide the outcome.)
-RUN /opt/vllm/bin/python3 - <<'PY'
-import importlib.util, os, shutil, sys, sysconfig
-
-sp = sysconfig.get_paths()["purelib"]
-jit = os.path.join(sp, "aiter", "jit")
-assert os.path.isfile(os.path.join(jit, "core.py")), \
-    f"no aiter JIT tree at {jit} -- base layout changed; re-audit this block"
-assert os.path.isfile(os.path.join(jit, "optCompilerConfig.json")), \
-    f"no aiter optCompilerConfig.json in {jit} -- base layout changed"
-
-# Build-env deltas (process scope only, so the served env stays byte-identical
-# to the launcher's; aiter reads them for the build flags the runtime would
-# otherwise resolve from a live device query):
-os.environ["GPU_ARCHS"] = "gfx1201"   # this image's arch (the live-resolved value)
-os.environ["CU_NUM"] = "64"          # R9700 CU count (escha/RESULTS_tuning.md: "64-CU part")
-# MAX_JOBS intentionally left unset: aiter's check_and_set_ninja_worker caps
-# jobs by cores (0.8x) and free memory (0.5 GB/job) on its own.
-
-# aiter's jit/core.py resolves chip_info / cpp_extension / file_baton /
-# torch_guard as bare module names (all in jit/utils/), but the wheel's top
-# package never puts utils/ on sys.path (its __init__.py is the license header
-# only). Load core.py standalone with the utils dir on the path -- the same
-# package-relative resolution aiter's JIT invocation itself yields.
-sys.path.insert(0, os.path.join(jit, "utils"))
-spec = importlib.util.spec_from_file_location("_aiter_jit_core", os.path.join(jit, "core.py"))
-core = importlib.util.module_from_spec(spec)
-sys.modules["_aiter_jit_core"] = core
-spec.loader.exec_module(core)
-
-# Drive the exact build the runtime's first use triggers: its ops call
-# core.build_module(md) with get_args_of_build(md) -- the same optCompilerConfig
-# entry and args. The config-identity assert bakes loud on any drift and the
-# --offload-arch flag below comes from the env above, so a future aiter source
-# change (new base) rebuilds a byte-identical-flag .so or fails the build.
-d = core.get_args_of_build("module_aiter_core")
-assert d["torch_exclude"] is True and d["flags_extra_cc"] == ["-DENABLE_CK=0"], \
-    f"module_aiter_core config drifted from this block's identity; re-audit: {d}"
-core.build_module("module_aiter_core",
-                  d["srcs"], d["flags_extra_cc"], d["flags_extra_hip"],
-                  d["blob_gen_cmd"], d["extra_include"], d["extra_ldflags"],
-                  d["verbose"], d["is_python_module"], d["is_standalone"],
-                  d["torch_exclude"], d.get("third_party", []),
-                  flags_extra_hip_per_source=d.get("flags_extra_hip_per_source"))
-
-# build_module drops the artifact in opbd_dir and (for this entry) copies it
-# to $SP/op_tests/ -- but get_module() probes get_user_jit_dir()/
-# module_aiter_core.so. Place the same artifact there so the runtime adopts
-# it instead of rebuilding:
-src = os.path.join(core.get_user_jit_dir(), "build", "module_aiter_core",
-                   "build", "module_aiter_core.so")
-if not os.path.isfile(src):
-    base = os.path.join(core.get_user_jit_dir(), "build", "module_aiter_core")
-    found = []
-    for root, _dirs, files in os.walk(base) if os.path.isdir(base) else []:
-        found += [os.path.relpath(os.path.join(root, f), base) for f in files if f.endswith(".so")]
-    raise SystemExit(f"aiter build left no .so at {src}; .so files found under {base}: {found}")
-dst = os.path.join(core.get_user_jit_dir(), "module_aiter_core.so")
-shutil.copyfile(src, dst)
-assert os.path.getsize(dst) > 3 * (1 << 20), f"baked .so implausibly small: {os.path.getsize(dst)} B"
-
-# The module is the product only if it loads: prove it now, GPU-free (the .so
-# init is device-independent; same reason the mxfp4 / ParoQuant import gates
-# above pass in a GPU-less build):
-sys.path.insert(0, os.path.dirname(dst))
-importlib.import_module("module_aiter_core")
-print(f"[build] aiter JIT pre-bake: {dst} ({os.path.getsize(dst) // (1 << 20)} MiB, import-clean)")
-PY
+# Script (not heredoc): the classic builder (DOCKER_BUILDKIT=0, pinned in build.sh)
+# discards a no-backslash in-file heredoc and runs python - clean on EOF (the first
+# cut of this block failed exactly that way -- every test passed, no .so anywhere),
+# so the bake runs from the repo's standalone bake_aiter_core.py, plain-COPY +
+# plain-RUN safe under both classic and buildkit: the script's asserts / exceptions
+# decide the step outcome -- a layout change or build failure is a loud failure,
+# never a silently skipped bake.
+COPY bake_aiter_core.py /opt/bake_aiter_core.py
+RUN set -e; /opt/vllm/bin/python3 /opt/bake_aiter_core.py
 
 # ------------------------------------------------------- build-time verification -
 # Prove the whole kernel stack is import-clean BEFORE the image is declared
