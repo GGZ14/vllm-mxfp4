@@ -491,6 +491,11 @@ ENTRYPOINT ["/opt/radiance_entrypoint.sh"]
 #   - the radiance modules the launcher cp's at runtime (the base's stage 3 ships its own
 #     12-module set; those cp's are idempotent against this same source tree, and the
 #     remainder -- germ, dflash_capture -- is delivered here).
+#   - aiter's JIT module .so, module_aiter_core: aiter compiles it on first use, but
+#     for this config the built artifact never reaches the path aiter's get_module()
+#     probes, so a bare container re-ran the whole JIT compile at every boot. The
+#     aiter-JIT-prebake block drives that same build at IMAGE build time and places the
+#     .so at the probed path -- no aiter build at boot.
 #
 # Dev loop: on a machine with warm build cache, only this stage re-runs after a
 # patch/kernel change (stages 1-4 are cached), a few minutes. On a cold machine the full
@@ -635,7 +640,10 @@ RUN chmod +x /opt/radiance_entrypoint.sh
 #
 # Cache dirs default to /cache (the launcher mounts $CACHE there) so a bare run
 # with that mount behaves identically; without the mount the dirs land in the
-# container layer and are dropped with --rm.
+# container layer and are dropped with --rm. The aiter JIT core .so is baked
+# into the image (the aiter-JIT-prebake block below), so --rm no longer costs
+# a boot aiter build; the remaining aiter modules (not used by these workloads)
+# still JIT on first use, as before.
 COPY qwen-fixed-v22.3.jinja /opt/qwen-fixed-v22.3.jinja
 ENV VLLM_LOGGING_LEVEL=INFO \
     VLLM_NO_USAGE_STATS=1 \
@@ -704,15 +712,62 @@ ENV VLLM_LOGGING_LEVEL=INFO \
     RADIANCE_TP_PAD_STRICT=1 \
     RADIANCE_STEP_TRACE=0 \
     RADIANCE_DFLASH_CALIB_TOKENS=200000
+# --------------------------------------------------------- aiter JIT pre-bake ---
+# aiter builds its JIT .so lazily on first use, and two independent facts make
+# the per-boot build unavoidable today, including on a persistent cache:
+#   (a) the built .so lands in the writable container layer, which --rm drops
+#       (the seen symptom: "start build [module_aiter_core]" on every boot);
+#   (b) aiter's own get_module() staleness check probes
+#       $SP/aiter/jit/module_aiter_core.so (get_user_jit_dir()), while
+#       build_module() for this entry (not a python module, not standalone in
+#       optCompilerConfig.json) copies the artifact to $SP/op_tests/ ... and
+#       so nothing ever lands at the probed path: aiter re-compiles on every
+#       boot even where a cache dir would be writable.
+# The fix drives the same build at IMAGE build time (hipcc needs no GPU to
+# compile, same as the mxfp4 / ParoQuant kernels above) and places the .so at
+# the probed path. The runtime then sees a .so whose embedded arch markers
+# match the device (--offload-arch strings in the binary; _needs_arch_rebuild
+# is false for a matching device and for no device), adopts it, and skips the
+# build. If it is ever missing or arch-mismatched, aiter rebuilds in place --
+# same self-healing as today, so this cannot pin a stale binary.
+#
+# Fidelity: this is aiter's own core.build_module("module_aiter_core") with the
+# exact per-module args its first-use runtime pass uses (get_args_of_build /
+# optCompilerConfig.json: single TU aiter_core_pybind.cu, -DENABLE_CK=0,
+# torch-excluded). Two env deltas, both equal to what the runtime resolves
+# live on the serving card:
+#   GPU_ARCHS=gfx1201  aiter's live-query path (no device -> ROCm info) lands
+#                      here; the build has no GPU, so state it explicitly.
+#   CU_NUM=64          64 CUs on the R9700; aiter needs it stated for a
+#                      GPU-less build (no map entry) and resolves the same
+#                      value live at runtime.
+# MAX_JOBS stays unset (aiter self-limits by cores / free memory, psutil) and
+# the assertion below pins the config identity so a future aiter source change
+# forces a loud rebuild next time this block re-runs (any base bump runs it).
+# Cost: tens of minutes added to a one-time image build; every boot after
+# paid it before (and still pays for any of the ~113 other aiter modules this
+# workload does not use -- those stay on the first-use lazy path, correct).
+# Script (not heredoc): the classic builder (DOCKER_BUILDKIT=0, pinned in build.sh)
+# discards a no-backslash in-file heredoc and runs python - clean on EOF (the first
+# cut of this block failed exactly that way -- every test passed, no .so anywhere),
+# so the bake runs from the repo's standalone bake_aiter_core.py, plain-COPY +
+# plain-RUN safe under both classic and buildkit: the script's asserts / exceptions
+# decide the step outcome -- a layout change or build failure is a loud failure,
+# never a silently skipped bake.
+COPY bake_aiter_core.py /opt/bake_aiter_core.py
+RUN set -e; /opt/vllm/bin/python3 /opt/bake_aiter_core.py
+
 # --------------------------------------------------------- final verification -----
 # Prove the whole kernel stack imports against this artifact before the build
 # succeeds. The venv's python (the system one does not see $SP). The base's
 # stage 4 gates (import + JIT probe) already ran for the base target; this is the
-# bake's own gate -- including the three .so files the runtime requires.
+# bake's own gate -- including the four .so files the runtime requires (the three
+# baked kernels + the pre-baked aiter JIT module).
 RUN set -e; \
   test -f "$SP"/r4d.so; \
   test -f "$SP"/radiance_mxfp4_fp8.so; \
   test -f "$SP"/radiance_paroquant_kernel.so; \
+  test -f "$SP"/aiter/jit/module_aiter_core.so; \
   /opt/vllm/bin/python3 -c 'import radiance_nvfp4, \
       radiance_mxfp4, radiance_mxfp4_fp8, radiance_gemm, \
       radiance_rmsquant, radiance_gdn, radiance_gdnmerge, radiance_drafthead, \

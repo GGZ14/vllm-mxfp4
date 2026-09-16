@@ -800,23 +800,44 @@ Everything below is baked into the image, and the tuned paths are env-gated and 
 | **The tuned drafter stack** (`RADIANCE_FAST_DRAFT`) | The draft head at 2 bits with an exact rerank (any drafter), plus a `dflash` drafter's decoder projections packed to signed symmetric int4 (one f16 scale per 128 input channels, no zero point, 4.25 bits per weight) on two purpose-built gfx1201 kernels (f16 matrix-core below 16 rows, int8 above). Codes are derived at load, so there is no calibration data and nothing on disk. Draft pass -9.1% at a drafter batch of 64; decode step -5.1% for +3.5% tokens/s |
 | **Prefix caching on the GDN hybrid** | Hybrid models leave APC off by default, so the compose turns it on with `--enable-prefix-caching --mamba-cache-mode=align`. Align mode snapshots and restores the GDN recurrent state at block boundaries (verified bit-identical to full recompute, including under MTP), giving a large TTFT drop on shared prefixes |
 | **Startup topology + bandwidth sweep** (`RADIANCE_RUN_BWTEST`) | Device list, P2P access matrix, NUMA distances, peak copy bandwidth per agent pair. Backgrounded, about a second. Set `0` to skip |
+| **Pre-baked AITER JIT core** | AITER's `module_aiter_core` module is hipcc-compiled at image build time and placed where AITER's `get_module()` looks, so a cold start never pays a JIT compile for it. If the `.so` ever goes missing or stops matching the device, AITER falls back to building in place (as before); the other AITER modules, which these workloads do not use, are still built lazily on first use |
 | **Optional NUMA pinning** (`--numa-bind`) | Off by default; for multi-NUMA-node hosts |
 
 ## Building the image from source
 
-You do not need any of this to serve. `setup-mxfp4.sh` pulls the published image, and the MXFP4
-patches and kernels are applied at container start. Build from source only to change a pinned
-component or a baked-in patch.
+You do not need any of this to serve. `setup-mxfp4.sh` / `serve-mxfp4.sh` point at
+`IMAGE=ggz14/vllm-radiance-mxfp4:latest`, which the recipes below build in a few minutes. Build
+only to change a pinned component or a baked-in patch.
 
-Everything the build needs is in this directory (a flat Docker build context). The version string
-lives in one place, the `VERSION` file, which the tag and the build-arg both read (`podman build`
-takes the same arguments):
+Three recipes, all with the repo as flat build context (below, the `Dockerfile` one):
+
+| File | What it builds | When you'd use it |
+|---|---|---|
+| `Dockerfile` | the four from-source stages, `--target base` = the base alone | the base itself (`--base-only`): produce it to publish as `stilldeadcode/vllm-radiance` and be the pin for the two variants |
+| `Dockerfile.ggz14` | the same four stages **plus** a fifth, the "radiance bake": the launcher patch chain applied once, the pinned-commit libr4d, both kernels, the radiance modules, the launcher measured profile, the entrypoint pair | the release build: `./build.sh --full` |
+| `Dockerfile.ggz14.top` | just the fifth stage, on the **published** base (digest-pinned `stilldeadcode/vllm-radiance:0.9.3`) | the minutes-scale dev loop: iterate the patch chain / kernels against a published base without rebuilding the stack |
+| `paroquant/Dockerfile` | the same fifth-stage bake with the **ParoQuant** measured profile baked in instead of the MXFP4 one | `./build.sh --paro` |
 
 ```bash
-docker build -t vllm-radiance:$(cat VERSION) --build-arg RADIANCE_VERSION=$(cat VERSION) .
+./build.sh            # .top on the published base -> $VERSION-$SHA, latest, v$VERSION (minutes)
+./build.sh --paro    # the ParoQuant image, same flow
+./build.sh --full    # the five-stage release build (hours: the four from-source stages)
+./build.sh --base-only  # the bare base, to publish and re-pin the variants
+./build.sh --push    # push the image afterwards
+./build.sh --no-cache  # force a recipe build even though nothing moved
 ```
 
-That single command builds everything from source, in four stages:
+`build.sh` pulls the published default and passes its live digest as `--build-arg BASE_DIGEST` (a
+base repaint cannot slip in); the version string lives in `VERSION`. `podman build` takes the same
+arguments; a bare `docker build -f Dockerfile.ggz14.top .`-style run works too, but uses the
+recipe's baked-in `BASE_DIGEST` default instead of build.sh's live pin.
+
+**No GPU required to build, no model on the build machine either**: hipcc compiles for `gfx1201`
+without a device (the same mechanism as the kernels and the pre-baked AITER module), and each
+recipe's gates import every radiance module in the venv before the image is declared built, so a
+broken change fails the build rather than the first container start.
+
+The `Dockerfile` recipe builds everything from source in four stages:
 
 | Stage | What it does |
 |---|---|
@@ -850,15 +871,19 @@ so `pip show` and the startup banner can be trusted.
 > load; restoring the pinned versions fixed it with no code change. If you override these with
 > `--build-arg`, move them together and soak-test under real load.
 
-If you just want a known-good image without building: `docker pull stilldeadcode/vllm-radiance`.
+If you just want a known-good image without building, `setup-mxfp4.sh` already points at
+`ggz14/vllm-radiance-mxfp4` (the MXFP4 image). `stilldeadcode/vllm-radiance` is the previous
+stock-generation image -- the bare base that builds its kernels in the container at first start --
+kept for reference and as the published pin for the top recipes.
 
 ## Repository layout
 
 Flat build context. The runtime Python modules (`radiance_*.py`), the `patch_*.py` fixes, the
-`fp8-configs/` `moe-configs/` and `mxfp4-configs/` GEMM configs, the chat templates, `Dockerfile`
-and `docker-compose.yml` all live at the repo root so `docker build .` works directly.
-`prune_rocm.sh` is the ROCm slimming step, and it self-checks: the arch's own kernels must survive
-and hipcc must still link a HIP shared object, since AITER JITs at runtime.
+`fp8-configs/` `moe-configs/` and `mxfp4-configs/` GEMM configs, the chat templates, and all three
+Dockerfiles (`Dockerfile`, `Dockerfile.ggz14.top`, `paroquant/Dockerfile` -- `build.sh` drives
+them) live at the repo root so `docker build -f <recipe> .` works directly. `prune_rocm.sh` is the ROCm slimming step, and it self-checks: the arch's own kernels
+must survive and hipcc must still link a HIP shared object, since AITER JITs at runtime (for the
+modules the recipes do not pre-bake).
 
 ### MXFP4 entry points
 
