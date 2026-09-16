@@ -21,6 +21,11 @@
 #   - both kernels compiled once: radiance_mxfp4_fp8.so (W4A8 MXFP4 GEMM)
 #     and radiance_paroquant_kernel.so (ParoQuant W4A8 / W5A8 GEMM)
 #   - the quant-method registration appended to sitecustomize.py
+#   - aiter's JIT module .so, module_aiter_core: aiter compiles it on first
+#     use, but the rebuilt artifact never reaches the path aiter's get_module()
+#     probes, so a bare container re-ran the whole JIT compile at every boot.
+#     The aiter-JIT-prebake block drives that same build at IMAGE build time
+#     and places the .so at the probed path -- no aiter build at boot
 #
 # One image serves every checkpoint this stack knows about; dispatch is
 # purely by the checkpoint's quantization_config:
@@ -277,14 +282,121 @@ ENV VLLM_LOGGING_LEVEL=INFO \
     RADIANCE_TP_PAD_STRICT=1 \
     RADIANCE_STEP_TRACE=0 \
     RADIANCE_DFLASH_CALIB_TOKENS=200000
+# --------------------------------------------------------- aiter JIT pre-bake ---
+# aiter builds its JIT .so lazily on first use, and two independent facts make
+# the per-boot build unavoidable today, including on a persistent cache:
+#   (a) the built .so lands in the writable container layer, which --rm drops
+#       (the seen symptom: "start build [module_aiter_core]" on every boot);
+#   (b) aiter's own get_module() staleness check probes
+#       $SP/aiter/jit/module_aiter_core.so (get_user_jit_dir()), while
+#       build_module() for this entry (not a python module, not standalone in
+#       optCompilerConfig.json) copies the artifact to $SP/op_tests/ ... and
+#       so nothing ever lands at the probed path: aiter re-compiles on every
+#       boot even where a cache dir would be writable.
+# The fix drives the same build at IMAGE build time (hipcc needs no GPU to
+# compile, same as the mxfp4 / ParoQuant kernels above) and places the .so at
+# the probed path. The runtime then sees a .so whose embedded arch markers
+# match the device (--offload-arch strings in the binary; _needs_arch_rebuild
+# is false for a matching device and for no device), adopts it, and skips the
+# build. If it is ever missing or arch-mismatched, aiter rebuilds in place --
+# same self-healing as today, so this cannot pin a stale binary.
+#
+# Fidelity: this is aiter's own core.build_module("module_aiter_core") with the
+# exact per-module args its first-use runtime pass uses (get_args_of_build /
+# optCompilerConfig.json: single TU aiter_core_pybind.cu, -DENABLE_CK=0,
+# torch-excluded). Two env deltas, both equal to what the runtime resolves
+# live on the serving card:
+#   GPU_ARCHS=gfx1201  aiter's live-query path (no device -> ROCm info) lands
+#                      here; the build has no GPU, so state it explicitly.
+#   CU_NUM=64          64 CUs on the R9700; aiter needs it stated for a
+#                      GPU-less build (no map entry) and resolves the same
+#                      value live at runtime.
+# MAX_JOBS stays unset (aiter self-limits by cores / free memory, psutil) and
+# the assertion below pins the config identity so a future aiter source change
+# forces a loud rebuild next time this block re-runs (any base bump runs it).
+# Cost: tens of minutes added to a one-time image build; every boot after
+# paid it before (and still pays for any of the ~113 other aiter modules this
+# workload does not use -- those stay on the first-use lazy path, correct).
+# (Docker 20.10+ inline heredoc -- keep UNBACKSLASHED; the venv's python runs
+# the script, whose asserts / exceptions decide the outcome.)
+RUN /opt/vllm/bin/python3 - <<'PY'
+import importlib.util, os, shutil, sys, sysconfig
+
+sp = sysconfig.get_paths()["purelib"]
+jit = os.path.join(sp, "aiter", "jit")
+assert os.path.isfile(os.path.join(jit, "core.py")), \
+    f"no aiter JIT tree at {jit} -- base layout changed; re-audit this block"
+assert os.path.isfile(os.path.join(jit, "optCompilerConfig.json")), \
+    f"no aiter optCompilerConfig.json in {jit} -- base layout changed"
+
+# Build-env deltas (process scope only, so the served env stays byte-identical
+# to the launcher's; aiter reads them for the build flags the runtime would
+# otherwise resolve from a live device query):
+os.environ["GPU_ARCHS"] = "gfx1201"   # this image's arch (the live-resolved value)
+os.environ["CU_NUM"] = "64"          # R9700 CU count (escha/RESULTS_tuning.md: "64-CU part")
+# MAX_JOBS intentionally left unset: aiter's check_and_set_ninja_worker caps
+# jobs by cores (0.8x) and free memory (0.5 GB/job) on its own.
+
+# aiter's jit/core.py resolves chip_info / cpp_extension / file_baton /
+# torch_guard as bare module names (all in jit/utils/), but the wheel's top
+# package never puts utils/ on sys.path (its __init__.py is the license header
+# only). Load core.py standalone with the utils dir on the path -- the same
+# package-relative resolution aiter's JIT invocation itself yields.
+sys.path.insert(0, os.path.join(jit, "utils"))
+spec = importlib.util.spec_from_file_location("_aiter_jit_core", os.path.join(jit, "core.py"))
+core = importlib.util.module_from_spec(spec)
+sys.modules["_aiter_jit_core"] = core
+spec.loader.exec_module(core)
+
+# Drive the exact build the runtime's first use triggers: its ops call
+# core.build_module(md) with get_args_of_build(md) -- the same optCompilerConfig
+# entry and args. The config-identity assert bakes loud on any drift and the
+# --offload-arch flag below comes from the env above, so a future aiter source
+# change (new base) rebuilds a byte-identical-flag .so or fails the build.
+d = core.get_args_of_build("module_aiter_core")
+assert d["torch_exclude"] is True and d["flags_extra_cc"] == ["-DENABLE_CK=0"], \
+    f"module_aiter_core config drifted from this block's identity; re-audit: {d}"
+core.build_module("module_aiter_core",
+                  d["srcs"], d["flags_extra_cc"], d["flags_extra_hip"],
+                  d["blob_gen_cmd"], d["extra_include"], d["extra_ldflags"],
+                  d["verbose"], d["is_python_module"], d["is_standalone"],
+                  d["torch_exclude"], d.get("third_party", []),
+                  flags_extra_hip_per_source=d.get("flags_extra_hip_per_source"))
+
+# build_module drops the artifact in opbd_dir and (for this entry) copies it
+# to $SP/op_tests/ -- but get_module() probes get_user_jit_dir()/
+# module_aiter_core.so. Place the same artifact there so the runtime adopts
+# it instead of rebuilding:
+src = os.path.join(core.get_user_jit_dir(), "build", "module_aiter_core",
+                   "build", "module_aiter_core.so")
+if not os.path.isfile(src):
+    base = os.path.join(core.get_user_jit_dir(), "build", "module_aiter_core")
+    found = []
+    for root, _dirs, files in os.walk(base) if os.path.isdir(base) else []:
+        found += [os.path.relpath(os.path.join(root, f), base) for f in files if f.endswith(".so")]
+    raise SystemExit(f"aiter build left no .so at {src}; .so files found under {base}: {found}")
+dst = os.path.join(core.get_user_jit_dir(), "module_aiter_core.so")
+shutil.copyfile(src, dst)
+assert os.path.getsize(dst) > 3 * (1 << 20), f"baked .so implausibly small: {os.path.getsize(dst)} B"
+
+# The module is the product only if it loads: prove it now, GPU-free (the .so
+# init is device-independent; same reason the mxfp4 / ParoQuant import gates
+# above pass in a GPU-less build):
+sys.path.insert(0, os.path.dirname(dst))
+importlib.import_module("module_aiter_core")
+print(f"[build] aiter JIT pre-bake: {dst} ({os.path.getsize(dst) // (1 << 20)} MiB, import-clean)")
+PY
+
 # ------------------------------------------------------- build-time verification -
 # Prove the whole kernel stack is import-clean BEFORE the image is declared
 # built, so a broken kernel fails the build rather than the first container
 # start. Use the venv's python (the system python3 does not see $SP).
+# Includes the four .so files the runtime needs.
 RUN set -e; \
   test -f "$SP"/r4d.so; \
   test -f "$SP"/radiance_mxfp4_fp8.so; \
   test -f "$SP"/radiance_paroquant_kernel.so; \
+  test -f "$SP"/aiter/jit/module_aiter_core.so; \
   /opt/vllm/bin/python3 -c 'import radiance_nvfp4, \
       radiance_mxfp4, radiance_gemm, radiance_rmsquant, \
       radiance_gdn, radiance_gdnmerge, radiance_drafthead, radiance_verifyhead, \
