@@ -75,7 +75,12 @@ if not os.path.isfile(src):
     raise SystemExit(f"aiter build left no .so at {src}; .so files found under {base}: {found}")
 dst = os.path.join(core.get_user_jit_dir(), "module_aiter_core.so")
 shutil.copyfile(src, dst)
-assert os.path.getsize(dst) > 256 * 1024, f"baked .so implausibly small: {os.path.getsize(dst)} B"  # single-TU, CK off: ~0.7 MiB is real -- the import + dir() checks below are the true gate
+assert os.path.getsize(dst) > 256 * 1024, f"baked .so implausibly small: {os.path.getsize(dst)} B"
+# Note: the hipcc --offload-arch output carries no "amdhsa--gfx" marker; aiter 0.1.17
+# _needs_arch_rebuild treats a marker-less .so as adopted-never-rebuilt (same class as the
+# three single-target hand-compiled .so files above; a chip-marked .so built for the wrong
+# arch would still be force-rebuilt in place by aiter itself, so no stale-binary wedge).
+  # single-TU, CK off: ~0.7 MiB is real -- the import + dir() checks below are the true gate
 
 # The module is the product only if it loads: prove it now, GPU-free (the .so
 # init is device-independent; same reason the mxfp4 / ParoQuant import gates
