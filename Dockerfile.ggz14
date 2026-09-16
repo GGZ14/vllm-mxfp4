@@ -16,7 +16,7 @@
 # changes what `--target base` publishes, which IS the base contract.
 #
 # Stage 5 (ggz14) bakes the layer the launcher scripts currently apply at every
-# container start -- the patched libr4d, the 21-patch chain, the ParoQuant
+# container start -- the patched libr4d, the 22-patch chain, the ParoQuant
 # kernel + registration, the entrypoint replace. See the STAGE 5 block for the
 # full list and the dev-loop notes.
 #
@@ -478,7 +478,7 @@ ENTRYPOINT ["/opt/radiance_entrypoint.sh"]
 #     (the 8-bit prefill attention legs, the fused GDN decode step, the TP=3 all-reduce).
 #     The base keeps shipping v0.5.0 -- that is the base's contract -- so the replacement
 #     here is load-bearing, not redundant.
-#   - the launcher's 21-patch chain in launcher order (patch_qwen3_thinkoff non-fatal).
+#   - the launcher's 22-patch chain in launcher order (patch_qwen3_thinkoff non-fatal).
 #     The base already carries its own 23 static chain from stage 3; the two sets are
 #     disjoint by design.
 #   - the ParoQuant W4A8 / W5A8 kernel (radiance_paroquant_kernel.so), the ParoQuant
@@ -506,7 +506,8 @@ ARG MAX_JOBS
 
 COPY r4d_radiance_extras.patch        /tmp/r4d_radiance_extras.patch
 COPY patch_*.py _patchlib.py install_radiance_hooks.py /build/
-COPY radiance_gemm.py \
+COPY radiance_nvfp4.py \
+     radiance_gemm.py \
      radiance_mxfp4.py \
      radiance_rmsquant.py \
      radiance_gdn.py \
@@ -546,6 +547,7 @@ RUN set -e; \
 # divergence in the image.
 RUN set -e; cd /build; \
   python3 patch_quark_mxfp4.py; \
+  python3 patch_nvfp4_mxfp4.py; \
   python3 patch_tp3_pad.py; \
   python3 patch_ar_maxbytes.py; \
   python3 patch_topk_triton_rows.py; \
@@ -570,7 +572,8 @@ RUN set -e; cd /build; \
 
 # --------------------------------------------------------- ship the modules --------
 RUN set -e; \
-  cp /build/radiance_mxfp4.py \
+  cp /build/radiance_nvfp4.py \
+     /build/radiance_mxfp4.py \
      /build/radiance_gemm.py \
      /build/radiance_rmsquant.py \
      /build/radiance_gdn.py \
@@ -636,6 +639,7 @@ RUN chmod +x /opt/radiance_entrypoint.sh
 COPY qwen-fixed-v22.3.jinja /opt/qwen-fixed-v22.3.jinja
 ENV VLLM_LOGGING_LEVEL=INFO \
     VLLM_NO_USAGE_STATS=1 \
+    HF_HUB_OFFLINE=1 \
     VLLM_ROCM_USE_AITER=1 \
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
     VLLM_ROCM_USE_AITER_MHA=0 \
@@ -666,6 +670,11 @@ ENV VLLM_LOGGING_LEVEL=INFO \
     RADIANCE_MXFP4_HOIST_QUANT=1 \
     RADIANCE_MXFP4_TRACED_QUANT=1 \
     RADIANCE_MXFP4_SANITIZE=0 \
+    RADIANCE_NVFP4_MXFP4=1 \
+    RADIANCE_NVFP4_EXP=mse \
+    RADIANCE_NVFP4_FP8_LAYERS=mxfp4 \
+    RADIANCE_NVFP4_BF16_LAYERS=in_proj_ba \
+    RADIANCE_NVFP4_LMHEAD=bf16 \
     RADIANCE_FP8_STREAM=1 \
     RADIANCE_RMS_QUANT_FUSION=1 \
     RADIANCE_GDN_MERGE_INPROJ=1 \
@@ -704,7 +713,8 @@ RUN set -e; \
   test -f "$SP"/r4d.so; \
   test -f "$SP"/radiance_mxfp4_fp8.so; \
   test -f "$SP"/radiance_paroquant_kernel.so; \
-  /opt/vllm/bin/python3 -c 'import radiance_mxfp4, radiance_mxfp4_fp8, radiance_gemm, \
+  /opt/vllm/bin/python3 -c 'import radiance_nvfp4, \
+      radiance_mxfp4, radiance_mxfp4_fp8, radiance_gemm, \
       radiance_rmsquant, radiance_gdn, radiance_gdnmerge, radiance_drafthead, \
       radiance_verifyhead, radiance_aroverlap, radiance_topk, radiance_arnq, \
       radiance_tp3pad, radiance_dflash_capture, radiance_paroquant, \

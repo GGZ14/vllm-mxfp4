@@ -10,6 +10,11 @@
 #                     -> ggz14/vllm-radiance-mxfp4:$VERSION-$SHA
 #                        e.g.  ggz14/vllm-radiance-mxfp4:0.13.0-3f8e21a
 #
+#   ./build.sh --paro        the ParoQuant prod-bake image: the SAME bake on the
+#                           same published base, but the ParoQuant measured profile
+#                           baked (paroquant/Dockerfile: run_paroquant.sh's "-e" list)
+#                           -> ggz14/vllm-radiance-paroquant:$VERSION-$SHA
+#
 # Building the base from source (only when the upstream base moves, e.g. a
 # new vLLM/torch - that is the base recipe's purpose, not a bake input):
 #
@@ -52,7 +57,7 @@ if [ "$RUNTIME" = docker ] && [ "${BUILDKIT:-0}" != 1 ]; then
   export DOCKER_BUILDKIT=0
 fi
 
-WANT_BASE=0; WANT_FULL=0; PUSH=0; JOBS=
+WANT_BASE=0; WANT_FULL=0; WANT_PARO=0; PUSH=0; JOBS=
 BASE_REPO=${BASE_REPO:-stilldeadcode/vllm-radiance}
 BASE_TAG=${BASE_TAG:-0.9.3}
 BASE_DIGEST=
@@ -61,13 +66,14 @@ for a in "$@"; do
   case "$a" in
     --base-only) WANT_BASE=1 ;;
     --full) WANT_FULL=1 ;;
+    --paro) WANT_PARO=1 ;;
     --push) PUSH=1 ;;
     --jobs=*) JOBS="${a#*=}" ;;
     --registry=*) REGISTRY="${a#*=}" ;;
     --base-repo=*) BASE_REPO="${a#*=}" ;;
     --base-tag=*) BASE_TAG="${a#*=}" ;;
     --base-digest=*) BASE_DIGEST="${a#*=}" ;;
-    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \?//' ; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \?//' ; exit 0 ;;
     *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -88,6 +94,10 @@ if [ "$WANT_BASE" = 1 ]; then
 elif [ "$WANT_FULL" = 1 ]; then
   NAME=${NAME:-ggz14/vllm-radiance-mxfp4}
   DF=Dockerfile.ggz14
+  TARGET=()
+elif [ "$WANT_PARO" = 1 ]; then
+  NAME=${PARO_NAME:-ggz14/vllm-radiance-paroquant}
+  DF=paroquant/Dockerfile
   TARGET=()
 else
   NAME=${NAME:-ggz14/vllm-radiance-mxfp4}

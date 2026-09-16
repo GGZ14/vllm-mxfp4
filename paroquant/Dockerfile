@@ -1,49 +1,41 @@
 # syntax=docker/dockerfile:1.7
 #
-# Dockerfile.ggz14.top -- the top-only build variant (dev loop).
+# Dockerfile (paroquant/) -- the ParoQuant prod-bake image.
 #
-# NOT the base-image build (that is the plain `Dockerfile` in this repo:
-# torch/triton/aiter/vLLM from source, four stages, hours). It is the
-# top-only variant of stage 5 of Dockerfile.ggz14: it sits on the PUBLISHED
-# base image, so it bakes the patch layer in a few minutes with NO stack
-# rebuild. Use it to iterate the patch chain / kernels against a published
-# base. It bakes in everything the container would otherwise do at every
-# start (the launcher scripts' in-container work), so `docker run` goes
-# straight to `vllm serve`:
+# Same contract as the top recipe in Dockerfile.ggz14.top, differing only in
+# the profile baked: the ggz14 image bakes the MXFP4 measured profile; this
+# image bakes the ParoQuant measured profile (paroquant/run_paroquant.sh's
+# "-e" list at launcher defaults), so a bare `docker run` reproduces the
+# ParoQuant prod unit without an exporter.
 #
-#   - the patched libr4d (the base's own externally-linked `r4d.so` segfaults
-#     on this kernel; the image's own r4d.so path is re-linked here at build
-#     time from codeberg.org/StillDeadcode/libr4d at the pinned commit, with
-#     this repo's r4d_radiance_extras.patch applied — the 8-bit prefill
-#     attention legs, the fused GDN decode step, the TP=3 all-reduce)
-#   - the full patch chain (every `python3 patch_*.py` the launchers run at
-#     container start, applied once, at build time)
-#   - both kernels compiled once: radiance_mxfp4_fp8.so (W4A8 MXFP4 GEMM)
-#     and radiance_paroquant_kernel.so (ParoQuant W4A8 / W5A8 GEMM)
-#   - the quant-method registration appended to sitecustomize.py
+# Everything else is shared, on purpose: both images ride the same published
+# base (build.sh --paro pulls it and passes the live digest), bake the same
+# common bake (patched libr4d, the 22-patch chain, the two kernels, the
+# dispatch registration, entrypoint + preamble) and carry the same universal
+# quant plugin set -- dispatch stays purely by the checkpoint's
+# quantization_config, no envvar "personality" switch. A quark_mxfp4
+# checkpoint run on this image still lands on the MXFP4 kernel (under the
+# PQ profile); a Querulf.paroquant checkpoint run on the ggz14 image still
+# lands on the ParoQuant kernel (under the MXFP4 profile).
 #
-# One image serves every checkpoint this stack knows about; dispatch is
-# purely by the checkpoint's quantization_config:
-#   - quark_mxfp4 / amd_mxfp4  -> the MXFP4 path (mxfp4 fp8-WMMA GEMM)
-#   - paroquant_mxfp4          -> MXFP4 weights with ParoQuant rotations
-#   - paroquant                -> the ParoQuant W4A8 / W5A8 GPU kernel
-# vLLM's quant-method plugin dispatch handles all three, so no envvar
-# "personality" switch is needed in the image.
+# The libr4d here is the b9e42ab + r4d_radiance_extras.patch build (the
+# rx6 flavour the launcher docs call the "fresh box" default; the rx7 build
+# only matters for the optional GDN_SSM_DTYPE narrow-state serves, which
+# still go through the launcher's in-container build).
 #
-# Setup / tagging lives in build.sh (pulls the published base, pins it by
-# live digest, builds this top variant in minutes, tags
-# ggz14/vllm-radiance-mxfp4:$VERSION-$SHA + latest + v$VERSION, optionally
-# --push). The full from-source base is an explicit request: --base-only /
-# --full.
+# Setup / serving are unchanged: IMAGE=ggz14/vllm-radiance-paroquant:latest
+# in setup.sh / serve.sh routes the same flow to this image (serve.sh's
+# per-QUANT profile exports are idempotent against the baked values), and
+# build.sh --paro tags it $VERSION-$SHA + latest + v$VERSION beside the
+# ggz14 image.
 
-# NB: the published 0.9.3 base carries vLLM 0.27.1 (the 0.29.0 base upgrade was
-# still in progress when it shipped); the patch set carries both shapes.
+# NB: same base caveat as the top recipe -- the published base carries vLLM
+# 0.27.1; the patch set carries both shapes.
 ARG BASE_REPO=stilldeadcode/vllm-radiance
 ARG BASE_TAG=0.9.3
-# Default is the digest at the v0.13.0 base. When building this top variant,
-# `docker pull` the base first and pass its live digest via
-# --build-arg BASE_DIGEST=<hex> so a base repaint can't slip in.
-# Change BASE_TAG and BASE_DIGEST together if you move the base.
+# Same default pin as the top recipe. build.sh pulls the base and passes its
+# live digest via --build-arg BASE_DIGEST=<hex> so a base repaint can't slip
+# in; change BASE_TAG and BASE_DIGEST together if you move the base.
 ARG BASE_DIGEST=45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
 ARG R4D_REPO=https://codeberg.org/StillDeadcode/libr4d.git
 ARG R4D_PIN=b9e42ab
@@ -55,7 +47,6 @@ ARG GFX_ARCH=gfx1201
 FROM ${BASE_REPO}:${BASE_TAG}@sha256:${BASE_DIGEST} AS r4d_builder
 ARG R4D_REPO
 ARG R4D_PIN
-ARG GFX_ARCH
 COPY r4d_radiance_extras.patch /tmp/r4d_radiance_extras.patch
 RUN set -e; \
   # The published base is a pruned shipping image -- no git. Get it if absent.
@@ -73,7 +64,7 @@ ARG GFX_ARCH
 
 # Build-time sources. Everything lands in /build (outside the venv, and never
 # mounted at runtime) so a stale copy cannot shadow site-packages on sys.path
-# — the documented 17-hours-stale-kernel incident, where a `make`-left .so in
+# -- the documented 17-hours-stale-kernel incident, where a `make`-left .so in
 # the working directory silently served a kernel older than its own source.
 COPY r4d_radiance_extras.patch        /build/r4d_radiance_extras.patch
 COPY patch_*.py _patchlib.py install_radiance_hooks.py /build/
@@ -106,9 +97,11 @@ COPY --from=r4d_builder /src/libr4d/r4d.so \
 ENV SP=/opt/vllm/lib/python3.12/site-packages
 
 # ------------------------------------------------------- the patch chain --------
-# The union of the chains `serve-mxfp4.sh` (MXFP4) and `run_paroquant.sh`
-# (ParoQuant) already run at container start, in launcher order. Keep
-# patch_qwen3_thinkoff.py non-fatal, exactly as the launchers do.
+# The union of the chains `serve-mxfp4.sh` (MXFP4) and `paroquant/run_paroquant.sh`
+# (ParoQuant) run at container start, in launcher order, `patch_nvfp4_mxfp4` after
+# `patch_quark_mxfp4` (the new NVFP4-at-load route, inert unless RADIANCE_NVFP4_MXFP4=1
+# AND a NVFP4 checkpoint is loaded). Keep patch_qwen3_thinkoff.py non-fatal, exactly
+# as the launchers do.
 RUN set -e; cd /build; \
   python3 patch_quark_mxfp4.py; \
   python3 patch_nvfp4_mxfp4.py; \
@@ -136,8 +129,8 @@ RUN set -e; cd /build; \
 
 # ------------------------------------------------------- ship the modules --------
 # The same copy set the launchers do (mxfp4-configs into the triton gemm config
-# dir, the radiance_*.py modules into site-packages, the two dflash / paroquant
-# modules alongside).
+# dir, the radiance_*.py modules into site-packages, the dflash / paroquant /
+# nvfp4 modules alongside).
 RUN set -e; \
   cp -r /build/mxfp4-configs/* "$SP"/aiter/ops/triton/configs/gemm/; \
   cp /build/radiance_nvfp4.py \
@@ -157,9 +150,12 @@ RUN set -e; \
      /build/radiance_paroquant_mxfp4.py \
      "$SP"/
 
-# ------------------------------------------------------- compile both kernels ----
+# ------------------------------------------------------- compile the kernels -----
 # Same flags as the launchers (`-O3 -w -std=c++17 -fPIC -shared --offload-arch`).
-# Build ONCE here instead of at every container start.
+# The launcher's in-container ParoQuant build passes $RADIANCE_PQ_HIPCC_FLAGS, which
+# is EMPTY in prod -- the header default PQ_HW_CVT=1 (device e4m3 convert) is the
+# prod kernel, so an unflagged bake below IS the prod build. Build ONCE here instead
+# of at every container start.
 RUN set -e; cd /build; \
   hipcc -O3 -w -std=c++17 -fPIC -shared \
         --offload-arch=$GFX_ARCH \
@@ -196,23 +192,29 @@ RUN chmod +x /opt/radiance_entrypoint.sh
 
 # --------------------------------------------------------- the measured profile --
 # The in-image kernel modules default to STOCK when a RADIANCE_* env is unset,
-# and the launchers' whole measured configuration arrives as `-e` flags. Bake the
-# launcher's measured defaults in so a bare `docker run` reproduces production:
+# and the ParoQuant launcher's whole measured configuration arrives as `-e`
+# flags. Bake paroquant/run_paroquant.sh's `-e` list at launcher defaults in
+# so a bare `docker run` reproduces the ParoQuant prod unit:
 #
-#   image ENV = the MXFP4 measured profile (serve-mxfp4.sh `-e` list, defaults)
-#   PAROQUANT serves additionally export (serve.sh does this for int4/int5;
-#   launcher: theoquant -- int4 defaults I8/PG/ZPE=0 (read off the checkpoint),
-#   ROT_STREAM/2=1, PAROQUANT=1, GDN_MERGE_INPROJ=0); 1005 pure run passes
-#   --compilation-config '{"pass_config":{"fuse_norm_quant":true,
-#   "fuse_act_quant":true}}' (the NQF=1 pass entry, identical graph key -nqft)
+#   int4-prod defaults (the unit's): RADIANCE_PAROQUANT=1, the rotation_supply
+#   producers on (PG_PRODUCER=3, FUSED_TOKQ, ROT_STREAM/2=1, ROT_V2=1),
+#   I8/PG/ZPE=0 (read off the checkpoint by the launcher and by serve.sh),
+#   GDN_MERGE_INPROJ=0 (in_proj_a/b are fp16 in the PQ checkpoints; the mxfp4
+#   image has it on -- the one profile divergence between the two images)
+#   and GDN_FUSED_UPDATE=1 / the dynwidth stack / the drafter+verify profile,
+#   all straight off the launcher.
+#
+# Skipped on purpose (empty / runtime-only at the launcher): RADIANCE_PQ_CHECKALL
+# and its PQM sibling (empty in prod), RADIANCE_PQ_HIPCC_FLAGS (the in-container
+# A/B build passthrough -- the kernel here is baked), the visible-GPU ids and
+# the R4D_SO mount (this image BAKES the libr4d build instead).
 #
 # Cache dirs default to /cache (the launcher mounts $CACHE there) so a bare run
 # with that mount behaves identically; without the mount the dirs land in the
 # container layer and are dropped with --rm.
 COPY qwen-fixed-v22.3.jinja /opt/qwen-fixed-v22.3.jinja
-ENV VLLM_LOGGING_LEVEL=INFO \
+ENV HF_HUB_OFFLINE=1 \
     VLLM_NO_USAGE_STATS=1 \
-    HF_HUB_OFFLINE=1 \
     VLLM_ROCM_USE_AITER=1 \
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
     VLLM_ROCM_USE_AITER_MHA=0 \
@@ -227,60 +229,73 @@ ENV VLLM_LOGGING_LEVEL=INFO \
     TORCHINDUCTOR_CACHE_DIR=/cache/inductor \
     TRITON_CACHE_DIR=/cache/triton \
     AITER_ROOT_DIR=/cache/aiter \
-    R4D_ATTN_FP8=3 \
+    TRITON_CACHE_AUTOTUNING=1 \
+    RADIANCE_USE_R4D=1 \
+    RADIANCE_USE_R4D_AR=1 \
+    RADIANCE_USE_R4D_AR_QUANT=1 \
     RADIANCE_R4D_REPORT=1 \
+    R4D_ATTN_FP8=3 \
     RADIANCE_AR_MAX_KB=86016 \
-    RADIANCE_MXFP4=1 \
-    RADIANCE_MXFP4_W4A8=1 \
-    RADIANCE_MXFP4_W4A8_MIN_M=0 \
-    RADIANCE_MXFP4_TN4_MIN_M=2048 \
-    RADIANCE_MXFP4_DECODE_MAX_M=64 \
-    RADIANCE_MXFP4_DECODE_NT=1 \
-    RADIANCE_MXFP4_A_TILED_MIN_M=513 \
-    RADIANCE_MXFP4_WPERM=1 \
-    RADIANCE_MXFP4_EPIFAST=1 \
-    RADIANCE_MXFP4_R4D_DECODE_MAX_M=0 \
-    RADIANCE_MXFP4_HOIST_QUANT=1 \
-    RADIANCE_MXFP4_TRACED_QUANT=1 \
-    RADIANCE_MXFP4_SANITIZE=0 \
-    RADIANCE_NVFP4_MXFP4=1 \
-    RADIANCE_NVFP4_EXP=mse \
-    RADIANCE_NVFP4_FP8_LAYERS=mxfp4 \
-    RADIANCE_NVFP4_BF16_LAYERS=in_proj_ba \
-    RADIANCE_NVFP4_LMHEAD=bf16 \
-    RADIANCE_FP8_STREAM=1 \
-    RADIANCE_RMS_QUANT_FUSION=1 \
-    RADIANCE_GDN_MERGE_INPROJ=1 \
-    RADIANCE_GDN_NORM_QUANT=1 \
-    RADIANCE_GDN_STRIDED_GATES=0 \
-    RADIANCE_GDN_EMPTY_OUT=0 \
-    RADIANCE_GDN_PATHS=both \
+    RADIANCE_PRESHUFFLE=1 \
+    RADIANCE_FUSE_RMS_QUANT=1 \
     RADIANCE_GDN_FUSED_UPDATE=1 \
+    RADIANCE_GDN_MERGE_INPROJ=0 \
+    RADIANCE_GDN_FUSED_MAX_ITEMS=32 \
+    RADIANCE_GDN_PATHS=both \
     RADIANCE_DYNAMIC_WIDTH=1 \
     RADIANCE_DYNW_ALPHA=0.35 \
     RADIANCE_DYNW_MARGIN=2 \
     RADIANCE_DYNW_MIN=2 \
     RADIANCE_DYNW_MIN_BATCH=3 \
+    RADIANCE_AR_QNB=96 \
+    RADIANCE_AR_QNT=1024 \
+    RADIANCE_AR_OVERLAP=0 \
+    RADIANCE_STEP_TRACE=0 \
+    RADIANCE_SKINNY_GEMM=1 \
+    RADIANCE_TOPK_TRITON_MIN_ROWS=1 \
+    RADIANCE_KV_GROUP_OPT=1 \
     RADIANCE_FAST_DRAFT=1 \
     RADIANCE_DRAFT_TAU=0.20 \
     RADIANCE_DRAFT_RERANK=80 \
     RADIANCE_VERIFY_HEAD=1 \
     RADIANCE_VERIFY_HEAD_MAX_M=32 \
-    RADIANCE_AR_OVERLAP=0 \
-    RADIANCE_AR_OVERLAP_MIN_M=2048 \
-    RADIANCE_AR_OVERLAP_SLICES=4 \
-    RADIANCE_AR_QNB=96 \
-    RADIANCE_AR_QNT=1024 \
-    RADIANCE_TOPK_TRITON_MIN_ROWS=1 \
-    RADIANCE_SKINNY_GEMM=1 \
-    RADIANCE_TP_PAD_DRAFTER=1 \
-    RADIANCE_TP_PAD_STRICT=1 \
-    RADIANCE_STEP_TRACE=0 \
-    RADIANCE_DFLASH_CALIB_TOKENS=200000
+    RADIANCE_PAROQUANT=1 \
+    RADIANCE_PQ_WPERM=1 \
+    RADIANCE_PQ_DECODE_NT=1 \
+    RADIANCE_PQ_ATILED=1 \
+    RADIANCE_PQ_AT_LBK=128 \
+    RADIANCE_PQ_AT_HOIST=1 \
+    RADIANCE_PQ_PTOK=1 \
+    RADIANCE_PQ_FUSED_TOKQ=1 \
+    RADIANCE_PQ_PG_PRODUCER=3 \
+    RADIANCE_PQ_ROT_STREAM=1 \
+    RADIANCE_PQ_ROT_STREAM2=1 \
+    RADIANCE_PQ_ROT_STREAM3=0 \
+    RADIANCE_PQ_ROT_V2=1 \
+    RADIANCE_PQ_AR_CHECK=0 \
+    RADIANCE_PQ_AR_FALLBACK=0 \
+    RADIANCE_PQ_I8=0 \
+    RADIANCE_PQ_PG=0 \
+    RADIANCE_PQ_ZPE=0 \
+    RADIANCE_PQ_DECODE_MAX_M=64 \
+    RADIANCE_PQ_CHECK_MAX_M=128 \
+    RADIANCE_MXFP4_W4A8=1 \
+    RADIANCE_MXFP4_WPERM=1 \
+    RADIANCE_MXFP4_DECODE_NT=1 \
+    RADIANCE_MXFP4_DECODE_MAX_M=64 \
+    RADIANCE_MXFP4_EPIFAST=1 \
+    RADIANCE_MXFP4_TN4_MIN_M=2048 \
+    RADIANCE_MXFP4_A_TILED_MIN_M=513 \
+    RADIANCE_NVFP4_MXFP4=1 \
+    RADIANCE_NVFP4_EXP=mse \
+    RADIANCE_NVFP4_FP8_LAYERS=mxfp4 \
+    RADIANCE_NVFP4_BF16_LAYERS=in_proj_ba \
+    RADIANCE_NVFP4_LMHEAD=bf16
 # ------------------------------------------------------- build-time verification -
 # Prove the whole kernel stack is import-clean BEFORE the image is declared
 # built, so a broken kernel fails the build rather than the first container
-# start. Use the venv's python (the system python3 does not see $SP).
+# start. Use the venv's python (the system python3 does not see $SP). Includes
+# the three .so files the runtime requires.
 RUN set -e; \
   test -f "$SP"/r4d.so; \
   test -f "$SP"/radiance_mxfp4_fp8.so; \
@@ -290,13 +305,13 @@ RUN set -e; \
       radiance_gdn, radiance_gdnmerge, radiance_drafthead, radiance_verifyhead, \
       radiance_aroverlap, radiance_topk, radiance_arnq, radiance_tp3pad, \
       radiance_dflash_capture, radiance_paroquant, radiance_paroquant_mxfp4; \
-      print("[build] all radiance modules import-clean in", "'/opt/vllm/lib/python3.12/site-packages'")'
+      print("[parobake] all radiance modules import-clean in", "'"$SP"'")'
 
 # ------------------------------------------------------- drop build sources -----
 # Nothing at runtime needs the patches / source .py / .hip; remove them so a
 # future stale copy cannot shadow the venv (the documented incident above).
-RUN rm -rf /build
+RUN rm -rf /build /tmp/r4d_radiance_extras.patch
 
 ENTRYPOINT ["/opt/radiance_entrypoint.sh"]
 # No CMD: the consumer supplies the vllm-serve args (tamad `command:`, or
-# `vllm serve ...` after the image), which the entrypoint passes through.
+# `vllm serve ...`), which the entrypoint passes through verbatim.
