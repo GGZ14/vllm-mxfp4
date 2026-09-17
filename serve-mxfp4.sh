@@ -80,6 +80,13 @@ Everything is an environment variable; these are the ones worth knowing.
                             TP3_PADDING_PLAN.md). _INTERMEDIATE=17408 keeps the MLP stock,
                             _DRAFTER=0 leaves the DFlash2 drafter unpadded (A/B lever)
   GPUS=0,1                  HIP indices to serve on; defaults to every card with enough VRAM
+  SINGLE_GPU_PROFILE=auto   at TP=1 only: fp16 ssm cache (halves the 1648-token attention
+                            block, C8 +59%), maxlen 65536, chunk 4096, capture sizes capped
+                            at MAXSEQS*(SPEC+1), libr4d rx9 (narrow-state GDN kernels).
+                            0 disables; 1 forces it at any TP (untested above TP=1 --
+                            the win does not transfer by inspection)
+  RADIANCE_FP8_STREAM_TP1=1 at TP=1 only: the fp8 residual-stream epilogues without an
+                            all-reduce (radiance_arnq). Own cache suffix (-tp1s)
   MIN_GPU_MIB=8192          VRAM floor for "usable"; excludes iGPUs from the count
   KV_MEM=auto               KV cache size: auto uses a pin measured for your hardware if
                             kv-profiles.tsv has one and lets vLLM profile if not; <bytes> pins
@@ -220,6 +227,9 @@ preflight() {
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 NAME=${NAME:-vllmmxfp4074}
 PORT=${PORT:-8080}
+# Whether the caller set CHUNK explicitly -- captured BEFORE the default, so the single-GPU
+# profile below can tell "unset" from "deliberately 8192".
+_SET_CHUNK=${CHUNK+1}
 CHUNK=${CHUNK:-8192}
 R4D_ATTN=${R4D_ATTN:-1}
 # GDN in_proj merge (radiance_gdnmerge.py): in_proj_qkvz + in_proj_ba as ONE GEMM, removing 96
@@ -260,6 +270,15 @@ FP8S=${RADIANCE_FP8_STREAM:-1}
 # a startup failure from inside a TP worker, and a four-card user got two idle cards. Resolved
 # HERE, above the cache-suffix block, because TP=3 changes what that block has to key on.
 TP=${TP:-$RAD_TP}
+# RADIANCE_GDN_LAZY (2026-09-17): lazy GDN state snapshots -- one base state + a candidate stash
+# per sequence instead of a snapshot per draft token, so a request holds 3 mamba pages per layer
+# group instead of 2+SPEC (radiance_gdn_lazy.py, patch_gdn_lazy.py, libr4d rx10). Default ON
+# only inside the single-GPU profile; TP>=2 never applies the patch, never loads rx10.
+if [ -z "${RADIANCE_GDN_LAZY:-}" ]; then
+  if [ "$TP" = 1 ] && [ "${SINGLE_GPU_PROFILE:-auto}" != 0 ]; then GDN_LAZY=1; else GDN_LAZY=0; fi
+else
+  GDN_LAZY=$RADIANCE_GDN_LAZY
+fi
 GPU_IDS=${GPU_IDS:-$RAD_GPU_INDICES}
 # TP=3 via zero-weight dummy heads (radiance_tp3pad.py + patch_tp3_pad.py; TP3_PADDING_PLAN.md).
 # The checkpoint's head counts (24 q / 4 kv / 16 GDN-k / 48 GDN-v) do not divide by 3, so at
@@ -351,6 +370,15 @@ if [ "$EOUT" = 1 ]; then CACHE_SUF="$CACHE_SUF-eo"; fi
 # the per-rank shapes differ between the TP=1/2 gates and TP=3. Unpadded serves keep their dir.
 if [ "$TP_PAD" != 0 ]; then CACHE_SUF="$CACHE_SUF-tp${TP}pad"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
+# TP=1 fp8-stream arm (radiance_arnq, RADIANCE_FP8_STREAM_TP1, 2026-09-16): the epilogue contract
+# without an all-reduce in it. It changes the traced graph at TP=1 only, and a TP=1 subdir of any
+# existing -fp8s cache holds the STOCK graph (the installer used to skip at tp=1 -- the trap
+# documented above), so the key must move. Applied to an explicit CACHE as well, for the same
+# reason; TP>=2 never reaches this line's condition.
+FP8S_TP1=${RADIANCE_FP8_STREAM_TP1:-1}
+if [ "$TP" = 1 ] && [ "$FP8S" = 1 ] && [ "$FP8S_TP1" = 1 ]; then CACHE="$CACHE-tp1s"; fi
+# Lazy GDN snapshots narrow the traced spec-state window from SPEC+1 to 2 columns: own key.
+if [ "$GDN_LAZY" = 1 ]; then CACHE="$CACHE-lz"; fi
 # prompt_logprobs allocates a ~1-1.7 GiB prompt x vocab logits transient that vLLM does not reserve
 # for, and KV is sized to eat everything else -- 0.97 and even 0.92 OOM the engine on ppl.py. Use
 # GPU_UTIL=0.75 for perplexity work, 0.98 for throughput.
@@ -441,6 +469,7 @@ if [ "$SPEC_METHOD" = dflash ]; then RADIANCE_DRAFT_RERANK=${RADIANCE_DRAFT_RERA
 if [ "$SPEC_METHOD" = dflash ]; then RADIANCE_VERIFY_HEAD=${RADIANCE_VERIFY_HEAD:-1}; fi
 # Context length. Only lower it for diagnostics -- the FLA GDN fallback allocates against this,
 # not against the chunk size, and OOMs at 262144.
+_SET_MAXLEN=${MAXLEN+1}
 MAXLEN=${MAXLEN:-262144}
 # Chat template. It is mounted into the container by path, so it must exist ON THE HOST: this was
 # hardcoded to a file under ~/.cache/huggingface that only ever existed on the box it was written
@@ -483,12 +512,26 @@ R4D_CACHE=${R4D_CACHE:-$HOME/.cache/radiance-libr4d}
 # (RADIANCE_GDN_FUSED_UPDATE). The build cache key carries a suffix so patched and stock builds
 # coexist; bump the suffix whenever the patch content changes, or a stale build serves silently.
 R4D_PATCH="$SCRIPT_DIR/r4d_radiance_extras.patch"
+# rx9 (2026-09-16) = rx6 + rx7's narrow-state GDN decode kernels (fp16 / bf16 ssm cache, fp32
+# accumulate, RTNE stores -- see r4d_gdn_state.h). It is a strict superset of rx6: the fp32 GDN
+# path is the same code, the 3-rank all-reduce is kept. It exists for the single-GPU profile,
+# whose fp16 ssm cache otherwise makes radiance_gdn decline every GDN layer to the FLA fallback.
+# TP>=2 stays on rx6 BY DEFAULT -- not because rx9 differs there (it should not) but because
+# nothing at TP>=2 has been gated on it; R4D_KEY=b9e42ab-rx9 opts a TP=2 serve in for that gate.
+R4D_PATCH_RX9="$SCRIPT_DIR/r4d_radiance_extras_rx9.patch"
+R4D_PATCH_RX10="$SCRIPT_DIR/r4d_radiance_extras_rx10.patch"
 # R4D_KEY=<key> in the environment selects a specific libr4d build (e.g. b9e42ab-rx7, what the
 # ParoQuant units serve on) instead of the launcher's default below.
 if [ -z "${R4D_KEY:-}" ]; then
   R4D_KEY="$R4D_PIN"
   if [ -f "$R4D_PATCH" ]; then R4D_KEY="$R4D_PIN-rx6"; fi   # rx6: + ar_oneshot_3rank_exact (TP=3 all-reduce); rx5: fused_update zeroes the pad rows
+  if [ "$TP" = 1 ] && [ "${SINGLE_GPU_PROFILE:-auto}" != 0 ] && [ -f "$R4D_PATCH_RX9" ]; then
+    R4D_KEY="$R4D_PIN-rx9"
+  fi
+  # rx10 = rx9 + the lazy-snapshot GDN kernels (gdn_lazy_update / gdn_lazy_materialize).
+  if [ "$GDN_LAZY" = 1 ] && [ -f "$R4D_PATCH_RX10" ]; then R4D_KEY="$R4D_PIN-rx10"; fi
 fi
+case "$R4D_KEY" in *-rx9) R4D_PATCH="$R4D_PATCH_RX9" ;; *-rx10) R4D_PATCH="$R4D_PATCH_RX10" ;; esac
 if [ -z "$R4D_SO" ] && [ "${AUTO_R4D:-1}" = 1 ]; then
   if [ ! -f "$R4D_CACHE/$R4D_KEY/r4d.so" ]; then
     echo "[radiance] building libr4d $R4D_KEY in $IMAGE -- one time, a few minutes"
@@ -558,6 +601,75 @@ EXTRA=${EXTRA:-}
 # the same session: single-stream 184.9 (even), conc-8 405-427 vs 444-461 (LOSES -- cold-start
 # batches run full width into the M=72>64 kernel cliff before the EMAs settle). 7 stays.
 CAPTURE_SIZES=${CAPTURE_SIZES:-none}
+
+# ---------------------------------------------------------------- single-GPU memory profile
+# TP=1 ONLY, and auto-detected. At TP=1 the fp32 GDN state makes vLLM force a 1648-token
+# attention block (an attention page must be >= a mamba page), so every sequence costs ~9 blocks
+# NO MATTER how short it is, and only THREE run concurrently -- measured 2026-09-16 on one R9700
+# at 65536 ctx: "Running: 3 reqs, Waiting: 5 reqs" with ~90k KV tokens still free. Narrowing the
+# ssm cache to fp16 halves the block to 880 and doubles admission (3 -> 6). BetterBench --quick,
+# stock corpus, 1x R9700, 210 W:
+#     C8 aggregate    162.0 -> 258.3 t/s  (+59%)      C8 TTFT  10186 -> 2421 ms
+#     combined decode  80.9 ->  86.5      (+6.9%)     GSM8K    98.00% / 250q (fp32 reads 97.60)
+#     prefill -5% (2386 -> 2249 @2k): the cost is attention paging on the smaller block, NOT the
+#     GDN path -- rx7, which binds a real narrow-state kernel, measured the same prefill.
+#
+# TP>=2 IS DELIBERATELY UNTOUCHED, because the win does not transfer by inspection: rx6 has no
+# narrow-state GDN kernel, so an fp16 cache makes radiance_gdn decline to the FLA fallback. That
+# fallback WINS at TP=1 (H=48 v-heads/rank) but is unmeasured at TP=2 (H=24), which is the shape
+# the radiance GDN kernel is tuned for. rx7 does bind the narrow kernel and measured -14% combined
+# decode at TP=1, and drops r4d_ar_oneshot_3rank_exact (TP=3), so it is not the answer either.
+#
+#   SINGLE_GPU_PROFILE=0     off, even at TP=1
+#   SINGLE_GPU_PROFILE=1     on at ANY TP -- this is the hook for gating TP=2 once it is measured
+#   SINGLE_GPU_PROFILE=auto  (default) on iff TP=1
+SINGLE_GPU_PROFILE=${SINGLE_GPU_PROFILE:-auto}
+if [ "$SINGLE_GPU_PROFILE" = auto ]; then
+  if [ "$TP" = 1 ]; then SINGLE_GPU_PROFILE=1; else SINGLE_GPU_PROFILE=0; fi
+fi
+if [ "$SINGLE_GPU_PROFILE" = 1 ]; then
+  # Capture sizes above MAXSEQS*(SPEC+1) are unreachable -- the decode batch is at most one row
+  # per sequence per speculative token -- and cost 1.05 GiB of CUDA graphs carved out of a pool
+  # the profiler has already promised to the KV cache. DERIVED, not hardcoded: MAXSEQS=8 SPEC=7
+  # caps at 64; MAXSEQS=16 caps at 128 and the stock list is kept whole.
+  if [ "$CAPTURE_SIZES" = none ]; then
+    _cap=$(( ${MAXSEQS:-8} * (SPEC + 1) )); _sizes=""
+    for _s in 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128; do
+      [ "$_s" -le "$_cap" ] && _sizes="${_sizes:+$_sizes,}$_s"
+    done
+    [ -n "$_sizes" ] && CAPTURE_SIZES="[$_sizes]"
+  fi
+  # 8192-token chunks peak at 2.74 GiB of activation against a TP=1 pool that is ALREADY
+  # over-committed (vLLM asks for 2.51 GiB of KV and the profiler hands out 4.91). 4096 costs
+  # nothing measurable (C8 162.0 vs 160.9; prefill within 1%) and returns the headroom.
+  [ -z "${_SET_CHUNK:-}" ] && CHUNK=4096
+  # Context: the two-card default (262144) does not fit one 32 GiB card next to a 27B target plus
+  # the drafter -- the NVFP4 prod checkpoint (bf16 lm_head) left 0.89 GiB of KV at 262144 and
+  # 1.14 GiB at 65536 (needs 2.85), the native MXFP4 checkpoint serves 65536 with ~70-79k KV
+  # tokens (2026-09-16, GPU_UTIL 0.95). 65536 is what the single-card measurements were made at;
+  # an explicit MAXLEN still wins.
+  [ -z "${_SET_MAXLEN:-}" ] && MAXLEN=65536
+  # The lever. EXTRA precedes PASSTHRU on the command line, so an explicit --mamba-*-cache-dtype
+  # from the caller still wins; skip ours entirely if they named either one.
+  # The CONV state is bf16, not float16: --mamba-cache-dtype sets the conv state's dtype and the
+  # libr4d GDN kernels take a bf16 conv state (fp16 there made radiance_gdn decline every layer:
+  # "step not handled by the fused path: conv state dtype torch.float16", 2026-09-16). Both are
+  # 16-bit, so the page -- and the 880-token attention block that buys the concurrency -- is
+  # the same. The ssm (temporal) state stays float16, the dtype rx9's narrow kernels were built
+  # and gated for (see r4d_gdn_state.h on why fp16 beats bf16 there).
+  case " $EXTRA ${PASSTHRU[*]+"${PASSTHRU[*]}"} " in
+    *--mamba-cache-dtype*|*--mamba-ssm-cache-dtype*) ;;
+    *) EXTRA="$EXTRA --mamba-cache-dtype bfloat16 --mamba-ssm-cache-dtype float16" ;;
+  esac
+  # The fused GDN decode step (conv -> barrier -> recurrent, one launch) is routed by
+  # (sequences x v-heads) <= this; the module default 32 is one sequence at TP=2's 24 heads, so
+  # at TP=1 (48 heads) it never fired and the pair ran. Microbench 2026-09-16 (rx9, f16 state,
+  # H=48, N=1 T=8): fused 37.0 us vs conv+recurrent 48.3 -- so one sequence takes the fused
+  # kernel here too; two sequences (96 items) still take the pair (45.0 vs 38.6). TP>=2 keeps 32.
+  GDN_FUSED_MAX_ITEMS=${RADIANCE_GDN_FUSED_MAX_ITEMS:-48}
+  echo "[run] single-GPU profile ON (TP=$TP): ssm cache fp16 (conv bf16), maxlen=$MAXLEN, chunk=$CHUNK, capture=$CAPTURE_SIZES, libr4d $R4D_KEY, gdn fused-items $GDN_FUSED_MAX_ITEMS, fp8-stream-tp1 $FP8S_TP1, lazy-gdn $GDN_LAZY"
+fi
+GDN_FUSED_MAX_ITEMS=${GDN_FUSED_MAX_ITEMS:-${RADIANCE_GDN_FUSED_MAX_ITEMS:-32}}
 # Compilation-config entries accumulate into ONE flag: two --compilation-config instances would
 # not merge (argparse keeps the last).
 CC_ITEMS=""
@@ -745,10 +857,16 @@ if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || tr
 # hipGraph node, identical with dev-kernarg, busy-poll signals, MWAITX off, direct dispatch off.
 # HIP_FORCE_DEV_KERNARG / HSA_ENABLE_INTERRUPT / ROC_ACTIVE_WAIT_TIMEOUT below are those knobs.
 # MXFP4_CUMODE=1 (-mcumode GEMM build): decode neutral (+0.4%), prefill -6% at 32k -- keep 0.
+# ROCR_VISIBLE_DEVICES carries the ABSOLUTE card ids and filters the runtime's device list;
+# HIP_VISIBLE_DEVICES (which vLLM copies into CUDA_VISIBLE_DEVICES) then indexes INTO that
+# filtered list, so it must be 0..n-1, not the same absolute ids. With GPUS=0,1 both spellings
+# coincide and nothing changes; with GPUS=1 the old "1,1" pair left the engine core with no
+# device at all ("No CUDA GPUs are available", 2026-09-16, first single-card serve on card 1).
+HIP_IDS=$(python3 -c "import sys; print(','.join(str(i) for i in range(len(sys.argv[1].split(',')))))" "$GPU_IDS")
 exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
-  -e ROCR_VISIBLE_DEVICES="$GPU_IDS" -e HIP_VISIBLE_DEVICES="$GPU_IDS" -e HF_HUB_OFFLINE=1 \
+  -e ROCR_VISIBLE_DEVICES="$GPU_IDS" -e HIP_VISIBLE_DEVICES="$HIP_IDS" -e HF_HUB_OFFLINE=1 \
   -e VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}" \
   -e VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}" \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
@@ -758,6 +876,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e NCCL_PROTO=Simple \
   -e RADIANCE_USE_R4D="${RADIANCE_USE_R4D:-1}" -e RADIANCE_USE_R4D_AR="${RADIANCE_USE_R4D_AR:-1}" -e RADIANCE_USE_R4D_AR_QUANT="${RADIANCE_USE_R4D_AR_QUANT:-1}" \
   -e RADIANCE_R4D_REPORT=1 -e RADIANCE_AR_MAX_KB="$AR_MAX_KB" \
+  -e RADIANCE_AR_QBITS="${RADIANCE_AR_QBITS:-6}" \
   -e RADIANCE_PRESHUFFLE="${RADIANCE_PRESHUFFLE:-1}" -e RADIANCE_FUSE_RMS_QUANT="${RADIANCE_FUSE_RMS_QUANT:-1}" \
   -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_MXFP4_W4A8_MIN_M="$MIN_M" \
   -e RADIANCE_FAST_DRAFT="$FAST_DRAFT" -e RADIANCE_DRAFT_TAU="${RADIANCE_DRAFT_TAU:-0.20}" \
@@ -780,12 +899,16 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_TP_PAD_DRAFTER="${RADIANCE_TP_PAD_DRAFTER:-1}" \
   -e RADIANCE_TP_PAD_STRICT="${RADIANCE_TP_PAD_STRICT:-1}" \
   -e RADIANCE_GDN_MERGE_INPROJ="$GDN_MERGE" \
+  -e RADIANCE_FP8_STREAM_TP1="$FP8S_TP1" \
   -e RADIANCE_GDN_NORM_QUANT="$GNQ" \
   -e RADIANCE_GDN_STRIDED_GATES="$SGATES" \
   -e RADIANCE_GDN_EMPTY_OUT="$EOUT" \
   -e R4D_ATTN_FP8="${R4D_ATTN_FP8:-3}" \
   -e RADIANCE_AR_OVERLAP="$AR_OVERLAP" \
   -e RADIANCE_GDN_FUSED_UPDATE="${RADIANCE_GDN_FUSED_UPDATE:-1}" \
+  -e RADIANCE_GDN_FUSED_MAX_ITEMS="$GDN_FUSED_MAX_ITEMS" \
+  -e RADIANCE_GDN_TRACE_SIDX="${RADIANCE_GDN_TRACE_SIDX:-0}" \
+  -e RADIANCE_GDN_LAZY="$GDN_LAZY" \
   -e RADIANCE_DYNAMIC_WIDTH="${RADIANCE_DYNAMIC_WIDTH:-1}" \
   -e RADIANCE_DYNW_ALPHA="${RADIANCE_DYNW_ALPHA:-0.35}" \
   -e RADIANCE_DYNW_MARGIN="${RADIANCE_DYNW_MARGIN:-2}" \
@@ -858,16 +981,18 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     python3 patch_async_dynwidth.py
     python3 patch_step_trace.py
     python3 patch_ar_geometry.py
+    python3 patch_ar_qbits.py          # RADIANCE_AR_QBITS: 6 (shipped) | 5 | 4-bit all-reduce wire payload (libr4d rx8+)
     python3 patch_ar_3rank.py
     python3 patch_gdn_glue.py
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
+    if [ "${RADIANCE_GDN_LAZY:-0}" = 1 ]; then python3 patch_gdn_lazy.py; fi   # TP=1 profile only; after the gdn builder patches it anchors on
     python3 patch_qwen3_thinkoff.py \
       || echo "[radiance] WARNING: thinkoff patch did not apply; thinking-off requests will return empty content"
     cp mxfp4-configs/*.json "$SP"/aiter/ops/triton/configs/gemm/
     # radiance_drafthead.py is copied too so RADIANCE_DRAFT_RERANK can be swept without an
     # image rebuild. The repo copy was byte-identical to the 0.9.3 one before that knob existed.
     cp radiance_preamble.py /opt/radiance_preamble.py      # banner/preamble from the repo, not the baked copy
-    cp radiance_nvfp4.py radiance_mxfp4.py radiance_gdn.py radiance_rmsquant.py radiance_drafthead.py \
+    cp radiance_nvfp4.py radiance_mxfp4.py radiance_gdn.py radiance_gdn_lazy.py radiance_rmsquant.py radiance_drafthead.py \
        radiance_verifyhead.py radiance_gdnmerge.py radiance_aroverlap.py radiance_topk.py \
        radiance_arnq.py radiance_tp3pad.py "$SP"/
     # MXFP4_CUMODE=1 builds the GEMM TU in CU mode (waves of a workgroup confined to one CU of the

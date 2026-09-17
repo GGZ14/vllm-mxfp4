@@ -18,12 +18,21 @@ Column/RowParallel pass input_ straight to quant_method.apply) into our apply_we
 unpacks it onto the pq kernel path. The LAST layer keeps the stock contract end-to-end so
 model.norm and the dflash drafter's last_hidden_states see exactly what they see today.
 
-GUARDS (install skips, loudly, if any fail): tp>1, pp==1, no aux_hidden_state_layers, no
+GUARDS (install skips, loudly, if any fail): pp==1, no aux_hidden_state_layers, no
 layer_scale, no sequence-parallel MoE, MLP.expert_gate is None, gdnmerge merged the GDN
 in_proj (its forward is ours to make tuple-aware), and every consumer linear of a streamed
 site runs the radiance W4A8 kernel (radiance_wref present).
 
 RADIANCE_FP8_STREAM=1 enables. Changes the traced graph -> cache dir must be keyed (-fp8s).
+
+TP=1 (2026-09-16). There is no all-reduce to absorb, but the epilogue is the same three traced
+inductor kernels per site (128 sites per step) and the same silu*up+quant and GDN norm+quant
+producers, so the contract pays there too: ar_add_rms_quant takes its plain arm (the
+tensor_model_parallel_all_reduce it calls is the identity at world size 1) and every other piece
+is TP-agnostic. Gated separately -- RADIANCE_FP8_STREAM_TP1=1 (default) -- so the TP>=2 path is
+untouched by construction: nothing below reads the TP=1 knob unless world size is 1. The launcher
+keys the compile cache on it (-tp1s) because the traced graph changes and the -fp8s dir on a TP=1
+host already holds the stock graph from before this arm existed.
 """
 import os
 import sys
@@ -31,6 +40,8 @@ import sys
 import torch
 
 ENABLED = os.environ.get("RADIANCE_FP8_STREAM", "0") == "1"
+# TP=1 only: the epilogue contract without an all-reduce in it. Never consulted at TP>=2.
+ENABLED_TP1 = os.environ.get("RADIANCE_FP8_STREAM_TP1", "1") == "1"
 
 
 def _log(msg):
@@ -263,8 +274,12 @@ def install(model) -> None:
     try:
         from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
         if get_tensor_model_parallel_world_size() <= 1:
-            _log("tp=1, skipping (epilogue exists to absorb the AR)")
-            return
+            if not ENABLED_TP1:
+                _log("tp=1 and RADIANCE_FP8_STREAM_TP1=0, skipping")
+                return
+            # No AR to absorb; the custom op's plain arm runs the standalone epilogue kernel
+            # (its all-reduce call is the identity at world size 1).
+            _log("tp=1: installing the epilogue contract without an all-reduce")
         if get_pp_group().world_size > 1:
             _log("pp>1, skipping (inter-layer contract crosses pp boundary)")
             return

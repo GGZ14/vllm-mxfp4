@@ -1022,7 +1022,12 @@ __global__ __launch_bounds__(DWN * 32) void radiance_mxfp4_fp8_gemm_decode(
 // Sized DEC_KS(4) x 64 rows x N(<=32768) x 4 B = 32 MiB, allocated in radiance_mxfp4.py. 64 rows
 // because a dflash drafter at SPEC=7 reaches M = max_num_seqs x 8 = 64. Single-stream decode per
 // rank is assumed. split_k_for() may choose a narrower split, which only shrinks the requirement.
-#define DEC_MAX_N 32768
+// 36864, not 32768 (2026-09-16): TP=1 gate_up is N=34816, and at 32768 the gate below sent every
+// decode call of the widest linear to the folded prefill tile. TP=2's widest shape is 17408, so
+// for it this is a comparison against a bigger constant and nothing else; the scratch that backs
+// DKS>1 is sized in radiance_mxfp4.py from the rank's own width, and nblk >= 110 picks DKS=1
+// (no scratch) for the 34816 shape anyway.
+#define DEC_MAX_N 36864
 #define DEC_KS 4
 #define DEC_DWN 8           // waves per decode block; the N tile is DEC_DWN*16 = 128 wide
 
@@ -1494,9 +1499,21 @@ __global__ __launch_bounds__(ART) void radiance_silu_mul_quant(
 
 static void launch_silu_mul_quant(uintptr_t gu, uintptr_t q, uintptr_t scale, int M, int N,
                                   uintptr_t stream, int tiled) {
-  if (N > 40 * ARNQ_T || (N & 7))
-    throw std::runtime_error("radiance_silu_mul_quant: N must be 8-aligned and <= 10240");
+  if (N > 40 * 512 || (N & 7))
+    throw std::runtime_error("radiance_silu_mul_quant: N must be 8-aligned and <= 20480");
   if (tiled && (N & 15)) throw std::runtime_error("radiance_silu_mul_quant: tiled needs N % 16 == 0");
+  // Above the 256-thread block's register budget (MAXG=5 groups of 8 -> N <= 10240, which is
+  // every TP>=2 shape) the 512-thread instantiation covers N <= 20480: TP=1's intermediate is
+  // 17408 (2026-09-16). Shapes at or below 10240 launch exactly as before.
+  if (N > 40 * ARNQ_T) {
+    if (tiled)
+      hipLaunchKernelGGL((radiance_silu_mul_quant<512, true>), dim3(M), dim3(512), 0,
+                         (hipStream_t)stream, (const __bf16 *)gu, (unsigned char *)q, (float *)scale, N);
+    else
+      hipLaunchKernelGGL((radiance_silu_mul_quant<512>), dim3(M), dim3(512), 0, (hipStream_t)stream,
+                         (const __bf16 *)gu, (unsigned char *)q, (float *)scale, N);
+    return;
+  }
   if (tiled) {
     if (M >= 2048)
       hipLaunchKernelGGL((radiance_silu_mul_quant<512, true>), dim3(M), dim3(512), 0,

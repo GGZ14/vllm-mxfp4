@@ -20,3 +20,4 @@
 #
 # sig                 maxseqs chunk   maxlen  spec    bytes           note
 2x7551-32624	8	8192	262144	dflash	18563072000	2x R9700 32 GiB, gfx1201; 943,581 KV tokens vs 892,799 profiled (+5.7%); survives a full 260k prefill sweep
+1x7551-32624	8	4096	65536	dflash	6535819798	1x R9700 32 GiB, gfx1201, TP=1 single-GPU profile; measured 2026-09-16 on the NVFP4 checkpoint (the largest footprint served: bf16 lm_head) from a pinned start (its profile run cannot reach the minimum); 7.00 GiB served 161,057 tokens, 7.60 OOM, backed off one step; ~140k KV tokens at the pin

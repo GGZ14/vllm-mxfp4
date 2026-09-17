@@ -54,8 +54,24 @@ esac; done
 # because the lookup key includes them -- a pin measured at MAXSEQS=8 is not valid at 16.
 PORT=${PORT:-8080}
 MAXSEQS=${MAXSEQS:-8}
+# At TP=1 serve-mxfp4.sh's single-GPU profile serves CHUNK=4096 unless the caller names one, and
+# the pin's lookup key carries the chunk -- so a row measured here at 8192 would never be hit.
+# Default to what that serve will actually run with (the same rule, same override).
+if [ -z "${CHUNK:-}" ] && [ "$RAD_TP" = 1 ] && [ "${SINGLE_GPU_PROFILE:-auto}" != 0 ]; then
+  CHUNK=4096
+fi
 CHUNK=${CHUNK:-8192}
+# Same rule for the context: the single-GPU profile serves 65536 (262144 does not fit one card
+# next to the target and the drafter), and the key carries maxlen too.
+if [ -z "${MAXLEN:-}" ] && [ "$RAD_TP" = 1 ] && [ "${SINGLE_GPU_PROFILE:-auto}" != 0 ]; then
+  MAXLEN=65536
+fi
 MAXLEN=${MAXLEN:-262144}
+# KV_START=<bytes>: begin from this pin instead of vLLM's profiled figure. For a checkpoint whose
+# PROFILE run cannot reach the minimum cache (the NVFP4 target at TP=1: 1.14 GiB profiled against
+# 2.85 needed at 65536, because the profile's transient peak is charged against the pool) the
+# search still works from a pin that is known to serve -- pass 2 raises it from there.
+KV_START=${KV_START:-}
 SPEC_METHOD=${SPEC_METHOD:-dflash}
 GPU_UTIL=${GPU_UTIL:-0.98}
 NAME=${NAME:-vllmkvcal}
@@ -158,8 +174,17 @@ print(json.dumps({'model':'Qwen3.8','prompt':sys.argv[1],'max_tokens':32,'temper
 }
 
 # ---------------------------------------------------------------- pass 1: profile
+if [ -n "$KV_START" ]; then
+  say "pass 1/2: pinned start at KV_START=$KV_START bytes (profiling skipped by request)"
+  res=$(attempt "$KV_START")
+  set -- $res
+  [ "$1" = PASS ] || die "the KV_START pin itself failed: ${*:2}" "pick a smaller KV_START"
+  # a pinned run logs the pin as its available memory; make pass 2 start from KV_START exactly
+  res="PASS $(awk -v b="$KV_START" 'BEGIN{printf "%.4f", b/1073741824}') $3"
+else
 say "pass 1/2: profiling run (vLLM sizes the cache itself)"
 res=$(attempt "")
+fi
 set -- $res
 [ "$1" = PASS ] || die "the profiling run itself failed: ${*:2}" \
     "this is not a calibration problem -- the configuration does not serve on this host at all" \
