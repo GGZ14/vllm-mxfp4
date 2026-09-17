@@ -598,6 +598,15 @@ def _(x, weight, weight_scale, weight_ref):
     return torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
 
 
+def _tp_world_size() -> int:
+    """Tensor-parallel world size, 1 when vLLM's groups are not initialised (benches)."""
+    try:
+        from vllm.distributed import get_tensor_model_parallel_world_size
+        return int(get_tensor_model_parallel_world_size())
+    except Exception:                                   # noqa: BLE001
+        return 1
+
+
 def make_row_ref(weight_scale: torch.Tensor) -> torch.Tensor:
     """Per-output-row reference exponent, computed ONCE at load.
 
@@ -727,13 +736,17 @@ def _make_kernel_class():
                     # from the env so the default (64) allocates exactly what it always has;
                     # a 16-concurrent serve sets RADIANCE_MXFP4_DECODE_MAX_M=128 and pays the
                     # extra 32 MiB only then.
+                    # Widest N the split-K partials must cover: 32768 at TP>=2 (unchanged),
+                    # 36864 at TP=1 where gate_up is 34816 (the kernel's DEC_MAX_N). Keyed on
+                    # the world size so a TP=2 serve allocates exactly what it always has.
+                    _dec_max_n = 36864 if _tp_world_size() == 1 else 32768
                     _decode_scratch[0] = torch.empty(
-                        4 * max(64, DECODE_MAX_M) * 32768, dtype=torch.float32,
+                        4 * max(64, DECODE_MAX_M) * _dec_max_n, dtype=torch.float32,
                         device=layer.weight.device)
                     # Block counter for the fused reduction, one int per n-block. MUST start
                     # zeroed; the kernel's last-arriving block resets it, so it stays that way.
                     _decode_scratch[1] = torch.zeros(
-                        32768 // 128 + 8, dtype=torch.int32, device=layer.weight.device)
+                        _dec_max_n // 128 + 8, dtype=torch.int32, device=layer.weight.device)
                     _ext.set_decode_scratch(_decode_scratch[0].data_ptr(),
                                             _decode_scratch[0].numel() * 4,
                                             _decode_scratch[1].data_ptr())

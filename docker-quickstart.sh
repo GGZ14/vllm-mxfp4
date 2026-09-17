@@ -72,6 +72,8 @@ Options:
 Environment (the launcher's own variables -- see ./serve-mxfp4.sh --help for the rest):
   MODELS=~/models   where the checkpoints go            RUNTIME=docker  docker or podman
   IMAGE=...:0.9.3   container image                     NAME=...        container name
+  TP=1|2|3          tensor-parallel size (auto)         GPUS=0,1        HIP indices to serve on
+                    (one card: ./serve-tp1.sh has the same effect -- README "One card (TP=1)")
 
 Disk: about 60 GiB for a full setup (19 source + 19 built checkpoint + 2 drafter + ~10 image).
 The 19 GiB source download can be deleted afterwards; setup prints the command.

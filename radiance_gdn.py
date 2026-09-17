@@ -98,6 +98,17 @@ _FUSED_UPDATE_NARROW = {
                            head_k=HEAD_K, head_v=HEAD_V)
     for dt, (tag, frag) in _STATE_TAGS.items()
 }
+# RADIANCE_GDN_LAZY=1 (radiance_gdn_lazy.py): one base state per sequence plus a candidate stash
+# instead of a snapshot per candidate. Needs libr4d rx10+ (gdn_lazy_update) and patch_gdn_lazy.py,
+# which makes the allocator hand out ONE speculative block. Under it the spec window is two
+# columns [base, stash]; a step the lazy path cannot take must raise, never fall back to FLA,
+# because FLA would write candidate snapshots into columns that do not exist.
+LAZY = os.environ.get("RADIANCE_GDN_LAZY", "0") == "1"
+_LAZY_UPDATE = _bind("gdn_lazy_update", head_k=HEAD_K, head_v=HEAD_V, state_dtype="fp32") if LAZY else None
+_LAZY_UPDATE_NARROW = ({dt: _bind_narrow_state("gdn_lazy_update", tag, frag, head_k=HEAD_K, head_v=HEAD_V)
+                        for dt, (tag, frag) in _STATE_TAGS.items()} if LAZY else {})
+if LAZY and _LAZY_UPDATE is None:
+    raise RuntimeError("RADIANCE_GDN_LAZY=1 but this libr4d has no gdn_lazy_update kernel (needs rx10+)")
 # The fused decode step (conv -> grid barrier -> recurrent in ONE launch) removes one kernel
 # boundary per GDN layer per forward. Bit-identical to the pair by construction. Off by default
 # until the serving A/B has run; needs a build whose registry has gdn_fused_update.
@@ -113,6 +124,30 @@ STRIDED_GATES = os.environ.get("RADIANCE_GDN_STRIDED_GATES", "0") == "1"
 # itself (vLLM PR 28182 is why the fill exists), and the non-fused paths below zero the tail in
 # Python. Default 0 until the serving A/B lands.
 EMPTY_OUT = os.environ.get("RADIANCE_GDN_EMPTY_OUT", "0") == "1"
+
+
+# RADIANCE_GDN_TRACE_SIDX=1: log, once per decode step for the first two sequences, the resident
+# state slots, the accepted count and the cumulative token bounds. Diagnostic for the align-mode
+# slot bookkeeping (which block each candidate writes, what happens at a block boundary). Syncs
+# the stream; never on in a serve that is being measured.
+TRACE_SIDX = os.environ.get("RADIANCE_GDN_TRACE_SIDX", "0") == "1"
+_trace_n = [0]
+_trace_layer = [None]
+
+
+def _trace_sidx(layer, md, sidx, cu, nseq):
+    if _trace_layer[0] is None:
+        _trace_layer[0] = id(layer)
+    if id(layer) != _trace_layer[0]:          # one line per step, not one per GDN layer
+        return
+    _trace_n[0] += 1
+    if _trace_n[0] > int(os.environ.get("RADIANCE_GDN_TRACE_STEPS", "4000")):
+        return
+    k = min(2, nseq)
+    sys.stderr.write(
+        f"[radiance.gdn.sidx] step {_trace_n[0]} nseq {nseq} T {int(md.num_actual_tokens)} "
+        f"sidx {sidx[:k].tolist()} nacc {md.num_accepted_tokens[:k].tolist()} "
+        f"cu {cu[:k + 1].tolist()}\n")
 
 
 def _zero_tail(core_attn_out, T):
@@ -429,19 +464,61 @@ def recurrent_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx, num_
         num_seqs, H, Hg, HEAD_K, HEAD_V, float(scale), SOFTPLUS_THRESHOLD, _stream())
 
 
+def lazy_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx, num_accepted,
+                num_seqs, H, Hg, scale):
+    """Lazy-snapshot recurrent update: base in sidx[:, 0], stash in sidx[:, 1]."""
+    _LU = _LAZY_UPDATE_NARROW.get(ssm_state.dtype) or _LAZY_UPDATE
+    if _LU is None:
+        raise RuntimeError(f"radiance_gdn: no lazy kernel for a {ssm_state.dtype} state cache")
+    _LU(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
+        a.stride(0), a.dtype == torch.bfloat16, A_log.data_ptr(), dt_bias.data_ptr(),
+        ssm_state.data_ptr(), ssm_state.stride(0), ssm_state.stride(1),
+        o.data_ptr(), cu.data_ptr(), sidx.data_ptr(), sidx.stride(0),
+        num_accepted.data_ptr() if num_accepted is not None else 0,
+        num_seqs, H, Hg, HEAD_K, HEAD_V, 1, float(scale), SOFTPLUS_THRESHOLD, _stream())
+
+
+def _lazy_invalidate(ssm_state, md, H):
+    """A prefill (or prefix hit) writes a fresh base for its rows: their stash must not replay.
+    Zero the two region headers (bytes 0..15 and 8192..8207 of every head's area) of each
+    non-spec row's stash block. Null rows hit block 0, which nothing reads."""
+    st = md.radiance_stash_indices
+    if st is None:
+        return
+    m = md.spec_sequence_masks
+    if m is not None:
+        n = min(st.shape[0], m.shape[0])
+        st = st[:n][~m[:n]]
+    if st.numel() == 0:
+        return
+    nb = ssm_state.shape[0]
+    i32 = ssm_state.view(nb, H, -1).view(torch.int32)
+    rows = st.long()
+    i32[:, :, 0:4].index_fill_(0, rows, 0)
+    i32[:, :, 2048:2052].index_fill_(0, rows, 0)
+
+
 def _plan(self, mixed_qkv, b, a, core_attn_out):
     """Decide whether this step is one the R4D path covers, and gather what it needs.
 
     Everything that could raise on an unexpected metadata shape happens here, BEFORE any kernel
     runs, so an unhandled case costs a fallback rather than a half-updated state cache.
     """
+    lazy_spec = [False]
+
     def no(why):
+        if lazy_spec[0]:
+            # A lazy cache has no candidate columns for FLA to write: declining a spec step would
+            # corrupt the state, so it is an error, never a fallback.
+            raise RuntimeError(f"radiance_gdn: lazy mode cannot decline a spec step: {why}")
         _fb(why)
         return None
 
     md = _metadata(self)
     if md is None:
         return None                                   # warm-up pass: the caller compiles kernels
+    lazy_spec[0] = bool(LAZY and md.spec_sequence_masks is not None and md.num_spec_decodes > 0)
     if not _geometry_ok(self):
         return no(f"geometry head_k {self.head_k_dim} head_v {self.head_v_dim} "
                   f"conv {self.conv_kernel_size}")
@@ -467,6 +544,11 @@ def _plan(self, mixed_qkv, b, a, core_attn_out):
         return no(f"ssm state dtype {ssm_state.dtype}")
     if ssm_state.stride(2) != ssm_state.shape[3] or ssm_state.stride(3) != 1:
         return no(f"ssm state [V,K] block is not packed: strides {tuple(ssm_state.stride())}")
+    # Lazy cache: every step that prefills (or resumes) a request rewrites that request's base,
+    # so its stash must not replay -- done HERE, before any path decision, so a step the fused
+    # path declines (and the stock prefill then handles) invalidates just the same.
+    if LAZY and md.num_prefills > 0:
+        _lazy_invalidate(ssm_state, md, self.num_v_heads // self.tp_size)
     if conv_state.dtype != torch.bfloat16:
         return no(f"conv state dtype {conv_state.dtype}")
     if a.dtype not in (torch.bfloat16, torch.float32) or b.dtype != a.dtype:
@@ -498,6 +580,9 @@ def _plan(self, mixed_qkv, b, a, core_attn_out):
         sidx = md.spec_state_indices_tensor
         if sidx is None or sidx.dim() != 2:
             return no("spec state indices are not [seq, candidate]")
+        if LAZY and sidx.shape[1] != 2:
+            raise RuntimeError(f"radiance_gdn: lazy mode expects a 2-column state window, got "
+                               f"{tuple(sidx.shape)} (is patch_gdn_lazy.py applied?)")
         if kind != "decode" and (md.spec_token_indx is None or md.non_spec_token_indx is None):
             return no("no spec/non-spec token index on the metadata")
     cu = None
@@ -517,6 +602,8 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
     try:
         plan = _plan(self, mixed_qkv, b, a, core_attn_out)
     except Exception as e:                            # an unexpected metadata shape is a fallback
+        if LAZY:
+            raise
         return _fb(f"{type(e).__name__} while planning: {e}")
     if plan is None:
         return False
@@ -533,7 +620,19 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         nseq = md.num_spec_decodes
         maxq = sidx.size(-1)
         cu = md.spec_query_start_loc[: nseq + 1]
+        if TRACE_SIDX:
+            _trace_sidx(self, md, sidx, cu, nseq)
         o = core_attn_out[:T].view(T, H, HEAD_V)
+        if LAZY:
+            maxq = self.num_spec + 1               # the window is 2 wide; the conv still rolls SPEC+1
+            q, k, v = conv_update(mixed_qkv, conv_w, self.conv1d.bias, conv_state,
+                                  (4 - 1) + (maxq - 1), sidx[:, 0][:nseq],
+                                  md.num_accepted_tokens, cu, nseq, T, H, Hg, maxq)
+            _first("decode(lazy)")
+            lazy_update(q, k, v, a, b, A_log, dt_bias, ssm_state, o, cu, sidx,
+                        md.num_accepted_tokens, nseq, H, Hg, HEAD_K ** -0.5)
+            _zero_tail(core_attn_out, T)
+            return True
         # The fused kernel's resident grid is capped at 32 workgroups (deadlock-free barrier), so
         # past one sequence it work-loops nseq*H (seq, head) items over 32 WGs while the pair's
         # recurrent kernel launches one WG per item. Microbench 2026-09-02 (gdn_decode_bench.py,
@@ -568,7 +667,7 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
         # split the original does, minus its extra merge buffer.
         si, ni = md.spec_token_indx, md.non_spec_token_indx
         nspec = md.num_spec_decodes
-        maxq = sidx.size(-1)
+        maxq = (self.num_spec + 1) if LAZY else sidx.size(-1)
         scu = md.spec_query_start_loc[: nspec + 1]
         x_spec = mixed_qkv.index_select(0, si)
         a_spec, b_spec = a.index_select(0, si), b.index_select(0, si)
@@ -577,8 +676,12 @@ def forward_core_fused(self, mixed_qkv, b, a, core_attn_out) -> bool:
                                  (4 - 1) + (maxq - 1), sidx[:, 0][:nspec],
                                  md.num_accepted_tokens, scu, nspec, ts, H, Hg, maxq)
         spec_o = torch.empty((ts, H, HEAD_V), device=mixed_qkv.device, dtype=torch.bfloat16)
-        recurrent_update(sq, sk, sv, a_spec, b_spec, A_log, dt_bias, ssm_state, spec_o, scu,
-                         sidx, md.num_accepted_tokens, nspec, H, Hg, HEAD_K ** -0.5)
+        if LAZY:
+            lazy_update(sq, sk, sv, a_spec, b_spec, A_log, dt_bias, ssm_state, spec_o, scu,
+                        sidx, md.num_accepted_tokens, nspec, H, Hg, HEAD_K ** -0.5)
+        else:
+            recurrent_update(sq, sk, sv, a_spec, b_spec, A_log, dt_bias, ssm_state, spec_o, scu,
+                             sidx, md.num_accepted_tokens, nspec, H, Hg, HEAD_K ** -0.5)
         mixed_qkv = mixed_qkv.index_select(0, ni)
         a, b = a.index_select(0, ni), b.index_select(0, ni)
 

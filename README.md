@@ -67,7 +67,7 @@ requires building an image**.
 
 | | |
 |---|---|
-| **A card** | Any AMD RDNA4 (gfx1201); the image is compiled for that architecture only. One card works, four work — the card count and the tensor-parallel size are detected, not configured |
+| **A card** | Any AMD RDNA4 (gfx1201); the image is compiled for that architecture only. One card works, four work — the card count and the tensor-parallel size are detected, not configured. One card gets its own tuned profile; see [One card (TP=1)](#one-card-tp1) |
 | **A host** | Linux with the amdgpu kernel driver loaded, so `/dev/kfd` and `/dev/dri` exist. ROCm userspace ships inside the image |
 | **A runtime** | `docker` or `podman`, and nothing else. No host Python, no ROCm install, no `huggingface-cli` |
 | **Disk** | ~60 GiB for a full setup, ~40 GiB of it downloaded once. 19 GiB of that is the source checkpoint, deletable when setup finishes — it prints the command |
@@ -122,6 +122,15 @@ both take `RUNTIME=docker` or `RUNTIME=podman`:
 ./serve-mxfp4.sh      # runs in the foreground; DETACH=1 puts it in the background
 ```
 
+The launcher picks the tensor-parallel size from the cards it finds. To pin it, use the wrappers
+(each is one line: `serve-mxfp4.sh` with `TP` set, every other knob and argument passed through):
+
+```bash
+./serve-tp1.sh        # one card  -- the single-GPU profile (GPUS=1 to pick which card)
+./serve-tp2.sh        # two cards -- the default on a two-card host
+./serve-tp3.sh        # three cards, via dummy-head padding (explicit only; see TP=3 below)
+```
+
 ### Check it works
 
 ```bash
@@ -147,7 +156,9 @@ served model name is `Qwen3.8` (`Qwen3.6` and `Qwen3.8-MXFP4` are aliases for th
 | WikiText-2 perplexity | 8.3708 |
 | GSM8K (500q, greedy) | 97.8% |
 
-Full numbers in [Performance](#performance).
+Full numbers in [Performance](#performance). On **one** R9700 (`./serve-tp1.sh`, 65,536 context):
+combined single-stream decode 137.7 t/s at 35.7 ms per update, 416 t/s aggregate at 8 concurrent
+(487 at 16 with `MAXSEQS=16`), prefill 2.5-2.8k t/s -- see [One card (TP=1)](#one-card-tp1-1).
 
 ### Useful next commands
 
@@ -260,6 +271,35 @@ therefore serves on two by default, leaves one idle, and says so.
 
 **KV cache size.** See [KV cache calibration](#kv-cache-calibration).
 
+### One card (TP=1)
+
+`TP=1` (or `./serve-tp1.sh`) turns on the **single-GPU profile** (`SINGLE_GPU_PROFILE=auto`), a
+set of choices that only make sense when one card holds the whole model. Every one of them is
+gated on TP=1 so a two-card serve is byte-identical to before:
+
+| | |
+|---|---|
+| Context | `MAXLEN` defaults to **65,536**: the two-card default (262,144) does not fit next to a 27B target plus the drafter on 32 GiB |
+| Attention KV cache | **fp8**, exactly as at TP=2 (`--kv-cache-dtype fp8`) |
+| GDN recurrent state | the mamba-style temporal state (not the KV cache) is stored fp16 and its conv window bf16 instead of fp32; vLLM allows no fp8 there. The GDN page halves, so vLLM's attention block halves (1648 -> 880 tokens) and the per-request floor with it |
+| Lazy GDN snapshots | `RADIANCE_GDN_LAZY=1` (libr4d rx10): one base state plus a candidate stash per request instead of one state per draft token. A request holds 3 mamba pages per layer group instead of 9, which is what lets 8 streams run at once instead of 5-6 |
+| Kernels | the decode GEMM width cap covers the unsharded `gate_up` (34816 wide) so it takes the decode kernel, not the prefill tile; the fp8 residual-stream epilogues install without an all-reduce (`RADIANCE_FP8_STREAM_TP1`); the fused GDN step routes at 48 heads |
+| Batch | `CHUNK` 4096, cudagraph capture sizes capped at `MAXSEQS*(SPEC+1)`, KV pin from the `1x7551-32624` row of `kv-profiles.tsv` |
+
+Which card: `GPUS=1 ./serve-tp1.sh` names it (the fix for a single non-zero card landed
+2026-09-16; earlier launchers left the engine with no visible device). Two things to know:
+
+- **The NVFP4 checkpoint barely fits one card.** Its bf16 `lm_head` puts the load at ~20 GiB and
+  vLLM's profiler cannot reach the 2.85 GiB the 65k cache needs; it serves only under a pin, which
+  is what the shipped TP=1 row provides (6.09 GiB, ~140k KV tokens). The native MXFP4 checkpoint has
+  no such trouble (~99k tokens at 8 sequences, ~85k at 16).
+- **More streams:** `MAXSEQS=16 ./serve-tp1.sh` measured 487 t/s aggregate at 16 concurrent
+  against 416 at 8 (TTFT p50 0.5 s). It re-profiles KV (the pin row is keyed on `MAXSEQS=8`); run
+  `MAXSEQS=16 ./calibrate-kv.sh` to claim the margin there.
+
+Numbers in [One card (TP=1)](#one-card-tp1-1) under Performance; the engineering ledger is in
+[PERFORMANCE.md](PERFORMANCE.md) (rows dated 2026-09-16/17).
+
 ### TP=3 (explicit)
 
 Three cards are served through zero-weight dummy heads. `radiance_tp3pad.py` widens the config to
@@ -296,7 +336,14 @@ batch shape:
 ```
 # sig            maxseqs chunk  maxlen  spec    bytes
 2x7551-32624     8       8192   262144  dflash  18563072000
+1x7551-32624     8       4096   65536   dflash  6535819798
 ```
+
+The signature starts with the TP size, so a one-card serve has its own row. That row was measured
+on the NVFP4 checkpoint, the largest footprint served, so it is conservative for the others. At
+TP=1 the calibrator inherits the single-GPU profile's `CHUNK` and `MAXLEN` defaults so the row it
+writes is the one the serve will look up, and `KV_START=<bytes>` starts the search from a pin that
+is known to serve when the profiling pass itself cannot come up (the NVFP4 case).
 
 A signature that is not in the table falls back to vLLM's own profiling. That is always safe; it
 just leaves the margin unclaimed, and the launcher prints a one-line note saying so.
@@ -461,6 +508,9 @@ of overrides produces without running it.
 | `GPU_UTIL` | `0.98` | The ceiling on this box. Use `0.75` for perplexity work: `prompt_logprobs` allocates a 1-1.7 GiB transient vLLM does not reserve for |
 | `KV_MEM` | `auto` | KV cache size. `auto` looks up a measured pin and falls back to profiling; `<bytes>` pins explicitly; `0` forces profiling. Consulted only at `GPU_UTIL=0.98`. Worth 892,799 -> 943,581 tokens on the R9700 pair. See [KV cache calibration](#kv-cache-calibration) |
 | `TP` / `GPUS` | auto | Tensor-parallel size and the HIP indices to serve on. `TP=3` is explicit; see [TP=3](#tp3-explicit) |
+| `SINGLE_GPU_PROFILE` | `auto` (on iff TP=1) | One-card serve: fp16 ssm cache + bf16 conv cache (880-token attention block, concurrency 3 -> 6), MAXLEN 65536, CHUNK 4096, capture sizes capped at MAXSEQS*(SPEC+1), libr4d rx9 (narrow-state GDN kernels), fused GDN step at 48 items. `0` disables, `1` forces at any TP (unmeasured above TP=1) |
+| `RADIANCE_GDN_LAZY` | `1` in the single-GPU profile, else `0` | Lazy GDN state snapshots under speculative decode: one base state + a candidate stash per sequence instead of a snapshot per draft token, so a request holds 3 mamba pages per layer group instead of 9. Needs libr4d rx10 (auto) and applies patch_gdn_lazy.py inside the container. Own cache suffix `-lz`. Never applied at TP>=2 |
+| `RADIANCE_FP8_STREAM_TP1` | `1` | TP=1 only: the fp8 residual-stream epilogues (residual add + norm + quant, silu*up + quant, GDN norm + quant) installed without an all-reduce. Own compile-cache suffix `-tp1s`. Never read at TP>=2 |
 | `RADIANCE_TP_PAD` | `3` at TP=3, else `0` | The dummy-head padding itself. `3` at TP=1/2 runs the validation gates; `_INTERMEDIATE=17408` keeps the MLP stock, `_DRAFTER=0` leaves the DFlash2 drafter unpadded, `_STRICT=0` demotes a weight-coverage mismatch to a warning |
 | `MIN_GPU_MIB` | `8192` | VRAM floor for "usable". Lower it to admit a small card, raise it to skip one |
 | `ASYNC` | `0` | Async scheduling. vLLM refuses it together with `disable_padded_drafter_batch`, so the two are one switch; the unpad lever is ~+50% single-stream under mtp |
@@ -655,6 +705,49 @@ This sweep stops at 64k. For deeper context the reference points are the fp8-att
 (3831 t/s at 106k) and the 0.5.8 -> 0.7.4 table, both in
 [PERFORMANCE.md](PERFORMANCE.md); they run on a different harness and are not directly comparable to
 this table. Prefill throughput keeps falling with depth in both.
+
+### One card (TP=1)
+
+BetterBench `--quick` (5 passes per category, 8 per prefill depth, 48 requests per concurrency
+level), `2026-09-16`, one R9700 at the box's standing 210 W cap and -75 mV, `./serve-tp1.sh`
+defaults (lazy GDN snapshots, `MAXSEQS=8`, 65,536 context), native MXFP4 checkpoint.
+
+| Category | TTFT p50 (ms) | update p50 (ms) | tok/update | decode t/s |
+|---|--:|--:|--:|--:|
+| code | 95.0 | 35.3 | 4.65 | 145.2 |
+| json | 94.9 | 35.1 | 5.59 | 184.4 |
+| math | 94.4 | 35.2 | 5.56 | 168.6 |
+| summarization | 98.0 | 35.1 | 4.67 | 138.1 |
+| file_edit | 99.6 | 35.3 | 5.63 | 166.1 |
+| reasoning | 94.8 | 35.2 | 3.60 | 120.8 |
+| chat | 96.9 | 34.9 | 2.75 | 81.4 |
+| prose | 50.4 | 35.2 | 2.76 | 79.0 |
+
+**Combined**: decode **137.7 t/s**, update p99 **35.7 ms**, TTFT p50 **95 ms**. Before the
+2026-09-16 pass the same card served at 64 ms per update (75.4 t/s combined).
+
+| Concurrent | Aggregate t/s | TTFT p50 (ms) | Per-request decode t/s |
+|--:|--:|--:|--:|
+| 1 | 116.9 | 94.8 | 146.3 |
+| 2 | 207.6 | 136.6 | 138.3 |
+| 4 | 319.0 | 147.8 | 108.4 |
+| 8 | **416.3** | 172.9 | 79.4 |
+| 16 (`MAXSEQS=16`) | 486.6 | 533.4 | 47.8 |
+
+| Target depth | Prompt tokens | TTFT p50 (ms) | PP t/s |
+|--:|--:|--:|--:|
+| 2k | 1,514 | 553.6 | 2737 |
+| 8k | 5,892 | 2,163.9 | 2720 |
+| 16k | 11,800 | 4,245.9 | 2778 |
+| 32k | 23,548 | 8,880.3 | 2651 |
+| 64k | 47,014 | 18,949.9 | 2480 |
+
+Prefill is compute-bound and follows the core clock: the same config measured 3552 t/s at 2k and
+3192 at 64k with the cap raised to 300 W (undervolt kept), and concurrency-8 rose to 471 t/s.
+Single-stream decode went the other way there (42 ms per update whenever the core boosted past
+3.3 GHz), so the power policy is a real trade on one card; the reference box's two cards also differ by
+~12% on prefill under the same cap, so compare prefill on the same card only. GSM8K 250q greedy on
+this config: 97.6-98.4% across the runs of the day, the same band as two cards.
 
 ### Quality and capacity
 
@@ -892,6 +985,9 @@ modules the recipes do not pre-bake).
 | `docker-quickstart.sh` | The guided path: host checks, setup, start, wait for `/health`, test request. Also `status` / `logs` / `test` / `stop` / `restart` / `clean`. Wraps the two scripts below |
 | `setup-mxfp4.sh` | One-time setup: host check, image, checkpoints, kernels. Idempotent |
 | `serve-mxfp4.sh` | The launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds, `DETACH=1` to background it |
+| `serve-tp1.sh`, `serve-tp2.sh`, `serve-tp3.sh` | One-line wrappers that pin the tensor-parallel size; everything else passes through |
+| `patch_gdn_lazy.py`, `radiance_gdn_lazy.py` | Lazy GDN state snapshots for one-card serves (`RADIANCE_GDN_LAZY`): the vLLM patch and the materialize glue. Applied only at TP=1 |
+| `r4d_radiance_extras{,_rx9,_rx10}.patch` | This repo's libr4d additions on top of the pinned commit: rx6 (TP>=2), rx9 (narrow-state GDN, TP=1), rx10 (rx9 + lazy snapshots, TP=1) |
 | `docker-compose-setup.sh` | Writes the `.env` `docker-compose.yml` needs on this host (GPU group ids, HIP indices, paths), and optionally fetches the FP8 checkpoint |
 | `gpu-detect.sh` | GPU/TP/KV detection, sourced by the launcher. Run it directly to see what it finds |
 | `calibrate-kv.sh` | Measures a `--kv-cache-memory` pin for your hardware and saves it |
