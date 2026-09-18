@@ -322,14 +322,25 @@ def _quantize_draft_head(mtp, lp_attr="logits_processor"):
         return f"unsupported draft-head weight {tuple(w.shape)} {w.dtype}"
     lp._radiance_topk_only = lp_attr == "candidate_logits_processor"
     # A drafter whose checkpoint carries no lm_head (DFlash2) gets the target's tensor shared in
-    # AFTER load_weights returns, so at this point the parameter is still allocated-but-empty.
-    # Quantising that yields an all-zero head, and the failure is silent and total: the serve comes
-    # up, text stays coherent because the TARGET is fine, and only acceptance collapses to ~1.0 --
-    # which reads as a plausible accuracy verdict on the quantisation. Defer instead.
-    if _head_is_empty(rows, rsc):
-        lp._apply_head = types.MethodType(_apply_head_lazy, lp)
-        return "lm_head empty at load_weights (shared in later); quantising on first use"
-    return _quantize_head_now(lp, lm_head)
+    # AFTER load_weights returns, so at this point the parameter is not yet the weight we want.
+    # Quantising it yields a garbage head, and the failure is silent and total: the serve comes up,
+    # text stays coherent because the TARGET is fine, and only acceptance collapses to ~1.0 --
+    # which reads as a plausible accuracy verdict on the quantisation.
+    #
+    # This deferred only when the parameter sniffed as all-zero, which was load-bearing and wrong:
+    # it held only because a fresh torch.empty() happened to hand back zeroed pages. Measured
+    # 2026-09-18 -- a loader that allocated and freed fp32 temporaries before the drafter loaded
+    # dirtied the caching allocator, the not-yet-shared parameter came back non-zero, the sniff
+    # said "populated", and acceptance fell 7.63 -> 1.01 (draft accept 94.7% -> 0.1%, decode
+    # 320 -> 47 tok/s) with GSM8K unmoved at 97.2%, i.e. invisible to every accuracy gate.
+    #
+    # So defer unconditionally. _apply_head_lazy takes the head as an ARGUMENT and is therefore
+    # guaranteed the populated tensor; it already falls back to the stock GEMM if that is somehow
+    # still empty. Costs one stock-GEMM call on the first draft. This is the branch every dflash
+    # serve already took anyway -- the sniff returned True in production -- so it narrows to the
+    # exercised path rather than adding a new one.
+    lp._apply_head = types.MethodType(_apply_head_lazy, lp)
+    return "deferred to first use (the weight a drafter scores against is shared in later)"
 
 
 # int2 buffers keyed by the bf16 weight they were derived from. DFlash2 shares ONE lm_head between
