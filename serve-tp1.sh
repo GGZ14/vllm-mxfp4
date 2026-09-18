@@ -5,5 +5,7 @@
 #   ./serve-tp1.sh --enforce-eager      # extra args go straight to vllm serve
 # All serve-mxfp4.sh knobs apply (MAXSEQS, MAXLEN, CHUNK, SPEC, DETACH, PORT, ...). See README.md.
 # TP=1 turns on the single-GPU profile automatically: fp16 ssm cache, MAXLEN 65536, CHUNK 4096,
-# libr4d rx10 with lazy GDN snapshots and the fp8 stream at TP=1. SINGLE_GPU_PROFILE=0 turns it off.
+# libr4d rx9 (narrow-state GDN kernels) and the fp8 stream at TP=1. SINGLE_GPU_PROFILE=0 turns it
+# off. Lazy GDN snapshots (RADIANCE_GDN_LAZY, rx10) are OFF by default -- they corrupt multi-turn
+# chat; see the note at serve-mxfp4.sh's RADIANCE_GDN_LAZY block.
 exec env TP=1 "$(cd "$(dirname "$0")" && pwd)/serve-mxfp4.sh" "$@"
