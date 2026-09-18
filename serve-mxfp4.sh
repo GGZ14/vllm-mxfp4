@@ -81,8 +81,9 @@ Everything is an environment variable; these are the ones worth knowing.
                             _DRAFTER=0 leaves the DFlash2 drafter unpadded (A/B lever)
   GPUS=0,1                  HIP indices to serve on; defaults to every card with enough VRAM
   SINGLE_GPU_PROFILE=auto   at TP=1 only: fp16 ssm cache (halves the 1648-token attention
-                            block, C8 +59%), maxlen 65536, chunk 4096, capture sizes capped
-                            at MAXSEQS*(SPEC+1), libr4d rx9 (narrow-state GDN kernels).
+                            block, C8 +59%), maxseqs 3, maxlen 220000, chunk 2560 (the
+                            long-context shape; see kv-profiles.tsv for its KV pin), capture
+                            sizes capped at MAXSEQS*(SPEC+1), libr4d rx9 (narrow-state GDN).
                             0 disables; 1 forces it at any TP (untested above TP=1 --
                             the win does not transfer by inspection)
   RADIANCE_FP8_STREAM_TP1=1 at TP=1 only: the fp8 residual-stream epilogues without an
@@ -651,6 +652,14 @@ if [ "$SINGLE_GPU_PROFILE" = auto ]; then
   if [ "$TP" = 1 ]; then SINGLE_GPU_PROFILE=1; else SINGLE_GPU_PROFILE=0; fi
 fi
 if [ "$SINGLE_GPU_PROFILE" = 1 ]; then
+  # Concurrency cap. 3 is the long-context shape: it is what the 220000/2560 KV pin below was
+  # reported at, and a smaller batch frees both cudagraph capture sizes and mamba state slots for
+  # the KV pool. NOTE THE TRADE: the fp16 mamba cache took TP=1 from 3 to 6 concurrent
+  # (C8 +59%, TTFT -76%, 2026-09-16) and capping at 3 hands that back. MAXSEQS=8 restores the
+  # throughput shape -- the KV pin then no longer matches the batch shape and vLLM falls back to
+  # profiling, which is safe.
+  # Set BEFORE the CAPTURE_SIZES derivation below, which reads it.
+  [ -z "${MAXSEQS:-}" ] && MAXSEQS=3
   # Capture sizes above MAXSEQS*(SPEC+1) are unreachable -- the decode batch is at most one row
   # per sequence per speculative token -- and cost 1.05 GiB of CUDA graphs carved out of a pool
   # the profiler has already promised to the KV cache. DERIVED, not hardcoded: MAXSEQS=8 SPEC=7
@@ -664,14 +673,22 @@ if [ "$SINGLE_GPU_PROFILE" = 1 ]; then
   fi
   # 8192-token chunks peak at 2.74 GiB of activation against a TP=1 pool that is ALREADY
   # over-committed (vLLM asks for 2.51 GiB of KV and the profiler hands out 4.91). 4096 costs
-  # nothing measurable (C8 162.0 vs 160.9; prefill within 1%) and returns the headroom.
-  [ -z "${_SET_CHUNK:-}" ] && CHUNK=4096
+  # nothing measurable (C8 162.0 vs 160.9; prefill within 1%) and returns the headroom; 2560
+  # returns more of it again and is the chunk the 220000 pin below was reported at. The cost is
+  # prefill transient size, not throughput -- but 2560 has NOT been benchmarked here the way 4096
+  # was. If long context is not what you want, CHUNK=4096 is the measured setting.
+  [ -z "${_SET_CHUNK:-}" ] && CHUNK=2560
   # Context: the two-card default (262144) does not fit one 32 GiB card next to a 27B target plus
   # the drafter -- the NVFP4 prod checkpoint (bf16 lm_head) left 0.89 GiB of KV at 262144 and
   # 1.14 GiB at 65536 (needs 2.85), the native MXFP4 checkpoint serves 65536 with ~70-79k KV
-  # tokens (2026-09-16, GPU_UTIL 0.95). 65536 is what the single-card measurements were made at;
-  # an explicit MAXLEN still wins.
-  [ -z "${_SET_MAXLEN:-}" ] && MAXLEN=65536
+  # tokens (2026-09-16, GPU_UTIL 0.95). 65536 is what every single-card THROUGHPUT measurement
+  # was made at.
+  #
+  # 220000 is the long-context shape, and it leans entirely on the explicit KV pin in
+  # kv-profiles.tsv for (seqs=3, chunk=2560, maxlen=220000): ~220k KV tokens at a 9.13 GB pin.
+  # That pin is REPORTED, not measured on this host -- see the note on its row. An explicit
+  # MAXLEN still wins, and any MAXLEN other than 220000 drops back to vLLM profiling.
+  [ -z "${_SET_MAXLEN:-}" ] && MAXLEN=220000
   # The lever. EXTRA precedes PASSTHRU on the command line, so an explicit --mamba-*-cache-dtype
   # from the caller still wins; skip ours entirely if they named either one.
   # The CONV state is bf16, not float16: --mamba-cache-dtype sets the conv state's dtype and the
