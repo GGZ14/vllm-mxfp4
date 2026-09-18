@@ -272,10 +272,30 @@ FP8S=${RADIANCE_FP8_STREAM:-1}
 TP=${TP:-$RAD_TP}
 # RADIANCE_GDN_LAZY (2026-09-17): lazy GDN state snapshots -- one base state + a candidate stash
 # per sequence instead of a snapshot per draft token, so a request holds 3 mamba pages per layer
-# group instead of 2+SPEC (radiance_gdn_lazy.py, patch_gdn_lazy.py, libr4d rx10). Default ON
-# only inside the single-GPU profile; TP>=2 never applies the patch, never loads rx10.
+# group instead of 2+SPEC (radiance_gdn_lazy.py, patch_gdn_lazy.py, libr4d rx10).
+#
+# DEFAULT OFF since 2026-09-17: lazy CORRUPTS MULTI-TURN CHAT. Measured on this box, one scripted
+# 25-question x 2-round conversation, chat endpoint, temperature 0, seed 1234, the SAME harness on
+# both legs, rx10 pinned on both and the pair path forced on both, so RADIANCE_GDN_LAZY was the
+# only variable:
+#     lazy=1   10/50 turns healthy, 35 empty replies, one 198-token repeat loop (first failure at
+#              turn 5, 3298 tokens of context); output "This This This ... XH X X X"
+#     lazy=0   49/50 turns healthy, 0 empty, 0 loops
+# It is NOT a long-context bug: single-shot completions, needle retrieval at 8k/12k/32k and
+# fp16-vs-fp32 state all read clean. It needs MULTI-TURN chat (the reporting session ran 73-77%
+# prefix-cache hits against ~8% for every single-shot gate). Prime suspect is gdn_lazy_materialize
+# mode 1, which fails OPEN: a stash whose magic or base_slot does not match replays NOTHING and
+# writes an aligned checkpoint silently missing `count` tokens -- which is what a prefix hit then
+# restores from. RADIANCE_GDN_LAZY=1 still turns it on for debugging that.
+#
+# The cost of this default is concurrency, not speed: lazy holds 3 mamba pages per request
+# instead of 9, and single-stream decode and prefill were measured at PARITY, so a one-user card
+# loses ~nothing. The 2026-09-17 row in PERFORMANCE.md recorded conc-8 337 (eager) -> 420 (lazy)
+# and a 77k -> 99k KV pool, but a same-card re-measure on the current launcher reads EAGER at
+# conc-8 405.6 t/s with 140,036 KV tokens -- those baseline figures predate the measured
+# --kv-cache-memory pin and overstate the gap. Being re-measured; see PERFORMANCE.md.
 if [ -z "${RADIANCE_GDN_LAZY:-}" ]; then
-  if [ "$TP" = 1 ] && [ "${SINGLE_GPU_PROFILE:-auto}" != 0 ]; then GDN_LAZY=1; else GDN_LAZY=0; fi
+  GDN_LAZY=0
 else
   GDN_LAZY=$RADIANCE_GDN_LAZY
 fi

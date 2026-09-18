@@ -282,7 +282,7 @@ gated on TP=1 so a two-card serve is byte-identical to before:
 | Context | `MAXLEN` defaults to **65,536**: the two-card default (262,144) does not fit next to a 27B target plus the drafter on 32 GiB |
 | Attention KV cache | **fp8**, exactly as at TP=2 (`--kv-cache-dtype fp8`) |
 | GDN recurrent state | the mamba-style temporal state (not the KV cache) is stored fp16 and its conv window bf16 instead of fp32; vLLM allows no fp8 there. The GDN page halves, so vLLM's attention block halves (1648 -> 880 tokens) and the per-request floor with it |
-| Lazy GDN snapshots | `RADIANCE_GDN_LAZY=1` (libr4d rx10): one base state plus a candidate stash per request instead of one state per draft token. A request holds 3 mamba pages per layer group instead of 9, which is what lets 8 streams run at once instead of 5-6 |
+| Lazy GDN snapshots | `RADIANCE_GDN_LAZY=1` (libr4d rx10): one base state plus a candidate stash per request instead of one state per draft token, so a request holds 3 mamba pages per layer group instead of 9. **OFF by default since 2026-09-17: it corrupts multi-turn chat** (repeat loops and empty replies from ~5 turns in; see the env table). Kept for debugging that |
 | Kernels | the decode GEMM width cap covers the unsharded `gate_up` (34816 wide) so it takes the decode kernel, not the prefill tile; the fp8 residual-stream epilogues install without an all-reduce (`RADIANCE_FP8_STREAM_TP1`); the fused GDN step routes at 48 heads |
 | Batch | `CHUNK` 4096, cudagraph capture sizes capped at `MAXSEQS*(SPEC+1)`, KV pin from the `1x7551-32624` row of `kv-profiles.tsv` |
 
@@ -509,7 +509,7 @@ of overrides produces without running it.
 | `KV_MEM` | `auto` | KV cache size. `auto` looks up a measured pin and falls back to profiling; `<bytes>` pins explicitly; `0` forces profiling. Consulted only at `GPU_UTIL=0.98`. Worth 892,799 -> 943,581 tokens on the R9700 pair. See [KV cache calibration](#kv-cache-calibration) |
 | `TP` / `GPUS` | auto | Tensor-parallel size and the HIP indices to serve on. `TP=3` is explicit; see [TP=3](#tp3-explicit) |
 | `SINGLE_GPU_PROFILE` | `auto` (on iff TP=1) | One-card serve: fp16 ssm cache + bf16 conv cache (880-token attention block, concurrency 3 -> 6), MAXLEN 65536, CHUNK 4096, capture sizes capped at MAXSEQS*(SPEC+1), libr4d rx9 (narrow-state GDN kernels), fused GDN step at 48 items. `0` disables, `1` forces at any TP (unmeasured above TP=1) |
-| `RADIANCE_GDN_LAZY` | `1` in the single-GPU profile, else `0` | Lazy GDN state snapshots under speculative decode: one base state + a candidate stash per sequence instead of a snapshot per draft token, so a request holds 3 mamba pages per layer group instead of 9. Needs libr4d rx10 (auto) and applies patch_gdn_lazy.py inside the container. Own cache suffix `-lz`. Never applied at TP>=2 |
+| `RADIANCE_GDN_LAZY` | `0` | Lazy GDN state snapshots under speculative decode: one base state + a candidate stash per sequence instead of a snapshot per draft token (3 mamba pages per request instead of 9). **Default OFF since 2026-09-17 — it corrupts multi-turn chat.** One scripted 25-question x 2-round conversation, chat endpoint, temperature 0, same harness both legs, rx10 pinned and the pair path forced on both so the flag was the only variable: `lazy=1` 10/50 turns healthy, 35 empty replies, one 198-token repeat loop (first failure at turn 5, 3,298 tokens of context); `lazy=0` 49/50 healthy, 0 empty, 0 loops. Not a long-context bug — single-shot completions and needle retrieval at 8k/12k/32k read clean; it needs multi-turn chat with prefix-cache hits. Set to `1` only to debug it. Needs libr4d rx10 (auto) and applies patch_gdn_lazy.py; own cache suffix `-lz`. Never applied at TP>=2 |
 | `RADIANCE_FP8_STREAM_TP1` | `1` | TP=1 only: the fp8 residual-stream epilogues (residual add + norm + quant, silu*up + quant, GDN norm + quant) installed without an all-reduce. Own compile-cache suffix `-tp1s`. Never read at TP>=2 |
 | `RADIANCE_TP_PAD` | `3` at TP=3, else `0` | The dummy-head padding itself. `3` at TP=1/2 runs the validation gates; `_INTERMEDIATE=17408` keeps the MLP stock, `_DRAFTER=0` leaves the DFlash2 drafter unpadded, `_STRICT=0` demotes a weight-coverage mismatch to a warning |
 | `MIN_GPU_MIB` | `8192` | VRAM floor for "usable". Lower it to admit a small card, raise it to skip one |
@@ -710,7 +710,7 @@ this table. Prefill throughput keeps falling with depth in both.
 
 BetterBench `--quick` (5 passes per category, 8 per prefill depth, 48 requests per concurrency
 level), `2026-09-16`, one R9700 at the box's standing 210 W cap and -75 mV, `./serve-tp1.sh`
-defaults (lazy GDN snapshots, `MAXSEQS=8`, 65,536 context), native MXFP4 checkpoint.
+defaults (`MAXSEQS=8`, 65,536 context; lazy GDN snapshots are OFF), native MXFP4 checkpoint.
 
 | Category | TTFT p50 (ms) | update p50 (ms) | tok/update | decode t/s |
 |---|--:|--:|--:|--:|
@@ -986,7 +986,7 @@ modules the recipes do not pre-bake).
 | `setup-mxfp4.sh` | One-time setup: host check, image, checkpoints, kernels. Idempotent |
 | `serve-mxfp4.sh` | The launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds, `DETACH=1` to background it |
 | `serve-tp1.sh`, `serve-tp2.sh`, `serve-tp3.sh` | One-line wrappers that pin the tensor-parallel size; everything else passes through |
-| `patch_gdn_lazy.py`, `radiance_gdn_lazy.py` | Lazy GDN state snapshots for one-card serves (`RADIANCE_GDN_LAZY`): the vLLM patch and the materialize glue. Applied only at TP=1 |
+| `patch_gdn_lazy.py`, `radiance_gdn_lazy.py` | Lazy GDN state snapshots (`RADIANCE_GDN_LAZY`, default OFF — corrupts multi-turn chat): the vLLM patch and the materialize glue. Applied only when the knob is set, and only at TP=1 |
 | `r4d_radiance_extras{,_rx9,_rx10}.patch` | This repo's libr4d additions on top of the pinned commit: rx6 (TP>=2), rx9 (narrow-state GDN, TP=1), rx10 (rx9 + lazy snapshots, TP=1) |
 | `docker-compose-setup.sh` | Writes the `.env` `docker-compose.yml` needs on this host (GPU group ids, HIP indices, paths), and optionally fetches the FP8 checkpoint |
 | `gpu-detect.sh` | GPU/TP/KV detection, sourced by the launcher. Run it directly to see what it finds |
