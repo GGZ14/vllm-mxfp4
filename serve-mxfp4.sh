@@ -87,6 +87,9 @@ Everything is an environment variable; these are the ones worth knowing.
                             the win does not transfer by inspection)
   RADIANCE_FP8_STREAM_TP1=1 at TP=1 only: the fp8 residual-stream epilogues without an
                             all-reduce (radiance_arnq). Own cache suffix (-tp1s)
+  RADIANCE_GDN_LAZY=0       lazy GDN state snapshots (libr4d rx10). DEFAULT OFF: they corrupt
+                            multi-turn chat (repeat loops / empty replies from ~5 turns in).
+                            Set to 1 only to debug that; never applied at TP>=2.
   MIN_GPU_MIB=8192          VRAM floor for "usable"; excludes iGPUs from the count
   KV_MEM=auto               KV cache size: auto uses a pin measured for your hardware if
                             kv-profiles.tsv has one and lets vLLM profile if not; <bytes> pins

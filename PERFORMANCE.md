@@ -23,7 +23,7 @@ same wall time.
 
 | Change | Measured | Gate |
 |---|---|---|
-| **TP=1 lazy GDN state snapshots, 2026-09-17** (`RADIANCE_GDN_LAZY`, on only in the single-GPU profile; libr4d **rx10**, patch_gdn_lazy.py, radiance_gdn_lazy.py) -- one base state per sequence plus a per-head stash of the last step's candidate inputs, replayed on the next step (`gdn_lazy_update`), and a `gdn_lazy_materialize` kernel that stands in for vLLM's two align-mode temporal-state copies (pre-forward migration at a window shift, post-step checkpoint at a block boundary) as base + replay. A request holds **3** mamba pages per layer group instead of 2+SPEC = 9 | One R9700, MXFP4-mtpfp8, 65536 ctx, lazy vs the eager TP=1 config of 09-16: decode-step 35.0/36.9/38.4 vs 35.7/37.2/38.9 ms at 0/8k/32k (parity); prefill same-card 3104/3048/3041/2860/2647 vs 3150/3085/3070/2881/2668 PP t/s (-1.5%); concurrency agg 117/205/313/**420** vs 112/199/304/337 at 1/2/4/8, C8 TTFT p50 **0.17 s vs 2.8 s**; MAXSEQS=16: C16 **487 t/s** (TTFT p50 0.53 s), C8 unchanged. KV pool 99k vs 77k tokens at MAXSEQS 8. Shipped default (lazy, MAXSEQS 8) BetterBench --quick on card 0: combined decode **137.7 t/s**, update p99 35.7 ms, TTFT p50 ~95 ms; per-category decode chat 81 / code 145 / file_edit 166 / json 184 / math 169 / prose 79 / reasoning 121 / summarization 138; concurrency 117/208/319/416; prefill 2737/2720/2778/2651/2480. Kernel: eager16 vs lazy16 us/layer 17.5/17.5 (1x8), 68/82 (8x5), 166/117 (8x8), 180/119 (16x4). TP>=2 untouched: patch not applied, rx6 kept, cache dir unchanged | lazy vs eager harness: fp32 state bit-identical over 12 steps of random acceptance; align-mode simulation with 6 window shifts + 6 checkpoints agrees to 1e-7; 3000-token generation across boundaries clean, zero fallbacks/errors; GSM8K 250q greedy conc-8 **97.60%** at MAXSEQS 8 and **98.40%** at MAXSEQS 16 (eager side 98.40%, baseline 98.00%; the day's band is 97.6-98.4). Note the two cards differ ~12% on prefill under the same 210 W cap (card 0 runs hotter): compare prefill same-card only |
+| **TP=1 lazy GDN state snapshots, 2026-09-17 — REVERTED 2026-09-17, see the note below this table** (`RADIANCE_GDN_LAZY`, now DEFAULT OFF; libr4d **rx10**, patch_gdn_lazy.py, radiance_gdn_lazy.py) -- one base state per sequence plus a per-head stash of the last step's candidate inputs, replayed on the next step (`gdn_lazy_update`), and a `gdn_lazy_materialize` kernel that stands in for vLLM's two align-mode temporal-state copies (pre-forward migration at a window shift, post-step checkpoint at a block boundary) as base + replay. A request holds **3** mamba pages per layer group instead of 2+SPEC = 9 | One R9700, MXFP4-mtpfp8, 65536 ctx, lazy vs the eager TP=1 config of 09-16: decode-step 35.0/36.9/38.4 vs 35.7/37.2/38.9 ms at 0/8k/32k (parity); prefill same-card 3104/3048/3041/2860/2647 vs 3150/3085/3070/2881/2668 PP t/s (-1.5%); concurrency agg 117/205/313/**420** vs 112/199/304/337 at 1/2/4/8, C8 TTFT p50 **0.17 s vs 2.8 s**; MAXSEQS=16: C16 **487 t/s** (TTFT p50 0.53 s), C8 unchanged. KV pool 99k vs 77k tokens at MAXSEQS 8. Shipped default (lazy, MAXSEQS 8) BetterBench --quick on card 0: combined decode **137.7 t/s**, update p99 35.7 ms, TTFT p50 ~95 ms; per-category decode chat 81 / code 145 / file_edit 166 / json 184 / math 169 / prose 79 / reasoning 121 / summarization 138; concurrency 117/208/319/416; prefill 2737/2720/2778/2651/2480. Kernel: eager16 vs lazy16 us/layer 17.5/17.5 (1x8), 68/82 (8x5), 166/117 (8x8), 180/119 (16x4). TP>=2 untouched: patch not applied, rx6 kept, cache dir unchanged | lazy vs eager harness: fp32 state bit-identical over 12 steps of random acceptance; align-mode simulation with 6 window shifts + 6 checkpoints agrees to 1e-7; 3000-token generation across boundaries clean, zero fallbacks/errors; GSM8K 250q greedy conc-8 **97.60%** at MAXSEQS 8 and **98.40%** at MAXSEQS 16 (eager side 98.40%, baseline 98.00%; the day's band is 97.6-98.4). Note the two cards differ ~12% on prefill under the same 210 W cap (card 0 runs hotter): compare prefill same-card only |
 | **TP=1 (single card) pass, 2026-09-16** -- decode-kernel width cap 32768 -> 36864 (TP=1 gate_up is N=34816 and every decode call of it ran the folded prefill tile: 400 vs 158 us at M=8); fp8 residual-stream epilogues installed at TP=1 without an all-reduce (`RADIANCE_FP8_STREAM_TP1`, 64 mid + 63 down + 64 act + 48 GDN sites); libr4d **rx9** = rx6 + narrow-state GDN decode kernels so the fp16 ssm cache no longer declines every GDN layer to FLA (conv state bf16, ssm fp16); fused GDN step routed at 48 items (one sequence at H=48); silu-mul-quant epilogue widened to N<=20480 (512-thread block); launcher `GPUS=<n>` device re-indexing fix; MAXLEN 65536 default at TP=1; TP=1 KV pin measured on the NVFP4 checkpoint (calibrate-kv.sh `KV_START`, kv-profiles.tsv row `1x7551-32624`: 6.09 GiB/GPU, ~140k tokens at 65536 where the profiler itself could not reach the 2.85 GiB minimum) | BetterBench paired A/B, 200 interleaved pairs, one R9700 per side, MXFP4-mtpfp8 ckpt, 65536 ctx: decode **74.3 -> 134.8 t/s (+81%, CI +78..+85)**, update gap 63.9 -> 35.4 ms; combined decode 75.4 -> **138.7**; prefill PP t/s **same-card (card 1)** 2618/2515/2473/2348/2191 -> **3150/3085/3070/2881/2668** (+20..+24%, the baseline's GDN prefill was on the FLA fallback; the first cross-card reading of +31..+41% was inflated by card 0 running ~12% slower on prefill under the same 210 W cap); concurrency agg 65/117/188/194 -> **116/202/312/308** t/s at 1/2/4/8, C8 TTFT p50 6.3 -> 4.3 s; bench_decode_ctx 64.2/66.6/68.1 -> 35.7/37.2/38.9 ms/step at 0/8k/32k. Split-K rule re-measured on every TP=1 shape: already optimal, unchanged. TP=2 byte-identical by construction (dry-run diff: only two inert env knobs) | GSM8K 250q greedy conc-8 on the candidate: **98.40%** (246/250, 0 errors, 1 truncated) vs the baseline side 98.00% (245/250) -- same band; kernel epilogues bit-identical to the traced path (unchanged kernels); GDN fp32 path unchanged (rx9 fp32 code = rx6) |
 | Decode launch-gap stack: traced quant, fp8 residual stream, fused AR epilogue (`db9dba6`) | **25.4 -> 22.66 ms/step**; decode launches 1477 -> ~1080/step; weighted single-stream +14%, conc-8 aggregate +24% | GSM8K 500q 97.8, paired sign test p=0.219; epilogue kernels bit-identical to the traced reference |
 | Dynamic verify width (`f68d215`) | conc-8 steps 52-57 -> **46-47 ms**, aggregate 391-413 -> 444-461 t/s (**+11-13%**); single-stream a wash | Lossless by construction: speculative verification preserves the output distribution at any proposal length |
@@ -37,6 +37,47 @@ same wall time.
 | GDN `in_proj` single-GEMM merge (`588d5e6`) | single-stream 26.25 -> **25.50 ms/step** (-2.9%), -6.5% stacked with `WPERM=1`; removes 96 GEMM launches and 48 activation quants per forward | GSM8K 500q paired; drift is split-K reassociation only |
 | GDN decode conv+recurrent fused into one launch (`9a84208`) | 25.01 -> **24.91 ms/step** (-0.4%) | **Bit-identical**: 4/4 byte-equal greedy completions |
 | Decode band extended to M<=128 (`44d48f0`, opt-in at `MAXSEQS>8`) | conc-16 **549-622 t/s** at 75-79 ms steps, +30% over the pre-extension attempt | dks1 bit-identical to the folded tile at every shape and M in {72, 96, 127, 128} |
+
+### Correction: lazy GDN snapshots were reverted the day they shipped
+
+The row above is kept because it records what was measured, but the change is **off by default
+since 2026-09-17**: lazy GDN snapshots corrupt multi-turn chat. Replies decay over turns, then
+collapse into empty completions and hard repeat loops. Controlled A/B — one scripted 25-question
+x 2-round conversation on the chat endpoint, temperature 0, seed 1234, the same harness on both
+legs, rx10 pinned on both and the pair path forced on both, so the flag was the only variable:
+
+| leg | turns healthy | empty replies | repeat loops | first failure |
+|---|--:|--:|--:|---|
+| `RADIANCE_GDN_LAZY=1` | 10/50 | 35 | 1 (198 tokens) | turn 5, 3,298 tokens of context |
+| `RADIANCE_GDN_LAZY=0` | 49/50 | 0 | 0 | none |
+
+The shipped eager path (rx9, fused-items 48 live) was gated separately: 24/25 turns healthy, 0
+empty, 0 loops, conversation carried to 15,603 tokens.
+
+**Why the original gate missed it.** It is not a long-context bug. Single-shot completions, needle
+retrieval at 8k/12k/32k (lazy and eager fail on the *identical* six cases, Fisher p = 1.0) and
+fp16-vs-fp32 state all read clean. The failure needs multi-turn chat: the reporting session ran
+73-77% prefix-cache hits, against ~8% for every single-shot gate in this document. Judge a state
+cache with a multi-turn conversation, never a needle or a single completion.
+
+**Prime suspect, not yet proven:** `gdn_lazy_materialize` mode 1 fails open — a stash whose magic
+or `base_slot` does not match replays nothing and writes an aligned checkpoint silently missing
+`count` tokens, which is what a prefix hit then restores from. The stash's only validity check is
+a physical block id, and block ids are recycled across turns.
+
+**The concurrency figures in the row above do not reproduce.** They were taken before the measured
+`--kv-cache-memory` pin existed. BetterBench `--quick`, same card, one R9700, current launcher,
+**eager** (the new default):
+
+| | 1 | 2 | 4 | 8 |
+|---|--:|--:|--:|--:|
+| aggregate t/s | 114.7 | 205.8 | 303.3 | 405.6 |
+| TTFT p50 (ms) | 93.8 | 135.5 | 146.5 | 174.3 |
+
+Prefill 2,738 / 2,721 / 2,795 / 2,666 / 2,494 PP t/s at 2k / 8k / 16k / 32k / 64k; KV pool
+**140,036 tokens**. So eager reads 405.6 at conc-8 against the 337 recorded above, with a *larger*
+KV pool than lazy's recorded 99k. The paired lazy leg was abandoned once the flag was reverted, so
+no lazy-vs-eager delta is claimed here.
 
 ## Two results worth carrying forward
 
