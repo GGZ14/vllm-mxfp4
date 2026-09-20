@@ -991,9 +991,9 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_REFLINEAR="${RADIANCE_MXFP4_REFLINEAR:-0}" \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor -e TRITON_CACHE_DIR=/cache/triton \
   -e AITER_ROOT_DIR=/cache/aiter -e TRITON_CACHE_AUTOTUNING=1 \
-  -v "${HF_CACHE:-$HOME/.cache/huggingface}":/root/.cache/huggingface \
-  -v "$MODELS":/models \
-  -v "$CACHE":/cache \
+  -v "${HF_CACHE:-$HOME/.cache/huggingface}":/root/.cache/huggingface:z \
+  -v "$MODELS":/models:z \
+  -v "$CACHE":/cache:z \
   -v "${PATCHES:-$SCRIPT_DIR}":/patches:z \
   ${CT_MOUNT[@]+"${CT_MOUNT[@]}"} \
   ${R4D_SO:+-v "$R4D_SO":/r4d:z} \

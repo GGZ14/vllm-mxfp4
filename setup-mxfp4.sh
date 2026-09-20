@@ -114,8 +114,8 @@ hf_get() { # repo [local-dir]
   "$RUNTIME" run --rm --network=host \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_TOKEN="${HF_TOKEN:-}" \
-    -v "$HF_CACHE":/root/.cache/huggingface \
-    -v "$MODELS":/models \
+    -v "$HF_CACHE":/root/.cache/huggingface:z \
+    -v "$MODELS":/models:z \
     --entrypoint python3 "$IMAGE" -c '
 import sys
 from huggingface_hub import snapshot_download
@@ -158,8 +158,8 @@ else
     python3 "$SCRIPT_DIR/fp8_mtp.py" "$SRC" "$SNAP"
   else
     "$RUNTIME" run --rm \
-      -v "$HF_CACHE":/root/.cache/huggingface \
-      -v "$MODELS":/models \
+      -v "$HF_CACHE":/root/.cache/huggingface:z \
+      -v "$MODELS":/models:z \
       -v "$SCRIPT_DIR":/repo:z \
       --entrypoint python3 "$IMAGE" /repo/fp8_mtp.py "$CSRC" "$CSNAP"
   fi
