@@ -381,6 +381,17 @@ SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
 RAM_TIER_BYTES=25769803776 ./serve-mxfp4.sh     # 24 GiB tier for the 27B
 ```
 
+### Slow starts: one HIP hardware queue
+
+With HIP's default of 4 hardware queues, vLLM's async output-copy stream gets a queue of its own.
+On some starts the firmware puts that queue on the same pipe as the model's queue, and for the life of
+the process every decode step runs at 43-44 ms instead of 35 (about 20% fewer tok/s on the 27B at
+TP=1). `serve-mxfp4.sh` now passes `GPU_MAX_HW_QUEUES=1` (`RADIANCE_HW_QUEUES`, default 1), which keeps
+the copy on the model's queue: 0 slow starts in 22, against 1 in 19 stock. After a llama.cpp HIP run,
+6 stock starts in a row came up slow on the same R9700. It costs nothing measurable: same KV pool,
++0.07 ms/step, ~100 MiB more free VRAM. `RADIANCE_HW_QUEUES=0` restores HIP's default. It is tested at
+TP=1 only; re-check at TP>1, where RCCL adds streams of its own.
+
 ### Serving something other than MXFP4
 
 `docker-compose.yml` serves **Qwen3.8-27B-FP8** and is the path for the FP8 and Gemma checkpoints.
