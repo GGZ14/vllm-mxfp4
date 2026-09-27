@@ -12,11 +12,19 @@
 #   MOE_FIXES=1       1: experts weight-only on the AITER a16w4 lane (patch_quark_moe_w4a16.py,
 #                     patch_gfx12_aiter_a16w4.py) + split-KV verify attention (patch_attn_3d_multiq.py).
 #                     0: stock vLLM, i.e. the EMULATION MoE backend on gfx1201 (~5x slower decode).
+#   MOE_PREFILL_ATTN=r4d  prefill attention with MOE_FIXES=1 (patch_moe_prefill_attn.py):
+#                     r4d: R4D backend for the model and the MTP drafter; libr4d's prefill kernel built at
+#                          GQA 8 (moe-r4d/) serves runs >= 17 tokens, stock Triton split-KV the rest
+#                          (decode, verify). ~6x lower TTFT at 16k. Needs a libr4d checkout (below).
+#                     off: TRITON_ATTN for everything, as before.
+#   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d; cloned from R4D_REPO at
+#                     R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
+#   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
 #   RAM_TIER_BYTES=0  host-RAM KV cache tier in bytes (OffloadingConnector); 0 = off. Lives in /dev/shm.
 #   SPEC=8            MTP draft tokens; 0 disables speculation
 #   MAXLEN=65536  MAXSEQS=8  CHUNK=4096  GPU_UTIL=0.95  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
-#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-rt]   compile cache; never share one across knobs
+#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-rt]   compile cache; never share one across knobs
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -39,6 +47,11 @@ MOE_FIXES=${MOE_FIXES:-1}; RAM_TIER_BYTES=${RAM_TIER_BYTES:-0}; SPEC=${SPEC:-8}
 MAXLEN=${MAXLEN:-65536}; MAXSEQS=${MAXSEQS:-8}; CHUNK=${CHUNK:-4096}; GPU_UTIL=${GPU_UTIL:-0.95}
 PORT=${PORT:-8080}; NAME=${NAME:-radiance-moe}; GPUS=${GPUS:-0}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
+PA=${MOE_PREFILL_ATTN:-r4d}; HWQ=${RADIANCE_HW_QUEUES:-1}
+case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)" ;; esac
+[ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
+R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
+R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
 
 # A Hugging Face cache snapshot holds symlinks into ../../blobs: mount the whole hub dir, at the same
 # path, so they resolve. Anything else mounts just the checkpoint.
@@ -47,7 +60,8 @@ MODEL_ID=$(basename "$SNAP")
 case "$SNAP" in */snapshots/*) MODEL_ID=$(basename "$(dirname "$(dirname "$SNAP")")" | sed 's/^models--//; s#--#/#') ;; esac
 SERVED_NAMES=${SERVED_NAMES:-$(basename "$MODEL_ID")}
 
-CACHE_SUF="-f$MOE_FIXES"; [ "$RAM_TIER_BYTES" != 0 ] && CACHE_SUF="$CACHE_SUF-rt"
+CACHE_SUF="-f$MOE_FIXES"; [ "$PA" != off ] && CACHE_SUF="$CACHE_SUF-pa$PA"
+[ "$RAM_TIER_BYTES" != 0 ] && CACHE_SUF="$CACHE_SUF-rt"
 CACHE=${CACHE:-$HOME/.radiance-cache-moe-$(echo "$MODEL_ID" | tr '/' '_')$CACHE_SUF}
 mkdir -p "$CACHE"/vllm "$CACHE"/inductor "$CACHE"/triton "$CACHE"/aiter
 
@@ -77,25 +91,41 @@ if [ "$RAM_TIER_BYTES" != 0 ]; then
   fi
   TIER=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$RAM_TIER_BYTES}}")
 fi
+BACKEND=TRITON_ATTN; R4D_MNT=()
+if [ "$PA" = r4d ]; then
+  BACKEND=R4D
+  if [ ! -f "$R4D_SRC/r4d_attn_prefill_h256_gqa6.hip" ]; then
+    echo "[serve-moe] cloning libr4d $R4D_VERSION into $R4D_SRC (once)"
+    git clone -q --depth 1 -b "$R4D_VERSION" "$R4D_REPO" "$R4D_SRC" \
+      || die "could not clone $R4D_REPO at $R4D_VERSION" "point R4D_SRC at a libr4d $R4D_VERSION checkout, or set MOE_PREFILL_ATTN=off"
+  fi
+  R4D_MNT=(-v "$(cd "$R4D_SRC" && pwd)":/r4dsrc:ro)
+fi
 SPEC_ARGS=()
 if [ "$SPEC" != 0 ]; then
-  SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true}")
+  SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$BACKEND\",\"disable_padded_drafter_batch\":true}")
 fi
 # patch_offload_mamba_eagle.py is what makes the RAM tier load on a hybrid model under speculation,
 # so it runs with or without the MoE fixes (inert when no connector is configured).
 if [ "$MOE_FIXES" = 1 ]; then
   PRE="python3 patch_quark_moe_w4a16.py && python3 patch_gfx12_aiter_a16w4.py && python3 patch_attn_3d_multiq.py && python3 patch_offload_mamba_eagle.py"
   FIX_ENV=(-e RADIANCE_MOE_W4A16=1 -e RADIANCE_MOE_BACKEND=aiter -e RADIANCE_ATTN_3D_MAX_Q=16)
+  if [ "$PA" = r4d ]; then
+    # build the GQA-8 prefill module with the image's hipcc (a few seconds), then install it
+    PRE="R4D_SRC=/r4dsrc OUT=/cache/r4d_moe.so bash moe-r4d/build.sh && $PRE && python3 patch_moe_prefill_attn.py"
+    FIX_ENV+=(-e RADIANCE_MOE_PREFILL_ATTN=r4d -e RADIANCE_R4D_MOE_SO=/cache/r4d_moe.so)
+  fi
 else
   PRE="python3 patch_offload_mamba_eagle.py"
   FIX_ENV=(-e RADIANCE_MOE_W4A16=0)
 fi
 
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES ram_tier=$RAM_TIER_BYTES spec=$SPEC runtime=$RUNTIME cache=$CACHE"
+HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
-  -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro \
-  -e HIP_VISIBLE_DEVICES="$GPUS" -e ROCR_VISIBLE_DEVICES="$GPUS" -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 \
+  -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
+  ${HWQ_ENV[@]+"${HWQ_ENV[@]}"} -e HIP_VISIBLE_DEVICES="$GPUS" -e ROCR_VISIBLE_DEVICES="$GPUS" -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 -e VLLM_ROCM_USE_AITER_MHA=0 \
   -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 -e VLLM_ROCM_USE_AITER_LINEAR=0 \
   -e VLLM_ROCM_USE_AITER_FP8BMM=0 -e VLLM_ROCM_USE_AITER_FP4BMM=0 -e VLLM_ROCM_USE_AITER_RMSNORM=0 \
@@ -106,7 +136,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=
   -c 'cd /patches && eval "$RADIANCE_PRE" && cd / && exec /opt/radiance_entrypoint.sh "$@"' _ \
   "$SNAP" --served-model-name $SERVED_NAMES --host 0.0.0.0 --port "$PORT" \
   --max-num-seqs "$MAXSEQS" --max-model-len "$MAXLEN" --gpu-memory-utilization "$GPU_UTIL" \
-  --max-num-batched-tokens "$CHUNK" --kv-cache-dtype fp8 --attention-backend TRITON_ATTN \
+  --max-num-batched-tokens "$CHUNK" --kv-cache-dtype fp8 --attention-backend "$BACKEND" \
   --enable-prefix-caching --mamba-cache-mode align ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
   --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72]}' \
   --no-async-scheduling --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \

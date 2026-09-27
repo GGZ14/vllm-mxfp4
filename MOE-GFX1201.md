@@ -1,6 +1,6 @@
-# MXFP4 MoE on gfx1201, split-KV verify attention, host-RAM KV tier
+# MXFP4 MoE on gfx1201, split-KV verify attention, host-RAM KV tier, MoE prefill attention
 
-Three independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
+Four independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
 All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the published image
 `stilldeadcode/vllm-radiance:0.9.3` (vLLM 0.27.1). Each is a single run unless noted.
 
@@ -9,6 +9,7 @@ All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the publi
 | MXFP4 MoE experts on gfx1201 | `patch_quark_moe_w4a16.py`, `patch_gfx12_aiter_a16w4.py`, `serve-moe-mxfp4.sh` | on in `serve-moe-mxfp4.sh` (`MOE_FIXES=1`) |
 | Split-KV attention for spec-decode verify | `patch_attn_3d_multiq.py`, `moe-tests/test_attn_3d.py` | applied by `serve-moe-mxfp4.sh` only |
 | Host-RAM KV tier | `patch_offload_mamba_eagle.py`, `RAM_TIER_BYTES` in both launchers | off (`RAM_TIER_BYTES=0`) |
+| R4D prefill attention on the MoE lane | `patch_moe_prefill_attn.py`, `moe-r4d/` | on in `serve-moe-mxfp4.sh` (`MOE_PREFILL_ATTN=r4d`) |
 
 ## 1. MXFP4 MoE experts on gfx1201
 
@@ -145,6 +146,59 @@ The tier is one mmap'd file in `/dev/shm`, pinned for DMA. Both launchers run wi
 it comes out of the host's `/dev/shm`. They refuse to start if it doesn't fit there. It stored about
 67 KB per token, so 24 GiB holds roughly 380k tokens.
 
+## 4. Prefill attention on the MoE lane (`MOE_PREFILL_ATTN`)
+
+With the MoE fixes on, attention becomes the prefill bottleneck: on `amd/Qwen3.5-35B-A3B-MXFP4` it is
+63% of prefill GPU time at 4k and 87% at 16k. TRITON_ATTN's 2D kernel runs a prefill chunk at
+2.7 TFLOP/s at every context length, for two reasons:
+
+- **Launch config.** On gfx1201 it picks BLOCK_M 16 (2 query tokens x 8 heads per program) with
+  num_stages 2. The ISA shows 256 VGPRs, 182 of them spilled (552 B of scratch).
+- **fp8 KV is decoded in software.** Triton 3.6 has no hardware fp8 convert on this target: about 15
+  VALU ops per element plus a software f32-to-bf16 round. The same kernel on a bf16 cache is 10.5x faster.
+
+libr4d's paged prefill kernel covers this. Its GQA 6 limit is a template argument, not a design limit
+(384 rows = 48 query tokens x 8 heads per workgroup still divides), so `moe-r4d/r4d_moe.hip`
+instantiates the unchanged v0.5.0 kernel at GQA 8 as a small pybind module. `moe-r4d/build.sh`
+compiles it at container start with the image's hipcc (a few seconds) against a libr4d v0.5.0
+checkout, which the launcher clones once into `R4D_SRC`. No libr4d source is copied into this repo.
+
+**`patch_moe_prefill_attn.py`** (`RADIANCE_MOE_PREFILL_ATTN=r4d`) lets the R4D backend accept GQA 8.
+Request runs of at least 17 query tokens go to the GQA-8 prefill kernel. Everything else goes to stock
+Triton on a sub-batch, including `patch_attn_3d_multiq.py`'s split-KV kernel: decode, the 9-token
+MTP-8 verify, drafter catch-up and graph capture. The R4D decode kernel holds 8 query tokens at GQA 8,
+one short of an MTP-8 verify, so it is never used. The launcher switches the model and the MTP drafter
+to `--attention-backend R4D`, which brings the HND cache layout and 16-token kernel blocks.
+
+Kernel alone, one 2,224-token prefill chunk, paged fp8 KV (error vs fp32: 1.4-1.8e-3 R4D,
+1.7-2.3e-3 stock):
+
+| Context | Stock Triton | R4D at GQA 8 |
+|--:|--:|--:|
+| 2,224 | 14.7 ms (2.8 TFLOP/s) | 0.51 ms (79) |
+| 16,384 | 200.7 ms (2.8) | 5.0 ms (112) |
+| 32,768 | 419.9 ms (2.8) | 10.3 ms (112) |
+
+End to end, `serve-moe-mxfp4.sh`, `MOE_PREFILL_ATTN=off` vs `r4d` (localeval speed, fresh-nonce
+prompts, median of 3):
+
+| Prompt | TTFT off | TTFT r4d | Prefill tok/s off | Prefill tok/s r4d |
+|--:|--:|--:|--:|--:|
+| 4k | 1.68 s | **0.38 s** | 2,434 | 10,760 |
+| 16k | 11.07 s | **1.83 s** | 1,504 | 9,128 |
+| 32k | 42.53 s | **4.33 s** | 797 | 7,833 |
+
+- Decode is unchanged within noise: +0.7% / +8.7% at 4k / 16k in the sweep. On 64-token answers over
+  4k / 16k / 32k code, medians go from 87.6 / 81.3 / 64.6 to 80.9 / 82.8 / 66.2 tok/s.
+- Quality is unchanged within noise: gsm8k (50, thinking on) 0.96 to 0.98. A 24-prompt judged set
+  went from 0.923 to 0.904, a paired difference of -0.023 against a run-to-run band of +/-0.032.
+- This exact launcher, cloning and building from scratch, measured 0.41 / 1.85 / 4.31 s TTFT at
+  4k / 16k / 32k once warm. The first 16k requests after a cold start pay one-time compilation.
+
+`MOE_PREFILL_ATTN=off` restores TRITON_ATTN for everything. The patch also has a `triton` mode (tuned
+tiles, BLOCK_M 128 / 8 warps / 1 stage, about 11x on the kernel). It still spills, and it was never
+served, so the launcher does not expose it.
+
 ## Running
 
 ```bash
@@ -153,6 +207,9 @@ SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
 # the same with a 16 GiB host-RAM tier, or stock vLLM for comparison
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RAM_TIER_BYTES=17179869184 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 MOE_FIXES=0 ./serve-moe-mxfp4.sh
+# TRITON_ATTN prefill instead of R4D (no libr4d clone), or an existing libr4d v0.5.0 checkout
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 MOE_PREFILL_ATTN=off ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 R4D_SRC=~/src/libr4d ./serve-moe-mxfp4.sh
 
 # the 27B with a 24 GiB host-RAM tier
 RAM_TIER_BYTES=25769803776 ./serve-mxfp4.sh
@@ -166,6 +223,8 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
 ## Not tested
 
 - The MoE lane at TP > 1.
+- R4D prefill under concurrent mixed prefill/decode batches (only single-stream runs were measured),
+  and on the `triton` mode end to end.
 - The RAM tier together with the MoE lane, and the RAM tier at TP = 2.
 - Qwen3.6-35B-A3B compressed-tensors W4A16 checkpoints (e.g. `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`).
   On the 0.9.3 image vLLM picks a MoE backend that fails with `'_C' has no gptq_marlin_repack`, and

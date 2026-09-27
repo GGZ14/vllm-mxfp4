@@ -371,6 +371,9 @@ the shape it was measured at.
 gfx1201 MoE fixes on by default. Its experts move from vLLM's EMULATION backend to AITER's Triton a16w4
 lane, and speculative-decode verify attention uses the split-KV kernel. On `amd/Qwen3.5-35B-A3B-MXFP4`
 that takes single-stream decode from 17 to 81 tok/s (prose), and to 107 tok/s on code.
+Prefill attention runs on libr4d's prefill kernel, built at GQA 8 at container start
+(`MOE_PREFILL_ATTN=r4d`, the default; the launcher clones libr4d v0.5.0 once). TTFT goes from 11.1 s to
+1.8 s at 16k and from 42.5 s to 4.3 s at 32k.
 `RAM_TIER_BYTES=<bytes>` (either launcher, off by default) adds a host-RAM KV tier. It restores evicted
 prefixes from RAM instead of recomputing them: repeat-turn TTFT went from 7.24 s to 0.52 s once 8 long
 conversations overflowed the GPU prefix cache. Design, measurements and caveats are in
@@ -389,8 +392,9 @@ the process every decode step runs at 43-44 ms instead of 35 (about 20% fewer to
 TP=1). `serve-mxfp4.sh` now passes `GPU_MAX_HW_QUEUES=1` (`RADIANCE_HW_QUEUES`, default 1), which keeps
 the copy on the model's queue: 0 slow starts in 22, against 1 in 19 stock. After a llama.cpp HIP run,
 6 stock starts in a row came up slow on the same R9700. It costs nothing measurable: same KV pool,
-+0.07 ms/step, ~100 MiB more free VRAM. `RADIANCE_HW_QUEUES=0` restores HIP's default. It is tested at
-TP=1 only; re-check at TP>1, where RCCL adds streams of its own.
++0.07 ms/step, ~100 MiB more free VRAM. `RADIANCE_HW_QUEUES=0` restores HIP's default.
+`serve-moe-mxfp4.sh` passes it too. It is tested at TP=1 only; re-check at TP>1, where RCCL adds
+streams of its own.
 
 ### Serving something other than MXFP4
 
