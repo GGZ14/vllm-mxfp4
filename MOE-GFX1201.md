@@ -137,7 +137,11 @@ prompts, served round-robin, so the working set overflows the GPU prefix cache:
 | Tokens restored per hit | 0 | 0 | 22,880 |
 
 - Answers were byte-identical to the GPU-only run: 32/32, plus 24/24 on a long-answer variant.
-- Decode was unchanged at 87.5 tok/s.
+- The drafter's acceptance held on restored turns: 0.70 of drafted tokens accepted (1,482 / 2,121) in
+  restored-only intervals, vs 0.69 on cold turns in the same run (841 / 1,218) and 0.69 GPU-only
+  (2,430 / 3,500). Read from vLLM's 10 s `SpecDecoding metrics` log intervals on the long-answer
+  variant, not per request.
+- A 400-token decode probe on a fresh prompt after each run held at 87.5 tok/s with and without the tier.
 - Restores ran at 16.9 GB/s, about 50 ms per hit. The rest of the TTFT is recomputing the tail after
   the last align-mode GDN checkpoint.
 - GPU-only prefix caching held only 2 such conversations; at 4 it got zero hits.
