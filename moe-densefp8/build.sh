@@ -5,10 +5,8 @@
 # radiance_moe_densefp8.py, is installed by patch_moe_densefp8.py, not here; the fused expert gate
 # (RADIANCE_MOE_GATE_FIX) needs no HIP module.
 #   OUT  output directory (default: the current directory), e.g. the image's site-packages
-# Flags match moe-w4a8/build.sh: -O3, gfx1201. radiance_fp8w.hip is written in this repo, but its skeleton
-# (accumulate, reduce, launch dispatch) follows libr4d v0.5.0's r4d_gemm_bf16_nt_m16.hip and a few boilerplate
-# lines are identical to it; the fp8 weight load, decode and scale epilogue are new. Nothing of libr4d is
-# needed at build time.
+# Flags match moe-w4a8/build.sh: -O3, gfx1201. radiance_fp8w.hip is written for this repo; the decomposition is
+# the same as libr4d's r4d_gemm_bf16_nt_m16, no code is copied. Nothing of libr4d is needed at build time.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-.}

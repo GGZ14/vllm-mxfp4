@@ -486,7 +486,8 @@ Kept in bf16, on purpose:
 - `lm_head` (the verify head stays exact) and the whole MTP drafter.
 
 `moe-densefp8/radiance_fp8w.hip` is the HIP skinny kernel, built at container start with the image's hipcc by
-`moe-densefp8/build.sh` (a few seconds). A block is WV output columns x SK K-splits waves; each wave owns one output
+`moe-densefp8/build.sh` (a few seconds). It is written for this repo; the decomposition is the same as libr4d's
+`r4d_gemm_bf16_nt_m16`, no code is copied. A block is WV output columns x SK K-splits waves; each wave owns one output
 column over one contiguous K slice and keeps M accumulators, and the SK partials are reduced in LDS in a fixed order, so
 it is deterministic and needs no second kernel. A 128-bit load is 16 fp8 weights; they are expanded with the gfx12
 hardware converter `v_cvt_f32_fp8` (exact), packed to bf16 pairs with `v_perm` (exact, fp8 has at most 4 significant
@@ -633,6 +634,17 @@ did not exist yet; the server was stopped and started again for the warm start.
   - both off: `patch_moe_densefp8.py` is not run, `radiance_moe_densefp8` is not installed;
   - `MOE_FIXES=0` drops dense fp8, the gate fix and W4A8, and keeps the draft head and the GDN fix;
   - `MOE_FIXES=0 RADIANCE_GDN_SCAN_FIX=0 RADIANCE_MOE_DRAFT_HEAD=off` leaves an empty chain.
+- **Kernel rewrite.** `radiance_fp8w.hip` was then rewritten so that it shares no text with libr4d: a line comparison
+  against every libr4d v0.5.0 file finds no run of three or more identical lines. Its outputs are bit-identical to the
+  previous kernel in all 2,048 test cases (5 shapes, M = 1-16, every valid WV/SK, contiguous and strided activations;
+  worst error against fp32 0.17%). In-graph time at the table's configs is -7% to +2% for M = 2-16 (geometric mean
+  -0.7%). The previous M = 1 build spilled registers and the new one does not, which moved the best `gate_up` M = 1
+  config: a few small-shape configs at M <= 4 run at a fixed ~15 µs per call with either build (cause not isolated),
+  and the old M = 1 build happened to miss that at (16, 2). The table now uses (1, 1) there, 6.6 µs against 8.1 µs
+  before; `out_proj` M = 1 at (8, 4) went from 22.2 to 19.0 µs. Served again warm (same flags, a copy of this tree):
+  every patch prints the same OK lines, the same healthy lines, KV 6.55 GiB, single stream 136.4 tok/s, 8 / 12 streams
+  477.0 / 620.7 (a third run: 137.9 / 506.7 / 624.6), gsm8k 200 `--nonce` 0.370. localeval marks every difference to the
+  run above as noise.
 
 ### Sections 4-6 defaults only (earlier run)
 
