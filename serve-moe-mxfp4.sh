@@ -33,6 +33,14 @@
 #                     rerank), 0.13 GiB: single-stream decode +19% on identical outputs, KV -0.20 GiB. Applies only with
 #                     SPEC > 0 (there is no draft head otherwise). off = the stock bf16 head. Do not also set
 #                     RADIANCE_FAST_DRAFT=1: the image's own hook would re-arm the head last.
+#   RADIANCE_MOE_DENSE_FP8=1  1: the target's bf16 dense linears (GDN in_proj_qkvz/out_proj, attention qkv/o, shared
+#                     expert gate_up/down; 2.62 -> 1.31 GiB) become fp8 e4m3 with a scale per output channel, the bf16
+#                     freed before KV sizing (+1.06 GiB KV). Decode weight-only (HIP skinny / Triton), prefill chunks
+#                     > 80 tokens W8A8. in_proj_ba, router, shared_expert_gate, lm_head and the drafter stay bf16
+#                     (patch_moe_densefp8.py, moe-densefp8/). Needs MOE_FIXES=1. 0 = bf16 dense layers.
+#   RADIANCE_MOE_GATE_FIX=1  1: sigmoid(shared_expert_gate(x)) * out as one fused kernel instead of hipBLASLt GEMV +
+#                     sigmoid + mul (same bf16 roundings, only the dot's summation order differs). Needs MOE_FIXES=1.
+#                     0 = the three stock ops.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
@@ -42,7 +50,10 @@
 #                     measured at SPEC=8, MAXSEQS=8, GPU_UTIL=0.95.
 #   MAXLEN=65536  MAXSEQS=16  CHUNK=4096  GPU_UTIL=0.97  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
-#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8]   compile cache; never share one across knobs
+#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8][-dfp8][-gate]   compile cache; never share one across knobs
+#                     (dense fp8 swaps the linears' apply, which vLLM's compile-cache key does not see: a bf16 cache would
+#                     replay the bf16 graph on the fp8 weights and die at the profile run. The gate knob is a runtime flag
+#                     in a source file that the patch edits either way, so it gets a suffix too rather than trusting the key)
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -70,13 +81,16 @@ GDNFIX=${RADIANCE_GDN_SCAN_FIX:-1}; W4A8=${RADIANCE_MOE_W4A8:-1}; W4A8_MIN=${RAD
 case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)" ;; esac
 case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDNFIX)" ;; esac
 case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;; esac
-DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}
+DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}; DFP8=${RADIANCE_MOE_DENSE_FP8:-1}; GF=${RADIANCE_MOE_GATE_FIX:-1}
 case "$DH" in off|fp8|int4|int2) ;; *) die "RADIANCE_MOE_DRAFT_HEAD must be off, fp8, int4 or int2 (got $DH)" ;; esac
+case "$DFP8" in 0|1) ;; *) die "RADIANCE_MOE_DENSE_FP8 must be 0 or 1 (got $DFP8)" ;; esac
+case "$GF" in 0|1) ;; *) die "RADIANCE_MOE_GATE_FIX must be 0 or 1 (got $GF)" ;; esac
 case "$W4A8_MIN" in ''|*[!0-9]*) [ -z "$W4A8_MIN" ] || die "RADIANCE_MOE_W4A8_MIN_TOKENS must be an integer (got $W4A8_MIN)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
 [ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
 [ "$MOE_FIXES" = 1 ] || W4A8=0   # W4A8 rides on the a16w4 lane that MOE_FIXES=1 enables
+[ "$MOE_FIXES" = 1 ] || { DFP8=0; GF=0; }   # fp8 dense layers and the fused gate were measured only on top of the MoE fixes
 [ "$SPEC" != 0 ] || DH=off       # the draft head only exists with speculation
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
@@ -91,6 +105,8 @@ SERVED_NAMES=${SERVED_NAMES:-$(basename "$MODEL_ID")}
 CACHE_SUF="-f$MOE_FIXES"; [ "$PA" != off ] && CACHE_SUF="$CACHE_SUF-pa$PA"
 [ "$GDNFIX" = 1 ] && CACHE_SUF="$CACHE_SUF-gdn2"
 [ "$W4A8" = 1 ] && CACHE_SUF="$CACHE_SUF-w4a8"
+[ "$DFP8" = 1 ] && CACHE_SUF="$CACHE_SUF-dfp8"
+[ "$GF" = 1 ] && CACHE_SUF="$CACHE_SUF-gate"
 CACHE=${CACHE:-$HOME/.radiance-cache-moe-$(echo "$MODEL_ID" | tr '/' '_')$CACHE_SUF}
 mkdir -p "$CACHE"/vllm "$CACHE"/inductor "$CACHE"/triton "$CACHE"/aiter
 
@@ -139,9 +155,9 @@ if [ "$MOE_FIXES" = 1 ]; then
 else
   FIX_ENV=(-e RADIANCE_MOE_W4A16=0)
 fi
-# Both new kernels are built straight into the image's site-packages, which is also where the patches
+# The new kernels are built straight into the image's site-packages, which is also where the patches
 # below edit the installed vLLM / radiance sources (never a copy that sits next to the patch scripts).
-if [ "$GDNFIX" = 1 ] || [ "$W4A8" = 1 ]; then
+if [ "$GDNFIX" = 1 ] || [ "$W4A8" = 1 ] || [ "$DFP8" = 1 ]; then
   pre_add "SP=\$(python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
 fi
 if [ "$GDNFIX" = 1 ]; then
@@ -162,9 +178,16 @@ if [ "$DH" != off ]; then
   pre_add "python3 patch_moe_drafthead.py"
   FIX_ENV+=(-e RADIANCE_MOE_DRAFT_HEAD="$DH")
 fi
+if [ "$DFP8" = 1 ] || [ "$GF" = 1 ]; then
+  # fp8 dense layers (needs the HIP skinny kernel, built here) and/or the fused expert gate (Triton only). One hook at
+  # the end of process_weights_after_loading, one flag in qwen2_moe.py.
+  [ "$DFP8" = 1 ] && pre_add "OUT=\$SP bash moe-densefp8/build.sh"
+  pre_add "python3 patch_moe_densefp8.py"
+  FIX_ENV+=(-e RADIANCE_MOE_DENSE_FP8="$DFP8" -e RADIANCE_MOE_GATE_FIX="$GF")
+fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
