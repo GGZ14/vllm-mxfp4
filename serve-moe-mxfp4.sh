@@ -21,8 +21,11 @@
 #                     R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
 #   RAM_TIER_BYTES=0  host-RAM KV cache tier in bytes (OffloadingConnector); 0 = off. Lives in /dev/shm.
-#   SPEC=8            MTP draft tokens; 0 disables speculation
-#   MAXLEN=65536  MAXSEQS=8  CHUNK=4096  GPU_UTIL=0.95  PORT=8080  NAME=radiance-moe  GPUS=0
+#   SPEC=4            MTP draft tokens; 0 disables speculation. In align mode each request pins 2 + SPEC GDN
+#                     state blocks, so SPEC sets how many requests fit: SPEC=4 fits 15 short ones at
+#                     MAXSEQS=16 and GPU_UTIL=0.97, SPEC=8 fits 7. Sections 1-4 of MOE-GFX1201.md were
+#                     measured at SPEC=8, MAXSEQS=8, GPU_UTIL=0.95.
+#   MAXLEN=65536  MAXSEQS=16  CHUNK=4096  GPU_UTIL=0.97  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
 #   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-rt]   compile cache; never share one across knobs
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
@@ -43,12 +46,14 @@ PY
 )
 [ "$KIND" = moe ] || echo "[serve-moe] WARNING: $SNAP does not look like an MoE checkpoint; serve-mxfp4.sh is the dense launcher" >&2
 
-MOE_FIXES=${MOE_FIXES:-1}; RAM_TIER_BYTES=${RAM_TIER_BYTES:-0}; SPEC=${SPEC:-8}
-MAXLEN=${MAXLEN:-65536}; MAXSEQS=${MAXSEQS:-8}; CHUNK=${CHUNK:-4096}; GPU_UTIL=${GPU_UTIL:-0.95}
+MOE_FIXES=${MOE_FIXES:-1}; RAM_TIER_BYTES=${RAM_TIER_BYTES:-0}; SPEC=${SPEC:-4}
+MAXLEN=${MAXLEN:-65536}; MAXSEQS=${MAXSEQS:-16}; CHUNK=${CHUNK:-4096}; GPU_UTIL=${GPU_UTIL:-0.97}
 PORT=${PORT:-8080}; NAME=${NAME:-radiance-moe}; GPUS=${GPUS:-0}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 PA=${MOE_PREFILL_ATTN:-r4d}; HWQ=${RADIANCE_HW_QUEUES:-1}
 case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)" ;; esac
+case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
+case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
 [ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
@@ -121,7 +126,7 @@ else
 fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \

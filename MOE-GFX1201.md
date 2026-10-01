@@ -203,6 +203,49 @@ prompts, median of 3):
 tiles, BLOCK_M 128 / 8 warps / 1 stage, about 11x on the kernel). It still spills, and it was never
 served, so the launcher does not expose it.
 
+## 5. MTP draft depth and sequence capacity (`SPEC`, `MAXSEQS`, `GPU_UTIL`)
+
+In align mode vLLM reserves `2 + num_speculative_tokens` GDN state blocks for every request
+(`MambaSpec.max_memory_usage_bytes` in `vllm/v1/kv_cache_interface.py`; `num_speculative_blocks` is set in
+`vllm/model_executor/layers/mamba/abstract.py`). The draft depth therefore decides how many requests fit
+long before the pool is full of tokens. At MTP-8 one short request pinned 12.7% of the KV pool and only 7 fit.
+The 8th queued, so 8 streams ran slower than 6. The launcher defaults are now `SPEC=4`, `MAXSEQS=16`,
+`GPU_UTIL=0.97` (they were 8, 8, 0.95). `MAXSEQS=16` alone cost about 0.95 GiB of KV at 0.95, and 0.97 more
+than gives it back.
+
+localeval speed, 1k-token prompts, 1024 forced output tokens, one run per cell:
+
+| | before: MTP-8, 8 seqs, 0.95 | MTP-4, 16 seqs, 0.95 | **MTP-4, 16 seqs, 0.97** |
+|---|--:|--:|--:|
+| KV cache | 5.18 GiB (242k tokens) | 4.23 GiB (249k) | **5.72 GiB (337k)** |
+| KV pinned per short request | 12.7% | 8.6% | 6.4% |
+| Requests that fit | 7 | 11 | **15** |
+| 1 stream, tok/s | 105.8 | 138.2 | 122.8 (noisy) |
+| 2 / 4 streams, aggregate tok/s | 162.7 / 255.4 | 195.0 / 274.1 | 177.2 / 308.1 |
+| 8 streams, aggregate tok/s | 301.6 (1 queued) | 431.1 | **456.2** |
+| 12 / 16 streams, aggregate tok/s | - | 477.3 (11 fit) / - | 569.3 / 534.1 (15 fit) |
+
+- Acceptance drops from about 3.0 to 2.86 tokens per step at depth 4. Aggregate throughput still rises
+  because more requests run at once.
+- gsm8k (200, `--nonce`, thinking off): 0.380 against 0.365 at the old defaults, noise.
+- No traceback or OOM line under 16-stream load. At 16 streams the 16th request waits and runs alone at the end.
+- Measured on a separate production launcher (R4D prefill, decode attention on AITER's unified kernel, a GDN
+  repair post-pass), not on `serve-moe-mxfp4.sh`. Section 8 has this launcher's own numbers.
+
+**No-go: a larger CUDA-graph size.** A full batch is 16 x 5 = 80 tokens per decode step, above the largest
+capture size (72). Adding 80 to `cudagraph_capture_sizes` made steps faster (+15% per stream at 16 streams)
+but graph memory profiling reserved 1.1 GiB more: KV went from 5.72 GiB / 337k tokens to 4.63 GiB / 273k.
+More requests queued, and aggregate throughput fell:
+
+| streams | capture sizes up to 72 | with 80 added |
+|--:|--:|--:|
+| 12 | 585.5 | 568.9 |
+| 14 | 609.5 | 488.5 |
+| 16 | 560.3 | 463.4 |
+
+`MAXSEQS=14` (14 x 5 = 70 fits the captured sizes) is an untested alternative. `SPEC=8 MAXSEQS=8 GPU_UTIL=0.95`
+restores the old defaults.
+
 ## Running
 
 ```bash
