@@ -318,6 +318,87 @@ Cost, localeval speed (128 forced tokens, 5 reps, fresh nonce):
 `RADIANCE_GDN_SCAN_FIX=0` runs libr4d's scan as is, and then no libr4d checkout is needed unless
 `MOE_PREFILL_ATTN=r4d`.
 
+## 7. W4A8 expert GEMMs for prefill (`RADIANCE_MOE_W4A8`)
+
+With the attention fix, the expert GEMMs are the largest block of MoE prefill. A rocprofv3 trace of one
+request on an idle server (busy kernel time):
+
+| Prompt | Steps | Expert GEMMs | Reduce | Dense bf16 GEMMs | Attention | GDN |
+|--:|--:|--:|--:|--:|--:|--:|
+| 3,991 | 1 | 42.0% | 2.8% | 32.3% | 4.8% | 6.0% |
+| 15,979 | 7 | 42.8% | 2.2% | 27.3% | 13.8% | 4.7% |
+
+AITER's a16w4 kernel feeds the 16-bit WMMA. gfx1201's fp8 WMMA has twice the peak (325 against 160 TFLOP/s),
+so a W4A8 kernel (MXFP4 weights, per-token e4m3 activations) can win where the GEMMs are compute-bound. Triton
+did not get there. `tl.dot` on e4m3 does emit the fp8 WMMA in this image, but converting e2m1 to e4m3 in
+registers ran at 0.6-0.75x of a16w4, and the upper bound (weights pre-converted to e4m3, no dequant, twice the
+weight bytes) was only 1.55-1.85x.
+
+**`moe-w4a8/radiance_moe_w4a8.hip`** is a grouped HIP kernel derived from this repo's own
+`radiance_mxfp4_fp8.hip` (LDS staging, `v_perm` e2m1-to-e4m3 upconvert with the MX block exponent folded in,
+fragment layout), extended to the expert-grouped schedule of the a16w4 lane:
+- `grid.y` walks AITER's routing `block_pid_map`, `grid.x` covers N blocks. It reads the same routing,
+  weights and sorted buffers as the a16w4 lane, and its output goes through the same `reduce_grouped`.
+- w13 (gate_up): rows are gathered from per-token fp8 activations. The gate row 2j and up row 2j+1 of the
+  interleaved weight land in two column tiles of one wave, so SiLU(gate) * up is lane-local in the epilogue.
+- w2 (down): per-row fp8 quantization of the intermediate, with the router gammas folded into the row scale.
+- The e2m1 weights are upconverted losslessly to e4m3 with the block exponent taken relative to the row's
+  maximum exponent (`Wref`, 0.75 MiB per layer, built on first use). That is exact for exponent gaps up to 14.
+  On this checkpoint every block with nonzero weights has a gap of 11 or less.
+- Tile configs are chosen per routing `block_m` (128x128 tiles, BK 128 or 64, a skip mode that drops padded 16-row tiles).
+
+**`patch_moe_w4a8.py`** (`RADIANCE_MOE_W4A8=1`) inserts the dispatch into vLLM's
+`aiter_triton_kernel_w4a16_moe_forward`. Calls with at least `RADIANCE_MOE_W4A8_MIN_TOKENS` tokens (default
+1025, where AITER's routing reaches `block_m` 64: prefill chunks) take the W4A8 kernel. Everything else stays
+on a16w4: decode, MTP verify, short prompts, every CUDA-graph capture, and any call with bias, clamp or
+router-weight-on-input. At those sizes the expert GEMMs are weight-bandwidth bound (535-548 GB/s of
+weight traffic at 60 and 80 verify tokens), so fp8 activations cannot speed them up. It anchors on code that
+`patch_gfx12_aiter_a16w4.py` inserts, so it needs `MOE_FIXES=1`. A module that was asked for and is missing is
+a startup failure. The kernel compiles at container start (about 5 s).
+
+Per layer, layer-20 weights, cold cache, including activation quantization and the reduce (us):
+
+| Tokens | block_m | a16w4 (gate_up + down) | W4A8 (quant + w13 + quant + w2 + reduce) | Layer speedup |
+|--:|--:|--:|--:|--:|
+| 1,056 | 64 | 913 + 530 = 1,443 | 1,044 | 1.38x |
+| 1,536 | 64 | 1,048 + 625 = 1,673 | 1,181 | 1.42x |
+| 2,224 | 128 | 1,798 + 1,063 = 2,861 | 1,404 | 2.04x |
+| 3,991 | 128 | 2,337 + 1,443 = 3,780 | 2,040 | 1.85x |
+
+Below block_m 64 the kernel is weight-streaming bound and loses to a16w4 (1.5-3x slower on w13 at 300-1,000
+tokens), which is why the threshold exists. Served, the expert path takes 77 ms instead of 149 ms of a
+3,991-token prefill and about 350 ms instead of 724 ms of a 15,979-token one.
+
+End to end, A/B on the same stack with the exact scan (localeval; prefill 128 forced tokens, 5 reps, fresh nonce):
+
+| | W4A8 off | W4A8 on | change |
+|---|--:|--:|---|
+| prefill 4,088 tokens | 10,916 tok/s (TTFT 0.37 s) | 13,607 (0.30 s) | **+24.6%** |
+| prefill 16,656 tokens | 9,201 | 11,805 | **+28.3%** |
+| prefill 33.9k tokens | 8,003 | 10,018 | **+25.2%** |
+| decode, 1 stream, 1k / 4k | 100.8 / 102.3 | 98.8 / 102.3 | -2.0% / 0.0%, noise |
+| decode, 8 / 12 streams | 405.4 / 537.8 | 413.8 / 546.0 | +2.1% / +1.5%, noise |
+| gsm8k 200, `--nonce`, thinking off | 0.375 | 0.375 | 0.000 |
+| KV cache | 5.72 GiB | 5.69 GiB | -0.03 GiB (the `Wref` tensors, 31 MB) |
+
+Numerics. The W4A8 layer differs from an fp32 reference by 0.040-0.043 (relative Frobenius norm) at every
+token count and tile config, on real layer-20 weights with router routing. a16w4 itself is 0.0023-0.0039, and
+the emulated W4A4 scheme the checkpoint declares is 0.19-0.22. Each GEMM alone on identical fp8 inputs is
+1.66e-3, which is bf16 output rounding, so the kernel is exact and the 4% comes from rounding the activations
+to e4m3 at two points.
+
+Limits:
+- **gsm8k does not exercise the shipped path.** Its prompts are shorter than 1,025 tokens, so at the default
+  threshold none of them reach W4A8. The gsm8k row above ran a test-only mode
+  (`RADIANCE_MOE_W4A8_MIN_TOKENS=1 RADIANCE_MOE_W4A8_FORCE_ALL=1`) that sends every eager prefill through W4A8,
+  using the block_m 16 tile configs rather than the shipped 64 / 128 ones. The evidence for the shipped
+  configs is the per-layer check across all 26 tile configs, plus a long-context code set (18 rows, prompts
+  up to 32k). Its judged score moved from 0.208 to 0.242 (n = 12, noise), and the judge's context rejected the
+  six 32k rows.
+- No perplexity or long-generation quality run was done. Per-layer numerics and timing use one layer (20).
+- Decode was not kernel-traced (rocprofv3 `--attach` crashes the engine under graph-launched decode). Its
+  evidence is the layer microbenchmark plus the served runs above.
+
 ## Running
 
 ```bash

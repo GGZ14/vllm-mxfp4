@@ -23,6 +23,10 @@
 #                     container start from a patch against the libr4d checkout (R4D_SRC), so it needs that
 #                     checkout with or without MOE_PREFILL_ATTN=r4d, and applies with or without MOE_FIXES.
 #                     0: libr4d's scan as is.
+#   RADIANCE_MOE_W4A8=1  1: expert GEMM calls of >= RADIANCE_MOE_W4A8_MIN_TOKENS tokens (default 1025: prefill
+#                     chunks) run on an fp8-WMMA W4A8 grouped kernel (moe-w4a8/, patch_moe_w4a8.py); decode,
+#                     MTP verify and CUDA-graph calls stay on a16w4. ~+25% prefill. Rides on the a16w4 lane,
+#                     so it needs MOE_FIXES=1 and is ignored with MOE_FIXES=0. 0: a16w4 only.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
@@ -33,7 +37,7 @@
 #                     measured at SPEC=8, MAXSEQS=8, GPU_UTIL=0.95.
 #   MAXLEN=65536  MAXSEQS=16  CHUNK=4096  GPU_UTIL=0.97  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
-#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-rt]   compile cache; never share one across knobs
+#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8][-rt]   compile cache; never share one across knobs
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -57,12 +61,15 @@ MAXLEN=${MAXLEN:-65536}; MAXSEQS=${MAXSEQS:-16}; CHUNK=${CHUNK:-4096}; GPU_UTIL=
 PORT=${PORT:-8080}; NAME=${NAME:-radiance-moe}; GPUS=${GPUS:-0}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 PA=${MOE_PREFILL_ATTN:-r4d}; HWQ=${RADIANCE_HW_QUEUES:-1}
-GDNFIX=${RADIANCE_GDN_SCAN_FIX:-1}
+GDNFIX=${RADIANCE_GDN_SCAN_FIX:-1}; W4A8=${RADIANCE_MOE_W4A8:-1}; W4A8_MIN=${RADIANCE_MOE_W4A8_MIN_TOKENS:-}
 case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)" ;; esac
 case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDNFIX)" ;; esac
+case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;; esac
+case "$W4A8_MIN" in ''|*[!0-9]*) [ -z "$W4A8_MIN" ] || die "RADIANCE_MOE_W4A8_MIN_TOKENS must be an integer (got $W4A8_MIN)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
 [ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
+[ "$MOE_FIXES" = 1 ] || W4A8=0   # W4A8 rides on the a16w4 lane that MOE_FIXES=1 enables
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
 
@@ -75,6 +82,7 @@ SERVED_NAMES=${SERVED_NAMES:-$(basename "$MODEL_ID")}
 
 CACHE_SUF="-f$MOE_FIXES"; [ "$PA" != off ] && CACHE_SUF="$CACHE_SUF-pa$PA"
 [ "$GDNFIX" = 1 ] && CACHE_SUF="$CACHE_SUF-gdn2"
+[ "$W4A8" = 1 ] && CACHE_SUF="$CACHE_SUF-w4a8"
 [ "$RAM_TIER_BYTES" != 0 ] && CACHE_SUF="$CACHE_SUF-rt"
 CACHE=${CACHE:-$HOME/.radiance-cache-moe-$(echo "$MODEL_ID" | tr '/' '_')$CACHE_SUF}
 mkdir -p "$CACHE"/vllm "$CACHE"/inductor "$CACHE"/triton "$CACHE"/aiter
@@ -134,18 +142,26 @@ else
   PRE="python3 patch_offload_mamba_eagle.py"
   FIX_ENV=(-e RADIANCE_MOE_W4A16=0)
 fi
-# The exact-scan kernel is built straight into the image's site-packages, which is also where the patch edits
-# the installed radiance_gdn.py (never a copy that sits next to the patch scripts).
+# Both new kernels are built straight into the image's site-packages, which is also where the patches
+# below edit the installed vLLM / radiance sources (never a copy that sits next to the patch scripts).
+if [ "$GDNFIX" = 1 ] || [ "$W4A8" = 1 ]; then
+  PRE="$PRE && SP=\$(python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
+fi
 if [ "$GDNFIX" = 1 ]; then
   # libr4d #4: libr4d v0.5.0's GDN chunk scan without the midpoint decay split. moe-gdn2/build.sh patches a
   # temporary copy of R4D_SRC's scan (no libr4d source in this repo), builds it, and the patch binds it.
-  PRE="$PRE && SP=\$(python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
   PRE="$PRE && R4D_SRC=/r4dsrc OUT=\$SP/radiance_gdn2.so bash moe-gdn2/build.sh && python3 patch_gdn_scan_fix.py"
   FIX_ENV+=(-e RADIANCE_GDN_SCAN_FIX=1)
 fi
+if [ "$W4A8" = 1 ]; then
+  # fp8-WMMA W4A8 expert GEMMs for prefill-sized calls; anchors on what patch_gfx12_aiter_a16w4.py inserts
+  PRE="$PRE && OUT=\$SP bash moe-w4a8/build.sh && python3 patch_moe_w4a8.py"
+  FIX_ENV+=(-e RADIANCE_MOE_W4A8=1)
+  [ -n "$W4A8_MIN" ] && FIX_ENV+=(-e RADIANCE_MOE_W4A8_MIN_TOKENS="$W4A8_MIN")
+fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
