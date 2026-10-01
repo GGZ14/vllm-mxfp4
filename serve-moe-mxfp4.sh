@@ -30,14 +30,13 @@
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
-#   RAM_TIER_BYTES=0  host-RAM KV cache tier in bytes (OffloadingConnector); 0 = off. Lives in /dev/shm.
 #   SPEC=4            MTP draft tokens; 0 disables speculation. In align mode each request pins 2 + SPEC GDN
 #                     state blocks, so SPEC sets how many requests fit: SPEC=4 fits 15 short ones at
-#                     MAXSEQS=16 and GPU_UTIL=0.97, SPEC=8 fits 7. Sections 1-4 of MOE-GFX1201.md were
+#                     MAXSEQS=16 and GPU_UTIL=0.97, SPEC=8 fits 7. Sections 1-3 of MOE-GFX1201.md were
 #                     measured at SPEC=8, MAXSEQS=8, GPU_UTIL=0.95.
 #   MAXLEN=65536  MAXSEQS=16  CHUNK=4096  GPU_UTIL=0.97  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
-#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8][-rt]   compile cache; never share one across knobs
+#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8]   compile cache; never share one across knobs
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -56,7 +55,7 @@ PY
 )
 [ "$KIND" = moe ] || echo "[serve-moe] WARNING: $SNAP does not look like an MoE checkpoint; serve-mxfp4.sh is the dense launcher" >&2
 
-MOE_FIXES=${MOE_FIXES:-1}; RAM_TIER_BYTES=${RAM_TIER_BYTES:-0}; SPEC=${SPEC:-4}
+MOE_FIXES=${MOE_FIXES:-1}; SPEC=${SPEC:-4}
 MAXLEN=${MAXLEN:-65536}; MAXSEQS=${MAXSEQS:-16}; CHUNK=${CHUNK:-4096}; GPU_UTIL=${GPU_UTIL:-0.97}
 PORT=${PORT:-8080}; NAME=${NAME:-radiance-moe}; GPUS=${GPUS:-0}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
@@ -83,7 +82,6 @@ SERVED_NAMES=${SERVED_NAMES:-$(basename "$MODEL_ID")}
 CACHE_SUF="-f$MOE_FIXES"; [ "$PA" != off ] && CACHE_SUF="$CACHE_SUF-pa$PA"
 [ "$GDNFIX" = 1 ] && CACHE_SUF="$CACHE_SUF-gdn2"
 [ "$W4A8" = 1 ] && CACHE_SUF="$CACHE_SUF-w4a8"
-[ "$RAM_TIER_BYTES" != 0 ] && CACHE_SUF="$CACHE_SUF-rt"
 CACHE=${CACHE:-$HOME/.radiance-cache-moe-$(echo "$MODEL_ID" | tr '/' '_')$CACHE_SUF}
 mkdir -p "$CACHE"/vllm "$CACHE"/inductor "$CACHE"/triton "$CACHE"/aiter
 
@@ -105,14 +103,6 @@ else
 fi
 [ "${DETACH:-0}" = 1 ] && RT_FLAGS+=(-d)
 
-TIER=()
-if [ "$RAM_TIER_BYTES" != 0 ]; then
-  shm_avail=$(df -B1 --output=avail /dev/shm 2>/dev/null | tail -1 | tr -d ' ')
-  if [ -n "$shm_avail" ] && [ "$shm_avail" -le "$RAM_TIER_BYTES" ]; then
-    die "RAM_TIER_BYTES=$RAM_TIER_BYTES does not fit in /dev/shm ($shm_avail bytes free)"
-  fi
-  TIER=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$RAM_TIER_BYTES}}")
-fi
 BACKEND=TRITON_ATTN; R4D_MNT=()
 [ "$PA" = r4d ] && BACKEND=R4D
 # The libr4d checkout is read by both the GQA-8 prefill build (r4d) and the exact GDN scan build.
@@ -128,10 +118,9 @@ SPEC_ARGS=()
 if [ "$SPEC" != 0 ]; then
   SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$BACKEND\",\"disable_padded_drafter_batch\":true}")
 fi
-# patch_offload_mamba_eagle.py is what makes the RAM tier load on a hybrid model under speculation,
-# so it runs with or without the MoE fixes (inert when no connector is configured).
+PRE=""; pre_add() { PRE="${PRE:+$PRE && }$1"; }
 if [ "$MOE_FIXES" = 1 ]; then
-  PRE="python3 patch_quark_moe_w4a16.py && python3 patch_gfx12_aiter_a16w4.py && python3 patch_attn_3d_multiq.py && python3 patch_offload_mamba_eagle.py"
+  PRE="python3 patch_quark_moe_w4a16.py && python3 patch_gfx12_aiter_a16w4.py && python3 patch_attn_3d_multiq.py"
   FIX_ENV=(-e RADIANCE_MOE_W4A16=1 -e RADIANCE_MOE_BACKEND=aiter -e RADIANCE_ATTN_3D_MAX_Q=16)
   if [ "$PA" = r4d ]; then
     # build the GQA-8 prefill module with the image's hipcc (a few seconds), then install it
@@ -139,29 +128,28 @@ if [ "$MOE_FIXES" = 1 ]; then
     FIX_ENV+=(-e RADIANCE_MOE_PREFILL_ATTN=r4d -e RADIANCE_R4D_MOE_SO=/cache/r4d_moe.so)
   fi
 else
-  PRE="python3 patch_offload_mamba_eagle.py"
   FIX_ENV=(-e RADIANCE_MOE_W4A16=0)
 fi
 # Both new kernels are built straight into the image's site-packages, which is also where the patches
 # below edit the installed vLLM / radiance sources (never a copy that sits next to the patch scripts).
 if [ "$GDNFIX" = 1 ] || [ "$W4A8" = 1 ]; then
-  PRE="$PRE && SP=\$(python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
+  pre_add "SP=\$(python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
 fi
 if [ "$GDNFIX" = 1 ]; then
   # libr4d #4: libr4d v0.5.0's GDN chunk scan without the midpoint decay split. moe-gdn2/build.sh patches a
   # temporary copy of R4D_SRC's scan (no libr4d source in this repo), builds it, and the patch binds it.
-  PRE="$PRE && R4D_SRC=/r4dsrc OUT=\$SP/radiance_gdn2.so bash moe-gdn2/build.sh && python3 patch_gdn_scan_fix.py"
+  pre_add "R4D_SRC=/r4dsrc OUT=\$SP/radiance_gdn2.so bash moe-gdn2/build.sh && python3 patch_gdn_scan_fix.py"
   FIX_ENV+=(-e RADIANCE_GDN_SCAN_FIX=1)
 fi
 if [ "$W4A8" = 1 ]; then
   # fp8-WMMA W4A8 expert GEMMs for prefill-sized calls; anchors on what patch_gfx12_aiter_a16w4.py inserts
-  PRE="$PRE && OUT=\$SP bash moe-w4a8/build.sh && python3 patch_moe_w4a8.py"
+  pre_add "OUT=\$SP bash moe-w4a8/build.sh && python3 patch_moe_w4a8.py"
   FIX_ENV+=(-e RADIANCE_MOE_W4A8=1)
   [ -n "$W4A8_MIN" ] && FIX_ENV+=(-e RADIANCE_MOE_W4A8_MIN_TOKENS="$W4A8_MIN")
 fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
@@ -180,4 +168,4 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=
   --enable-prefix-caching --mamba-cache-mode align ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
   --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72]}' \
   --no-async-scheduling --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
-  --language-model-only --trust-remote-code ${TIER[@]+"${TIER[@]}"} "$@"
+  --language-model-only --trust-remote-code "$@"

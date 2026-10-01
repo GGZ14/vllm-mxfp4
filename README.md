@@ -365,7 +365,7 @@ The result is written to `~/.cache/radiance-mxfp4/kv-profiles.local.tsv`, which 
 shipped table and wins over it. Re-run after changing `MAXSEQS` or `CHUNK`: a pin is only valid at
 the shape it was measured at.
 
-### MXFP4 MoE models and the host-RAM KV tier
+### MXFP4 MoE models
 
 `serve-moe-mxfp4.sh` serves a Qwen3.5/3.6-35B-A3B-class MXFP4 MoE checkpoint on one card, with the
 gfx1201 MoE fixes on by default. Its experts move from vLLM's EMULATION backend to AITER's Triton a16w4
@@ -385,15 +385,11 @@ Three more defaults, each with a switch (`SPEC`/`MAXSEQS`/`GPU_UTIL`, `RADIANCE_
 
 Together the launcher prefills 13.6k / 11.8k / 10.0k tok/s at 4k / 16k / 34k. In one test the first start on
 an empty compile cache came up with less KV (4.76 against 5.69 GiB); a restart got 5.69.
-`RAM_TIER_BYTES=<bytes>` (either launcher, off by default) adds a host-RAM KV tier. It restores evicted
-prefixes from RAM instead of recomputing them: repeat-turn TTFT went from 7.24 s to 0.52 s once 8 long
-conversations overflowed the GPU prefix cache. Design, measurements and caveats are in
-[MOE-GFX1201.md](MOE-GFX1201.md).
+Design, measurements and caveats are in [MOE-GFX1201.md](MOE-GFX1201.md).
 
 ```bash
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-mxfp4.sh   # the old defaults
-RAM_TIER_BYTES=25769803776 ./serve-mxfp4.sh     # 24 GiB tier for the 27B
 ```
 
 ### Slow starts: one HIP hardware queue
@@ -1080,4 +1076,4 @@ specific to this fork rather than general to gfx1201, so the image build compile
 | [PERFORMANCE.md](PERFORMANCE.md) | The change-by-change optimization ledger, the 0.5.8 -> 0.7.4 provenance A/B, and the gated-delta-net NaN write-up |
 | [MXFP4-NOTES.md](MXFP4-NOTES.md) | Design notes, measurements and traps behind `serve-mxfp4.sh` |
 | [TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) | The TP=3 dummy-head padding design and its validation gates |
-| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, the host-RAM KV tier, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts: design and measurements |
+| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts: design and measurements |

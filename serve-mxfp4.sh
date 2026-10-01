@@ -103,9 +103,6 @@ Everything is an environment variable; these are the ones worth knowing.
   AUTO_R4D=1                build the pinned libr4d on first run (cached); 0 uses the image's
   R4D_SO=<dir>              use your own libr4d checkout instead of building one
   EXTRA="--enforce-eager"   extra `vllm serve` flags (same as passing them as arguments)
-  RAM_TIER_BYTES=0          host-RAM KV cache tier in bytes (vLLM OffloadingConnector), 0 = off.
-                            Evicted prefixes reload from RAM instead of being recomputed; the
-                            tier lives in the host's /dev/shm. See MOE-GFX1201.md
   HIP_FORCE_DEV_KERNARG=1   ROCm runtime knobs passed through when set: kernargs in VRAM,
   HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
   RADIANCE_HW_QUEUES=1      HIP compute queues per priority (GPU_MAX_HW_QUEUES). 1 keeps the async
@@ -399,10 +396,6 @@ if [ "$EOUT" = 1 ]; then CACHE_SUF="$CACHE_SUF-eo"; fi
 # (the 08-30 selector-graph burn), so a padded serve gets its own dir, keyed on TP as well since
 # the per-rank shapes differ between the TP=1/2 gates and TP=3. Unpadded serves keep their dir.
 if [ "$TP_PAD" != 0 ]; then CACHE_SUF="$CACHE_SUF-tp${TP}pad"; fi
-# Host-RAM KV tier (vLLM OffloadingConnector, patch_offload_mamba_eagle.py). Off by default; the
-# connector hooks attention and the scheduler, so a tier serve keeps its own cache dir.
-RAM_TIER_BYTES=${RAM_TIER_BYTES:-0}
-if [ "$RAM_TIER_BYTES" != 0 ]; then CACHE_SUF="$CACHE_SUF-rt"; fi
 CACHE=${CACHE:-$HOME/.radiance-cache-w4a8-093$CACHE_SUF}
 # TP=1 fp8-stream arm (radiance_arnq, RADIANCE_FP8_STREAM_TP1, 2026-09-16): the epilogue contract
 # without an all-reduce in it. It changes the traced graph at TP=1 only, and a TP=1 subdir of any
@@ -891,17 +884,6 @@ if [ "$KV_SRC" = profiled ] && [ "$GPU_UTIL" = "0.98" ]; then
   echo "[run]   another ~5% of KV cache on hardware it has not seen before."
 fi
 echo "[run] cache=$CACHE"
-KVT_CFG=""
-if [ "$RAM_TIER_BYTES" != 0 ]; then
-  # The tier is one mmap'd file in /dev/shm (--ipc=host: the host's), pinned for DMA.
-  shm_avail=$(df -B1 --output=avail /dev/shm 2>/dev/null | tail -1 | tr -d ' ')
-  if [ -n "$shm_avail" ] && [ "$shm_avail" -le "$RAM_TIER_BYTES" ]; then
-    die "RAM_TIER_BYTES=$RAM_TIER_BYTES does not fit in /dev/shm ($shm_avail bytes free)" \
-        "lower RAM_TIER_BYTES, or grow /dev/shm (e.g. sudo mount -o remount,size=48G /dev/shm)"
-  fi
-  KVT_CFG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$RAM_TIER_BYTES}}"
-  echo "[run] ram tier: $RAM_TIER_BYTES bytes of host RAM (OffloadingConnector)"
-fi
 echo "[run] chat-template=$CHAT_TEMPLATE"
 echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME stop $NAME"
 
@@ -1058,7 +1040,6 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     python3 patch_ar_qbits.py          # RADIANCE_AR_QBITS: 6 (shipped) | 5 | 4-bit all-reduce wire payload (libr4d rx8+)
     python3 patch_ar_3rank.py
     python3 patch_gdn_glue.py
-    python3 patch_offload_mamba_eagle.py   # RAM tier: GDN groups stay loadable under DFlash/MTP; inert without it
     # Non-fatal: fixes content=null on thinking-off requests; not required to serve.
     if [ "${RADIANCE_GDN_LAZY:-0}" = 1 ]; then python3 patch_gdn_lazy.py; fi   # TP=1 profile only; after the gdn builder patches it anchors on
     python3 patch_qwen3_thinkoff.py \
@@ -1095,7 +1076,6 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     --max-model-len "$MAXLEN" --max-num-seqs "${MAXSEQS:-8}" --max-num-batched-tokens "$CHUNK" \
     --attention-backend "$ATTN" \
     --speculative-config "$SPEC_CFG" \
-    ${KVT_CFG:+--kv-transfer-config "$KVT_CFG"} \
     $ASYNC_FLAG $EXTRA \
     --enable-prefix-caching --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     --override-generation-config '{"temperature":0.7,"top_p":0.95,"top_k":20}' \
