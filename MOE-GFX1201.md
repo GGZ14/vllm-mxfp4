@@ -1,8 +1,12 @@
-# MXFP4 MoE on gfx1201, split-KV verify attention, host-RAM KV tier, MoE prefill attention
+# MXFP4 MoE on gfx1201: native experts, split-KV verify, RAM tier, prefill attention, MTP depth, exact GDN scan, W4A8 prefill
 
-Four independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
+Seven independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
 All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the published image
 `stilldeadcode/vllm-radiance:0.9.3` (vLLM 0.27.1). Each is a single run unless noted.
+Sections 1-4 were measured with the launcher's old defaults (MTP-8, 8 sequences, GPU utilization 0.95).
+Sections 5-7 were measured with the new ones (MTP-4, 16 sequences, 0.97), on a launcher that also ran
+decode attention on AITER's unified kernel, which is not part of this repo; section 8 repeats the key
+numbers with `serve-moe-mxfp4.sh` itself.
 
 | Addition | Files | Default |
 |---|---|---|
@@ -10,6 +14,9 @@ All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the publi
 | Split-KV attention for spec-decode verify | `patch_attn_3d_multiq.py`, `moe-tests/test_attn_3d.py` | applied by `serve-moe-mxfp4.sh` only |
 | Host-RAM KV tier | `patch_offload_mamba_eagle.py`, `RAM_TIER_BYTES` in both launchers | off (`RAM_TIER_BYTES=0`) |
 | R4D prefill attention on the MoE lane | `patch_moe_prefill_attn.py`, `moe-r4d/` | on in `serve-moe-mxfp4.sh` (`MOE_PREFILL_ATTN=r4d`) |
+| MTP draft depth and sequence capacity | `SPEC`, `MAXSEQS`, `GPU_UTIL` in `serve-moe-mxfp4.sh` | on: `SPEC=4`, `MAXSEQS=16`, `GPU_UTIL=0.97` (were 8, 8, 0.95) |
+| Exact GDN chunk scan (libr4d #4) | `patch_gdn_scan_fix.py`, `moe-gdn2/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_GDN_SCAN_FIX=1`) |
+| W4A8 expert GEMMs for prefill | `patch_moe_w4a8.py`, `moe-w4a8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_W4A8=1`) |
 
 ## 1. MXFP4 MoE experts on gfx1201
 
@@ -399,15 +406,65 @@ Limits:
 - Decode was not kernel-traced (rocprofv3 `--attach` crashes the engine under graph-launched decode). Its
   evidence is the layer microbenchmark plus the served runs above.
 
+## 8. This launcher, end to end
+
+`serve-moe-mxfp4.sh` with the new defaults on `amd/Qwen3.5-35B-A3B-MXFP4`, docker, a copy of this tree (no
+`.git`), libr4d v0.5.0 already checked out. localeval, as in the sections above.
+
+- **Boot.** Every patch prints OK (`aiter a16w4`, `quark moe`, `unified_attention`, `radiance_r4d_attn`,
+  `gdn scan fix bind`, `moe w4a8: knob + import` and `dispatch`). The log shows `exact chunk scan ON` from the
+  API server and the engine core, and `W4A8 expert GEMMs ON (fp8 WMMA, calls >= 1025 tokens ...)`.
+- **KV cache.** 5.69 GiB, 334,367 tokens (5.10x at 65k) on the second start, which reused the compile cache.
+  **The one start on an empty compile cache sized 4.76 GiB (279,531 tokens)**: the profiling pass saw 1.77 GiB
+  of peak activation instead of 1.17 GiB, and 24.38 GiB of weights plus non-torch memory instead of 24.05.
+  Same flags, so if the first start comes up with the smaller pool, restart it. This was seen once and the
+  cause was not isolated.
+- **Prefill** (speed sweep, 128 forced tokens, 5 reps, median):
+
+  | Prompt | TTFT | Prefill tok/s | Section 4 (r4d, no W4A8, stock scan) | change |
+  |--:|--:|--:|--:|--|
+  | 4,088 | 0.30 s | 13,605 | 10,760 | +26% |
+  | 16,655 | 1.41 s | 11,808 | 9,128 | +29% |
+  | 33,879 | 3.38 s | 10,011 | 7,833 | +28% |
+
+  The section 4 column is a different session on this launcher before these changes. The controlled A/B is
+  section 7. One rep each at 4k (3,656 tok/s) and 16k (7,108) was slow; the medians do not include them.
+- **Decode, 1 stream** (9 reps x 256 tokens): 100.2 tok/s at 1k, 98.9 at 4k.
+- **gsm8k** (200, `--nonce`, thinking off): 0.345 and 0.385 in two runs, against 0.365-0.395 on the validated
+  stack. The standard error at n = 200 is about 0.034.
+- **Concurrency** (1k prompts, 512 tokens, 3 runs): 8 streams 368 / 383 / 430 tok/s aggregate, 12 streams
+  535 / 525 / 495. No errors, no traceback in the server log, at most 12 requests running and 0 waiting.
+- **Knob-off paths.** `SPEC=8`, `RADIANCE_GDN_SCAN_FIX=0`, `RADIANCE_MOE_W4A8=0`, `MOE_PREFILL_ATTN=off` and
+  `MOE_FIXES=0` each print the expected command. `SPEC=8` only changes the speculative config. For the other
+  four the container's patch and build chain also ran in the image without a GPU (twice per case: the second
+  pass reports NOOP for every patch):
+  - `MOE_PREFILL_ATTN=off` still mounts libr4d and builds the GDN module, and builds no `r4d_moe`;
+  - `RADIANCE_GDN_SCAN_FIX=0` builds and patches no GDN module, and leaves `radiance_gdn.py` untouched;
+  - `RADIANCE_MOE_W4A8=0` builds and patches no W4A8 module;
+  - `MOE_FIXES=0` keeps the GDN fix and drops W4A8 (it rides on the a16w4 lane).
+- The production launcher that sections 5-7 were measured on runs decode attention on AITER's unified kernel
+  (+13% / +21% decode at 16k / 32k). That patch is not in this repo, so decode at long context is not expected
+  to match it here.
+  Prefill and KV size matched production. The 8- and 12-stream aggregates averaged 394 and 518 tok/s over
+  three runs, 4% and 3% under the production launcher's single-run 410.5 and 535.8, inside the spread of the
+  three runs.
+
 ## Running
 
 ```bash
-# MoE (one card): fixes on, tier off
+# MoE (one card): fixes on, tier off. Defaults: MTP-4, 16 sequences, 0.97, exact GDN scan, W4A8 prefill
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
+# the previous defaults (MTP-8, 8 sequences, 0.95), or switch the newer pieces off one at a time
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_GDN_SCAN_FIX=0 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8=0 ./serve-moe-mxfp4.sh
+# W4A8 only from 2,049 tokens up
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8_MIN_TOKENS=2049 ./serve-moe-mxfp4.sh
 # the same with a 16 GiB host-RAM tier, or stock vLLM for comparison
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RAM_TIER_BYTES=17179869184 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 MOE_FIXES=0 ./serve-moe-mxfp4.sh
-# TRITON_ATTN prefill instead of R4D (no libr4d clone), or an existing libr4d v0.5.0 checkout
+# TRITON_ATTN prefill instead of R4D, or an existing libr4d v0.5.0 checkout. The libr4d clone is still made
+# for the GDN scan fix; with MOE_PREFILL_ATTN=off RADIANCE_GDN_SCAN_FIX=0 nothing needs it.
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 MOE_PREFILL_ATTN=off ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 R4D_SRC=~/src/libr4d ./serve-moe-mxfp4.sh
 
@@ -423,9 +480,25 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
 ## Not tested
 
 - The MoE lane at TP > 1.
-- R4D prefill under concurrent mixed prefill/decode batches (only single-stream runs were measured),
-  and on the `triton` mode end to end.
+- R4D prefill under concurrent mixed prefill/decode batches (only single-stream runs and the 1k-prompt
+  concurrency runs were measured), and on the `triton` mode end to end.
 - The RAM tier together with the MoE lane, and the RAM tier at TP = 2.
+- podman for `serve-moe-mxfp4.sh`. Its flags mirror `serve-mxfp4.sh`, but it has only been run with docker.
+- Sections 1-4 were measured at MTP-8 / 8 sequences / 0.95 and were not repeated at the new defaults, apart
+  from the end-to-end check in section 8.
+- The new capacity defaults: `GPU_UTIL=0.97` leaves about 1 GiB of the card free, and it was not tried with
+  another process on the same GPU (a desktop session, for instance). `MAXSEQS=14` is untested. The
+  depth-4 numbers use forced-length outputs; acceptance on real long answers was not re-measured.
+- W4A8 (`RADIANCE_MOE_W4A8`): no perplexity or long-generation quality run. The gsm8k check ran a test-only
+  mode, because its prompts never reach the 1,025-token threshold. The judged long-context set (n = 12) is
+  too small to show a difference, and its judge could not take the 32k rows. Per-layer numbers come from one
+  layer. A checkpoint other than Qwen3.5-35B-A3B-MXFP4 may have block-exponent gaps above the 14 the kernel
+  represents exactly.
+- Exact GDN scan (`RADIANCE_GDN_SCAN_FIX`): the served per-head error check used prompts up to about 4.1k
+  tokens, so a carried-over initial state from an earlier prefill chunk is covered by the synthetic kernel
+  tests (random initial state, multi-sequence batches) and by the 16.7k / 33.9k speed runs, not by a served
+  per-head measurement. The dense launcher `serve-mxfp4.sh` does not build the module. Its 48/16 head layout
+  is in the kernel tests and the patch applies to its `radiance_gdn.py`, but it was never served with it.
 - Qwen3.6-35B-A3B compressed-tensors W4A16 checkpoints (e.g. `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`).
   On the 0.9.3 image vLLM picks a MoE backend that fails with `'_C' has no gptq_marlin_repack`, and
   its dense MXFP4 layers fall back to emulation. That needs a separate patch.
