@@ -17,8 +17,14 @@
 #                          GQA 8 (moe-r4d/) serves runs >= 17 tokens, stock Triton split-KV the rest
 #                          (decode, verify). ~6x lower TTFT at 16k. Needs a libr4d checkout (below).
 #                     off: TRITON_ATTN for everything, as before.
-#   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d; cloned from R4D_REPO at
-#                     R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
+#   RADIANCE_GDN_SCAN_FIX=1  1: exact GDN chunk scan (moe-gdn2/, patch_gdn_scan_fix.py) in place of libr4d
+#                     v0.5.0's, which is wrong for any (sequence, head) whose in-chunk decay span exceeds
+#                     160 (libr4d #4; about 7% of GDN heads on real prompts). Same prefill speed. Built at
+#                     container start from a patch against the libr4d checkout (R4D_SRC), so it needs that
+#                     checkout with or without MOE_PREFILL_ATTN=r4d, and applies with or without MOE_FIXES.
+#                     0: libr4d's scan as is.
+#   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
+#                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
 #   RAM_TIER_BYTES=0  host-RAM KV cache tier in bytes (OffloadingConnector); 0 = off. Lives in /dev/shm.
 #   SPEC=4            MTP draft tokens; 0 disables speculation. In align mode each request pins 2 + SPEC GDN
@@ -27,7 +33,7 @@
 #                     measured at SPEC=8, MAXSEQS=8, GPU_UTIL=0.95.
 #   MAXLEN=65536  MAXSEQS=16  CHUNK=4096  GPU_UTIL=0.97  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
-#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-rt]   compile cache; never share one across knobs
+#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-rt]   compile cache; never share one across knobs
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -51,7 +57,9 @@ MAXLEN=${MAXLEN:-65536}; MAXSEQS=${MAXSEQS:-16}; CHUNK=${CHUNK:-4096}; GPU_UTIL=
 PORT=${PORT:-8080}; NAME=${NAME:-radiance-moe}; GPUS=${GPUS:-0}
 IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
 PA=${MOE_PREFILL_ATTN:-r4d}; HWQ=${RADIANCE_HW_QUEUES:-1}
+GDNFIX=${RADIANCE_GDN_SCAN_FIX:-1}
 case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)" ;; esac
+case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDNFIX)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
 [ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
@@ -66,6 +74,7 @@ case "$SNAP" in */snapshots/*) MODEL_ID=$(basename "$(dirname "$(dirname "$SNAP"
 SERVED_NAMES=${SERVED_NAMES:-$(basename "$MODEL_ID")}
 
 CACHE_SUF="-f$MOE_FIXES"; [ "$PA" != off ] && CACHE_SUF="$CACHE_SUF-pa$PA"
+[ "$GDNFIX" = 1 ] && CACHE_SUF="$CACHE_SUF-gdn2"
 [ "$RAM_TIER_BYTES" != 0 ] && CACHE_SUF="$CACHE_SUF-rt"
 CACHE=${CACHE:-$HOME/.radiance-cache-moe-$(echo "$MODEL_ID" | tr '/' '_')$CACHE_SUF}
 mkdir -p "$CACHE"/vllm "$CACHE"/inductor "$CACHE"/triton "$CACHE"/aiter
@@ -97,12 +106,13 @@ if [ "$RAM_TIER_BYTES" != 0 ]; then
   TIER=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$RAM_TIER_BYTES}}")
 fi
 BACKEND=TRITON_ATTN; R4D_MNT=()
-if [ "$PA" = r4d ]; then
-  BACKEND=R4D
-  if [ ! -f "$R4D_SRC/r4d_attn_prefill_h256_gqa6.hip" ]; then
+[ "$PA" = r4d ] && BACKEND=R4D
+# The libr4d checkout is read by both the GQA-8 prefill build (r4d) and the exact GDN scan build.
+if [ "$PA" = r4d ] || [ "$GDNFIX" = 1 ]; then
+  if [ ! -f "$R4D_SRC/r4d_attn_prefill_h256_gqa6.hip" ] || [ ! -f "$R4D_SRC/r4d_gdn_wmma.h" ]; then
     echo "[serve-moe] cloning libr4d $R4D_VERSION into $R4D_SRC (once)"
     git clone -q --depth 1 -b "$R4D_VERSION" "$R4D_REPO" "$R4D_SRC" \
-      || die "could not clone $R4D_REPO at $R4D_VERSION" "point R4D_SRC at a libr4d $R4D_VERSION checkout, or set MOE_PREFILL_ATTN=off"
+      || die "could not clone $R4D_REPO at $R4D_VERSION" "point R4D_SRC at a libr4d $R4D_VERSION checkout, or set MOE_PREFILL_ATTN=off RADIANCE_GDN_SCAN_FIX=0"
   fi
   R4D_MNT=(-v "$(cd "$R4D_SRC" && pwd)":/r4dsrc:ro)
 fi
@@ -124,9 +134,18 @@ else
   PRE="python3 patch_offload_mamba_eagle.py"
   FIX_ENV=(-e RADIANCE_MOE_W4A16=0)
 fi
+# The exact-scan kernel is built straight into the image's site-packages, which is also where the patch edits
+# the installed radiance_gdn.py (never a copy that sits next to the patch scripts).
+if [ "$GDNFIX" = 1 ]; then
+  # libr4d #4: libr4d v0.5.0's GDN chunk scan without the midpoint decay split. moe-gdn2/build.sh patches a
+  # temporary copy of R4D_SRC's scan (no libr4d source in this repo), builds it, and the patch binds it.
+  PRE="$PRE && SP=\$(python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
+  PRE="$PRE && R4D_SRC=/r4dsrc OUT=\$SP/radiance_gdn2.so bash moe-gdn2/build.sh && python3 patch_gdn_scan_fix.py"
+  FIX_ENV+=(-e RADIANCE_GDN_SCAN_FIX=1)
+fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX hw_queues=$HWQ ram_tier=$RAM_TIER_BYTES spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \

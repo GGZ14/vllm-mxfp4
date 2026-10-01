@@ -246,6 +246,78 @@ More requests queued, and aggregate throughput fell:
 `MAXSEQS=14` (14 x 5 = 70 fits the captured sizes) is an untested alternative. `SPEC=8 MAXSEQS=8 GPU_UTIL=0.95`
 restores the old defaults.
 
+## 6. Exact GDN chunk scan (`RADIANCE_GDN_SCAN_FIX`)
+
+libr4d v0.5.0's `r4d_gdn_chunk_scan_k128_v128_c64_bf16` (libr4d issue #4) carries the in-chunk decay on the
+chunk's midpoint `c = (G_first + G_last) / 2`: `e^{G_i-G_j} = e^{G_i-c} * e^{c-G_j}`. Each factor is clamped at
+e^80, so any (sequence, head) whose chunk span `G_first - G_last` exceeds 160 gets finite but wrong outputs and
+carried state. On this model that is common: 67 of 960 GDN heads exceeded it over about 25k tokens of real
+prompts.
+
+`radiance_gdn2` is the same kernel without the split. It never splits a factor that is <= 1:
+- diagonal 16x16 tiles use elementwise `e^{min(G_i-G_j, 0)}`;
+- below-diagonal tiles use `e^{G_i-c_J} * e^{c_J-G_j}`, with `c_J` the G at the end of the tile's 16-token block,
+  so both factors are <= 1;
+- the state path uses `e^{G_last-G_t}` directly.
+
+`G` is a cumsum of non-positive values, so every exponent is <= 0. Nothing can overflow, and an underflow to 0
+is the right value at fp32 precision. The extra tile fits in the LDS the kernel already has (59.5 of 64 KB), so
+no barrier and no buffer are added. The ABI is r4d's 18 arguments, so `radiance_gdn.py` calls it from the same site.
+
+**How it ships.** No libr4d source is stored in this repo, and the module is not a copy of libr4d's file.
+- `moe-gdn2/radiance_gdn2_vs_v050.patch` is a unified diff against libr4d v0.5.0's
+  `r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip`. It carries the lines it adds, the 29 lines it removes, and 3 lines
+  of context around each hunk.
+- `moe-gdn2/build.sh` runs at container start. It checks that `R4D_SRC` is libr4d 0.5.0 and that the scan and
+  `r4d_gdn_wmma.h` have the v0.5.0 md5s, applies the patch to a temporary copy of the scan
+  (`moe-gdn2/apply_patch.py`, because the image has neither `patch` nor `git`), checks the patched file's md5,
+  and compiles it with the image's hipcc into site-packages. Any mismatch is fatal.
+- `patch_gdn_scan_fix.py` binds `radiance_gdn`'s `_CHUNK_SCAN` to it under `RADIANCE_GDN_SCAN_FIX=1`. A missing
+  module is an import error at startup, never a silent fallback to the inexact scan. The log shows
+  `[radiance.gdn] exact chunk scan ON` in the API server and in the engine core.
+- The launcher needs the libr4d checkout for this even with `MOE_PREFILL_ATTN=off`, and applies it with
+  `MOE_FIXES=0` too, because the GDN scan runs in every mode.
+
+Error against an fp64 token-by-token recurrence (36 cases on the MoE 32/16 and dense 48/16 head layouts: decay
+0.02-92 per token, mixed fast/slow heads, partial chunks, spans of exactly 160 and 170, batches, random beta and
+initial state), relative error of output / state:
+
+| case | libr4d v0.5.0 scan | exact scan |
+|---|--:|--:|
+| not exposed (span <= 160) | 0.29-0.34% / 0.16-0.25% | same, bit-identical |
+| span 163.8 (2.6 per token) | 15.0% / 84.8% | 0.27% / 0.13% |
+| span 201.6 (3.2 per token) | 46.0% / 100% | 0.26% / 0.09% |
+| 8, 50, 92 per token | 82-99% / 100% | 0.23-0.24% / 0.00% |
+| **max over 36 cases** | 98.6% / 100% | **0.343% / 0.253%** |
+
+The remaining error is the kernel's own bf16 staging. The stock instantiation built from the same source is
+bit-identical to the image's `r4d.so` in all 36 cases.
+
+In the served model (per-head error against an fp64 recurrence, about 25k tokens of prompts, 420 scan calls),
+whole-model output error goes from **7.45%** to **0.18%**, normed output from 26.96% to 0.12%, and state from
+18.38% to 0.17%. That is the bf16 baseline.
+
+Cost, localeval speed (128 forced tokens, 5 reps, fresh nonce):
+
+| Prompt | libr4d scan | exact scan |
+|--:|--:|--:|
+| 4.1k | 10,842 tok/s | 10,894 (+0.5%) |
+| 16.7k | 9,145 | 9,196 (+0.6%) |
+| 33.9k | 7,974 | 7,982 (+0.1%) |
+
+- The scan is 2-3% of MoE prefill, and the exact kernel runs at -4% to +10% of the stock one (single sequence,
+  2,224 and 4,096 tokens, both head layouts), so the served difference is within noise.
+- gsm8k (200, `--nonce`, thinking off): **0.375 against 0.215** (and 0.210 / 0.195 on repeats), +0.160 with a
+  2-SE band of 0.090. The unfixed scan is also unstable between conditions: without a nonce it scores about as
+  well as the fixed one, with a nonce it drops. The cause was not isolated.
+- Container start took about 30 s longer on that production launcher (126 s against 91-96 s), because the
+  module compiles at start.
+- A post-pass that replays the flagged heads in fp32 is exact too, but costs 9-16% of prefill. This repo does
+  not carry one.
+
+`RADIANCE_GDN_SCAN_FIX=0` runs libr4d's scan as is, and then no libr4d checkout is needed unless
+`MOE_PREFILL_ATTN=r4d`.
+
 ## Running
 
 ```bash
