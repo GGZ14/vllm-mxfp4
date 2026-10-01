@@ -383,8 +383,15 @@ Three more defaults, each with a switch (`SPEC`/`MAXSEQS`/`GPU_UTIL`, `RADIANCE_
   checkout, so no libr4d source is stored here, and prefill speed is unchanged.
 - fp8-WMMA W4A8 expert GEMMs for prefill-sized calls (1,025 tokens and up): +25-28% prefill, decode unchanged.
 
-Together the launcher prefills 13.6k / 11.8k / 10.0k tok/s at 4k / 16k / 34k. In one test the first start on
-an empty compile cache came up with less KV (4.76 against 5.69 GiB); a restart got 5.69.
+Three decode-side defaults cut the bytes each step reads, each with a switch (`RADIANCE_MOE_DRAFT_HEAD`,
+`RADIANCE_MOE_DENSE_FP8`, `RADIANCE_MOE_GATE_FIX`): an int2 copy of `lm_head` for the MTP draft passes only (the verify
+head stays bf16, outputs unchanged), fp8 copies of the bf16 dense layers (+1.06 GiB of KV), and a fused shared-expert
+gate. On a fixed 20-prompt set, single-stream decode went from 117 to 139 tok/s with the draft head and from 136 to
+154 tok/s with the other two on top (separate sessions).
+
+Together the launcher prefills 14.9k / 12.6k / 10.6k tok/s at 4k / 16k / 34k and decodes 141 tok/s single-stream
+(490 / 632 aggregate at 8 / 12 streams, 1k prompts). In both tests the first start on an empty compile cache came up
+with less KV (5.62 against 6.55 GiB in the latest); a restart gets the full pool.
 Design, measurements and caveats are in [MOE-GFX1201.md](MOE-GFX1201.md).
 
 ```bash
@@ -1076,4 +1083,4 @@ specific to this fork rather than general to gfx1201, so the image build compile
 | [PERFORMANCE.md](PERFORMANCE.md) | The change-by-change optimization ledger, the 0.5.8 -> 0.7.4 provenance A/B, and the gated-delta-net NaN write-up |
 | [MXFP4-NOTES.md](MXFP4-NOTES.md) | Design notes, measurements and traps behind `serve-mxfp4.sh` |
 | [TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) | The TP=3 dummy-head padding design and its validation gates |
-| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts: design and measurements |
+| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts, int2 draft head, fp8 dense layers, fused gate: design and measurements |

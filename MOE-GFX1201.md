@@ -1,12 +1,13 @@
-# MXFP4 MoE on gfx1201: native experts, split-KV verify, prefill attention, MTP depth, exact GDN scan, W4A8 prefill
+# MXFP4 MoE on gfx1201: native experts, split-KV verify, prefill attention, MTP depth, exact GDN scan, W4A8 prefill, int2 draft head, fp8 dense layers, fused gate
 
-Six independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
+Nine independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
 All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the published image
 `stilldeadcode/vllm-radiance:0.9.3` (vLLM 0.27.1). Each is a single run unless noted.
 Sections 1-3 were measured with the launcher's old defaults (MTP-8, 8 sequences, GPU utilization 0.95).
-Sections 4-6 were measured with the new ones (MTP-4, 16 sequences, 0.97), on a launcher that also ran
-decode attention on AITER's unified kernel, which is not part of this repo; section 7 repeats the key
-numbers with `serve-moe-mxfp4.sh` itself.
+Sections 4-9 were measured with the new ones (MTP-4, 16 sequences, 0.97), on a launcher that also ran
+decode attention on AITER's unified kernel, which is not part of this repo; section 10 repeats the key
+numbers with `serve-moe-mxfp4.sh` itself. Sections 7-9 were measured on top of sections 4-6 (exact scan and
+W4A8 on), and 8 and 9 on top of 7: the int2 draft head was on in every arm of their A/Bs.
 
 | Addition | Files | Default |
 |---|---|---|
@@ -16,6 +17,9 @@ numbers with `serve-moe-mxfp4.sh` itself.
 | MTP draft depth and sequence capacity | `SPEC`, `MAXSEQS`, `GPU_UTIL` in `serve-moe-mxfp4.sh` | on: `SPEC=4`, `MAXSEQS=16`, `GPU_UTIL=0.97` (were 8, 8, 0.95) |
 | Exact GDN chunk scan (libr4d #4) | `patch_gdn_scan_fix.py`, `moe-gdn2/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_GDN_SCAN_FIX=1`) |
 | W4A8 expert GEMMs for prefill | `patch_moe_w4a8.py`, `moe-w4a8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_W4A8=1`) |
+| Draft-only int2 lm_head | `patch_moe_drafthead.py`, `moe-drafthead/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DRAFT_HEAD=int2`, only with `SPEC > 0`) |
+| FP8 dense layers | `patch_moe_densefp8.py`, `moe-densefp8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DENSE_FP8=1`) |
+| Fused shared-expert gate | `patch_moe_densefp8.py`, `moe-densefp8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_GATE_FIX=1`) |
 
 ## 1. MXFP4 MoE experts on gfx1201
 
@@ -191,7 +195,7 @@ localeval speed, 1k-token prompts, 1024 forced output tokens, one run per cell:
 - gsm8k (200, `--nonce`, thinking off): 0.380 against 0.365 at the old defaults, noise.
 - No traceback or OOM line under 16-stream load. At 16 streams the 16th request waits and runs alone at the end.
 - Measured on a separate production launcher (R4D prefill, decode attention on AITER's unified kernel, a GDN
-  repair post-pass), not on `serve-moe-mxfp4.sh`. Section 7 has this launcher's own numbers.
+  repair post-pass), not on `serve-moe-mxfp4.sh`. Section 10 has this launcher's own numbers.
 
 **No-go: a larger CUDA-graph size.** A full batch is 16 x 5 = 80 tokens per decode step, above the largest
 capture size (72). Adding 80 to `cudagraph_capture_sizes` made steps faster (+15% per stream at 16 streams)
@@ -360,10 +364,277 @@ Limits:
 - Decode was not kernel-traced (rocprofv3 `--attach` crashes the engine under graph-launched decode). Its
   evidence is the layer microbenchmark plus the served runs above.
 
-## 7. This launcher, end to end
+## 7. Draft-only int2 lm_head (`RADIANCE_MOE_DRAFT_HEAD`)
 
-`serve-moe-mxfp4.sh` with the new defaults on `amd/Qwen3.5-35B-A3B-MXFP4`, docker, a copy of this tree (no
-`.git`), libr4d v0.5.0 already checked out. localeval, as in the sections above.
+Single-stream decode is no longer bounded by the experts. rocprofv3 `--attach` on single-stream decode of the
+served model, compiled without CUDA graphs so the kernels can be attributed (per decode step):
+
+| | per step | share |
+|---|--:|--:|
+| kernel busy (31 steps) | 20.7 ms | |
+| **lm_head** (verify + 3.32 draft passes) | **6.89 ms** | **33.3%** |
+| bf16 dense GEMMs (including `shared_expert_gate`) | 6.87 ms | 33.2% |
+| target expert GEMMs (a16w4) | 3.44 ms | 16.7% |
+| MTP experts / MoE routing + reduce / GDN | | 1.8% / 2.6% / 3.3% |
+| attention / sampling / norms + elementwise | | 0.9% / 0.3% / 7.9% |
+
+An eager trace puts lm_head at 27.1%, but eager splits the inductor fusions and inflates "other", so the compiled
+trace is the representative one. Each MTP draft pass computes the full-vocab logits `[batch, 248320]` against the
+bf16 `lm_head` (1.017 GB, untied) and takes the argmax. The image's dynamic draft runs 1 to 4 passes per step
+(3.3 on average), and the verify pass reads the head once more. At 634 GB/s one read is 1.6 ms.
+
+The drafter only needs the top-1 token (`draft_sample_method` is greedy, so drafts are one-hot in rejection
+sampling). A worse draft costs acceptance and nothing else, because the verify pass scores with the target's own
+`LogitsProcessor` and its bf16 head. So the drafter's head can be approximate.
+
+**`patch_moe_drafthead.py`** (with `moe-drafthead/radiance_moe_drafthead.py`, copied into site-packages) ends
+`Qwen3_5MTP.load_weights` with `radiance_moe_drafthead.arm(self)`. The drafter's own `LogitsProcessor` gets a
+compressed copy of its populated lm_head; the target's `LogitsProcessor` is not touched. This happens before vLLM
+sizes the KV cache, so the copy's memory shows up in "Available KV cache memory". Modes:
+- **int2** (default): the image's `radiance_drafthead`, an int2 g128 asymmetric coarse pass plus an exact bf16 rerank
+  of the top 32 candidates. 0.133 GiB.
+- **int4**: g128 symmetric, on vLLM's RDNA W4A16 kernels (HIP `wvSplitK_int4_g` up to M = 5, Triton above). 0.244 GiB.
+- **fp8**: per-row e4m3 weights with bf16 activations, a Triton weight-only GEMV. 0.475 GiB.
+- Every mode checks a 512-row sample of the compressed copy against the head, at load and again on the first real
+  call, and raises on a mismatch. A test that hands it the wrong head raised in all three modes.
+
+The head alone, `[248320, 2048]`, per call (GB/s = weight bytes / time):
+
+| | M = 1 | M = 5 | M = 16 |
+|---|--:|--:|--:|
+| bf16 (`wvSplitK` / `F.linear`, the stock head) | 1605 µs (634 GB/s) | 1628 | 1667 |
+| fp8 per-row, Triton weight-only | 835 | 850 | 878 |
+| int4 g128 (`wvSplitK_int4_g` up to M = 5, Triton above) | 413 | 527 | 1098 |
+| int2 g128 + exact rerank | 487 | 481 | 460 |
+
+End to end, same stack as section 6 (exact scan, W4A8), on a production-style launcher set up with the defaults that
+`serve-moe-mxfp4.sh` has now.
+The greedy-equality set is 20 prompts x 256 tokens at temperature 0, and tok/s on those identical outputs is the
+controlled single-stream A/B:
+
+| arm | identical to off | acceptance (tokens/step) | tok/s, identical outputs (2 runs) | localeval 1k decode | 8 / 12 streams | gsm8k 200 | KV GiB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| off | 20/20 (off vs off) | 3.305 | 116.7 / 117.0 | 103.3 / 99.9 | 412 / 530; 411 / 554 | 0.355 / 0.385 | 5.69 |
+| fp8 | 20/20 | 3.293 | 129.7 / 131.8 (+12%) | 109.7 (noise) | 416 / 575 | 0.365 | 5.19 |
+| int4 | 20/20 | 3.277 | 136.5 / 137.9 (+18%) | 117.0 (+13%) | 444 / 578 | 0.370 | 5.42 |
+| **int2** | 20/20 | 3.304 | **138.1 / 139.3 (+19%)** | **121.3 (+17%)** | **449 / 605** | 0.395 | 5.49 |
+
+- The outputs were identical in every arm, so no divergence analysis was needed. A divergence could only have been a
+  near-tie flip caused by different verify positions.
+- Acceptance and the drafted tokens per step (3.28) did not move with int2, so its coarse logits do not hurt the depth
+  gate's softmax either.
+- gsm8k is within noise for every arm (`localeval compare`, 2 SE about ±0.097; the off arm itself moved 0.030).
+- The 4k localeval decode depends on the content (one rep in some runs decodes at about 200 tok/s), so it is not used
+  for the A/B.
+- 8 and 12 streams ran with no errors and no regression.
+- In production (the tatooine service, localeval 1k decode): single stream **125.9 tok/s** (it was about 100-103
+  before), 8 / 12 streams 459.4 / 598.1.
+- The copy costs 0.133 GiB for int2 (KV -0.20 GiB), 0.244 GiB for int4 and 0.475 GiB for fp8. int2 is the fastest arm at
+  1 and 12 streams and the cheapest in memory, which is why it is the default.
+
+**Which `radiance_drafthead`.** The int2 mode reuses the image's module and relies on its internals:
+`_quantize_head_now(lp, head)`, `RERANK`, and the `_radiance_wq` / `_radiance_scale` / `_radiance_zs` buffers it leaves
+on the `LogitsProcessor`, plus its quarter-major packing (`_dequant_int2` rebuilds rows from it for the sample check).
+The 0.9.3 image's copy (md5 3e957338) is older than this repo's `radiance_drafthead.py` (md5 265a8593, which adds
+fp8 lm_head support, `RADIANCE_DRAFT_RERANK`, a packing cache and unconditional deferral of the quantization), and
+the launcher serves with the image's copy: nothing in it puts the repo's on the import path. Both copies provide
+everything the patch uses, with the same packing. A kernel-level check on the real lm_head (arm each mode on a stand-in
+drafter, compare the logits with bf16, give the first-call guard a wrong head) printed identical error figures with
+both copies: int2 relative error 0.408 at M = 1 and 0.514-0.560 at M = 2-16, and the guard raised in all three modes.
+The int2 call took 0.44-0.47 ms with the image's copy and 0.46-0.49 ms with this repo's. Only the image's copy was served,
+so an image rebuilt from this repo's file is covered by that check and not by a served run.
+
+Limits:
+- The first-use check against the shared head runs on the first request, after the server is up. A mismatch there
+  would kill the engine on that request, not at boot. Send one request after starting.
+- `RADIANCE_FAST_DRAFT=1` is the image's own hook for the same head. Do not set it together with this knob: its
+  wrapper around `load_weights` runs outside the patch and would re-arm the head last. Setting it alone, without this
+  patch, was not tested here and has no first-use check.
+- The patch needs TP = 1 (a vocab-sharded head raises) and a bf16 / fp16 lm_head.
+- Acceptance was measured on the 20-prompt equality set (forced 256-token answers). Acceptance on real long answers
+  was not re-measured.
+
+`RADIANCE_MOE_DRAFT_HEAD=off` runs the stock bf16 draft head and imports nothing. The knob is also dropped when
+`SPEC=0`, since there is no draft pass then.
+
+## 8. FP8 dense layers (`RADIANCE_MOE_DENSE_FP8`)
+
+The bf16 dense layers are the next block after the lm_head: Quark leaves the GDN and attention projections and the
+shared expert in bf16, and they take 33.2% of the step in the section 7 trace. `patch_moe_densefp8.py` (with
+`moe-densefp8/radiance_moe_densefp8.py` and the HIP kernel `moe-densefp8/radiance_fp8w.hip`) hooks the end of vLLM's
+`process_weights_after_loading`, before KV sizing:
+- It skips the MTP drafter (by class name).
+- The target's `in_proj_qkvz`, `out_proj`, `qkv_proj`, `o_proj` and the shared expert's `gate_up_proj` / `down_proj`
+  (160 linears, 2.62 GiB bf16) are quantized to e4m3 with one fp32 scale per output row into one contiguous arena
+  (1.31 GiB). The bf16 parameters are dropped.
+- Each layer's quant method becomes an fp8 apply that calls one opaque custom op,
+  `torch.ops.vllm.radiance_fp8w_linear`, which picks the kernel by (N, K, M) from a measured table:
+  - M <= 16: the better of the HIP skinny W8A16 kernel and Triton W8A16;
+  - 17 to 80: Triton W8A16 tiles;
+  - above 80: `torch._scaled_mm` rowwise W8A8 with vLLM's per-token fp8 activation quant. This is the only place
+    activations are quantized, and it only runs in prefill chunks. At M = 4096 it is 1.3-1.4x faster than the bf16
+    hipBLASLt GEMM; every weight-only path is 15-50% slower there.
+- A load-time self-check runs every shape across every dispatch band (19 M values) against `x @ dequant(W)^T`. It also
+  compiles every Triton variant before graph capture. Worst relative error: HIP / Triton 0.0018, W8A8 0.027.
+
+Kept in bf16, on purpose:
+- `in_proj_ba`: its outputs feed the GDN beta (a sigmoid) and decay (`exp(-exp(A_log) * softplus(a + dt_bias))`), so an
+  error compounds through the recurrence across every later token. 4 MB in all and latency-bound.
+- `mlp.gate`, the router: a top-8-of-256 choice flips on small logit changes, and vLLM builds it with
+  `quant_config=None`.
+- `shared_expert_gate`: a scalar gate (section 9).
+- `lm_head` (the verify head stays exact) and the whole MTP drafter.
+
+`moe-densefp8/radiance_fp8w.hip` is the HIP skinny kernel, built at container start with the image's hipcc by
+`moe-densefp8/build.sh` (a few seconds). A block is WV output columns x SK K-splits waves; each wave owns one output
+column over one contiguous K slice and keeps M accumulators, and the SK partials are reduced in LDS in a fixed order, so
+it is deterministic and needs no second kernel. A 128-bit load is 16 fp8 weights; they are expanded with the gfx12
+hardware converter `v_cvt_f32_fp8` (exact), packed to bf16 pairs with `v_perm` (exact, fp8 has at most 4 significant
+bits) and multiplied with `v_dot2_f32_bf16`; the row scale is applied once in the epilogue. M <= 16.
+On gfx1201 the packed `__builtin_amdgcn_cvt_pk_f32_fp8` returned the selected byte in both halves (a one-hot test
+shows it); the scalar `__builtin_amdgcn_cvt_f32_fp8` with a constant byte select is exact, so the kernel uses that.
+
+Per call at M = 5 (single-stream verify), inside a captured CUDA graph with the weights rotated over at least 256 MB
+so the 64 MB last-level cache cannot hold them, µs / GB/s:
+
+| shape (calls per step) | bf16 (stock) | HIP W8A16 | Triton W8A16 | `_scaled_mm` W8A8 + act quant |
+|---|--:|--:|--:|--:|
+| `in_proj_qkvz` 12288x2048 (x30) | 83.0 / 606 | **46.6 / 541** | 57.7 / 437 | 72.8 / 346 |
+| `out_proj` 2048x4096 (x30) | 30.8 / 544 | **18.8 / 446** | 28.9 / 290 | 44.9 / 187 |
+| `qkv_proj` 9216x2048 (x10) | 62.7 / 602 | **36.5 / 518** | 45.0 / 420 | 58.5 / 323 |
+| `o_proj` 2048x4096 (x10) | 30.9 / 543 | **18.9 / 444** | 28.1 / 298 | 44.9 / 187 |
+| shared expert `gate_up` 1024x2048 (x40) | 9.9 / 423 | **8.3 / 254** | 15.7 / 134 | 17.5 / 120 |
+| shared expert `down` 2048x512 (x40) | 6.6 / 318 | 6.4 / 166 | **5.6 / 190** | 24.5 / 43 |
+
+vLLM rounds CUDA-graph sizes up to multiples of 1 + `SPEC` (5, 10, 20, ... at `SPEC=4`), so one stream always verifies
+at M = 5, 8 streams at M = 40 and 12 streams at M = 60.
+
+End to end, same session, same launcher, knobs only (the int2 head is on in every arm). The fixed-prompt set is the
+20 x 256 greedy set of section 7; acceptance comes from the server's Prometheus spec-decode counters:
+
+| arm | KV GiB | fixed prompts tok/s (acceptance) | localeval 1k decode | 8 / 12 streams (warm) | prefill TTFT 4k / 16k / 32k | gsm8k, 2 runs | mmlu |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| off | 5.49 | 135.7 (3.304) | 115.2 / 117.5 | 463 / 607 (2 runs) | 0.30 / 1.39 / 3.32 s | 0.375 / 0.390 | 0.839 |
+| gate only (section 9) | 5.79 | 140.9 (3.303), **+3.8%** | 128.5 | 477 / 614 | 0.29 / 1.39 / 3.33 s | 0.365 (1 run) | not run |
+| fp8 only | 6.55 | 147.1 (3.272), **+8.4%** | 131.3 / 118.4 | 477 / 604 | 0.28 / 1.34 / 3.22 s | 0.375 / 0.395 | 0.839 |
+| **both** | **6.55** | **154.4 (3.257), +13.8%** | 139.2 / 140.9 | **491 / 622** | **0.28 / 1.33 / 3.19 s** | 0.395 / 0.365 | 0.839 |
+
+- "off" is the mean of three fixed-prompt runs (134.0 / 135.8 / 137.3), "both" the mean of two (153.6 / 155.2). A third
+  "both" run, 145.0 tok/s, was the first traffic after a fresh compile: the stock MoE Triton kernels were still
+  JIT-compiling on their first shapes. Cold, the gain is about +8%; warm, +14%.
+- The step shrinks from 24.3 ms (off) to 22.2 (fp8) and 21.1 ms (both). Acceptance falls about 1% with fp8 (3.304 to
+  3.272) and 1.4% with both, so tok/s rises less than the step time falls (+8.4% / +13.8% against -9% / -13%).
+- localeval's 1k decode moves with the content, because the outputs differ per arm and so does acceptance.
+- Prefill is +3-6% at 4k-32k (the W8A8 GEMMs at M > 80). localeval calls that noise, but the sign is the same at all
+  three sizes. No regression.
+- Quality: every `localeval compare` verdict against off is "noise" (gsm8k 2 SE about ±0.097, mmlu ±0.062). The gate-only
+  arm has one gsm8k run and no mmlu.
+- 8 / 12 streams are warm runs, one per fp8 arm (two for off). A cold cache gave 433 / 618 (fp8) and 450 / 573 (both).
+  Single runs vary by about ±5%, so the 8-stream gain (+6%, one warm pair) is weak evidence and 12 streams is noise.
+- In production (the tatooine service, 1k decode): single stream 141-155 tok/s, 8 streams 484.6 (warm), 12 streams
+  628-644, prefill 14,702 / 11,673 / 10,623 tok/s at 4.1k / 16.7k / 33.9k, gsm8k 0.395.
+
+Numerics and outputs:
+- The fp8 per-row weight error on real layer-0 / layer-3 weights is 2.6% (relative Frobenius). Layer output error is
+  2.4-2.8% against fp32 (bf16 itself is 0.17%); W8A8 gives 3.3-3.9%.
+- Greedy outputs diverge from off on 18 of 20 fixed prompts, with fp8 and with both. Every first divergence is a near-tie:
+  the top-2 logprob margin is at most 0.5 for fp8, and the arm's token is off's second choice in 18 of 18 (both: 17
+  of 18, largest margin 0.63).
+
+KV memory. Of the 1.31 GiB freed, 1.06 GiB reaches the KV pool; about 0.35 GiB stays reserved by torch's allocator in
+20 MB segments that still hold live tensors.
+
+Limits:
+- Needs its own compile cache (`-dfp8`). vLLM's AOT compile-cache key does not see the swapped linear apply: a copied bf16
+  cache replays the bf16 graph on the uint8 weights and the profile run dies with `expected mat1 and mat2 to have the
+  same dtype`. A cold cache costs about a minute of compile, plus JIT of the stock MoE Triton kernels on the first new
+  prefill shapes: TTFT is 1-1.6 s higher on the first few requests after the first start, then normal.
+- A cold-cache start sizes the KV pool smaller (5.62 GiB against 6.55 GiB on the warm restart, in production), as in
+  section 10. Restart once.
+- W8A8 is only used for prefill chunks (M > 80), so prefill and decode numerics differ slightly. The W4A8 experts make
+  the same split.
+- M = 81 to 511 goes to `_scaled_mm` but was not measured. At M = 80 it is slower than bf16 on `out_proj` / `o_proj`
+  (52 against 47 µs); at M = 512 it is faster on every big shape. Small prefill chunks and mixed batches in that range may
+  lose a few µs per call.
+- M = 65 to 80 (13 or more streams) uses the 128-row Triton tiles, about 10% slower than bf16 on the 2048x4096 shapes
+  (at the kernel level, not end to end). M = 60, the 12-stream size, uses the 64-row tile and wins.
+- Tested with the int2 draft head on in every arm, and only on Qwen3.5-35B-A3B-MXFP4 (the layer list and the
+  M table are measured on its shapes).
+
+`RADIANCE_MOE_DENSE_FP8=0` keeps the bf16 layers and builds no HIP module.
+
+## 9. Fused shared-expert gate (`RADIANCE_MOE_GATE_FIX`)
+
+Every MoE layer computes `sigmoid(shared_expert_gate(x)) * out` as three kernels. The 1x2048 gate falls to a hipBLASLt
+GEMV that alone takes about 20 µs per call, 40 times per step. `patch_moe_densefp8.py` (the same patch as section 8)
+makes `Qwen2MoeMLP.forward` (target and drafter) call one Triton kernel, `torch.ops.vllm.radiance_gate_mul`, which takes
+about 3 µs per call and emulates the bf16 roundings of the three ops it replaces. A stride / dtype guard falls back to the
+original path. Only the dot product's summation order differs from hipBLASLt: it is bit-equal on the bench checks.
+
+- Fixed-prompt decode: +3.8% (140.9 against 135.7 tok/s), the step 24.3 to 23.4 ms (predicted 0.72 ms, measured
+  0.9 ms). In the serve 15 of 20 fixed prompts are identical over 256 tokens; the other 5 flip at exact near-ties (top-2
+  margin at most 0.125, and the arm's token is off's second choice). Acceptance is unchanged (3.303 against 3.304).
+- KV +0.3 GiB on its own (5.49 to 5.79) from less non-torch memory (24.24 to 23.94 GiB consumed, weights equal). The
+  cause is not isolated; it does not add on top of section 8 (both = 6.55 GiB).
+- The gate-only arm has one gsm8k run (0.365) and no mmlu.
+
+`RADIANCE_MOE_GATE_FIX=0` keeps the three stock ops. It is applied through a flag in `qwen2_moe.py` that the patch
+installs either way, so it gets its own `-gate` compile-cache suffix.
+
+## 10. This launcher, end to end
+
+Two runs of `serve-moe-mxfp4.sh` on `amd/Qwen3.5-35B-A3B-MXFP4`, docker, a copy of this tree (no `.git`), libr4d
+v0.5.0 already checked out, localeval as in the sections above. The first ran with the defaults of sections 4-6,
+before sections 7-9 existed; the second has all nine on and is the launcher as it stands.
+
+### All nine on
+
+`SNAP` pointed at the Hugging Face cache snapshot, `RUNTIME=docker`, `DETACH=1`, the default knobs, and a compile cache that
+did not exist yet; the server was stopped and started again for the warm start.
+
+- **Boot.** Every patch prints OK, including the three new ones (`moe draft head: arm in Qwen3_5MTP.load_weights`, `moe dense
+  fp8: convert hook`, `moe gate fix`, two patches) and both builds (`radiance_fp8w`, `radiance_moe_w4a8_hip`). The log shows
+  `exact chunk scan ON` from the API server and the engine core, `W4A8 expert GEMMs ON`, `MoE dense fp8 ON: 160 linears` (2.62
+  to 1.31 GiB), `MoE gate fix ON` for the target (40 gates) and the MTP drafter (1), each with a self-check difference of 0, and
+  `MoE draft head int2 ON`. After the first request: `int2 draft head verified against the shared lm_head at first use (sample
+  rel. error 0.5254, tol 0.8)`. No traceback in either start.
+- **Start time and KV cache.** The cold start took 242 s and sized the KV pool at **5.62 GiB** (331,692 tokens). The warm
+  restart took 115 s and got **6.55 GiB** (385,191 tokens, 5.88x at 65k), the pool of the production launcher. The previous run
+  had 5.69 GiB, so fp8 layers and gate (+1.06 GiB) net of the draft head (-0.20 GiB) are +0.86 GiB. The smaller pool on the first
+  start was seen in both runs (sections 4-6 defaults: 4.76 against 5.69 GiB); restart once.
+- **Decode** (1k prompts, 512 forced tokens, 3 reps, warm; the sweep ran twice and this is the second):
+  1 stream **140.6 tok/s** (138.6-141.4), 8 streams **490.4** aggregate, 12 streams **632.1**. The first run, right after the
+  start, gave 139.1 / 353.9 / 569.1: the 8-stream cell had a 2.9 s TTFT, probably the first new prompt shapes JIT-compiling the
+  stock MoE kernels, as seen on the production launcher. Before sections 7-9 this launcher measured 100.2 tok/s single-stream and 394 / 518 at 8 / 12 streams (three runs);
+  the production launcher with all nine measured 141-155, 484.6 and 628-644.
+- **Prefill** (speed sweep, 128 forced tokens, 5 reps, median):
+
+  | Prompt | TTFT | Prefill tok/s | Before sections 7-9 | change |
+  |--:|--:|--:|--:|--:|
+  | 4,089 | 0.28 s | 14,873 | 13,605 | +9% |
+  | 16,633 | 1.32 s | 12,627 | 11,808 | +7% |
+  | 33,858 | 3.20 s | 10,589 | 10,011 | +6% |
+
+  The 16k cell had one slow rep (7,703 tok/s); the median does not include it. The previous column is the earlier run
+  below (a different session).
+- **gsm8k** (200, `--nonce`, thinking off): 0.395. The standard error at n = 200 is about 0.034, and the earlier runs of this
+  launcher scored 0.345 and 0.385.
+- **Knob-off paths.** `RADIANCE_MOE_DRAFT_HEAD=off`, `RADIANCE_MOE_DENSE_FP8=0`, `RADIANCE_MOE_GATE_FIX=0`, `SPEC=0` and
+  `MOE_FIXES=0` each print the expected command, and bad values (`RADIANCE_MOE_DRAFT_HEAD=int8`, `RADIANCE_MOE_DENSE_FP8=yes`,
+  `RADIANCE_MOE_GATE_FIX=2`) stop with an error. With all three new knobs off the printed command, the patch chain, the
+  environment and the cache path are byte-identical to the previous revision's. The container's patch and build chain also ran
+  in the image without a GPU, twice per case (the second pass reports NOOP for every patch; the builds and the module copies
+  rerun):
+  - `RADIANCE_MOE_DRAFT_HEAD=off` patches nothing in `qwen3_5_mtp.py` and installs no `radiance_moe_drafthead`;
+  - `SPEC=0` does the same (the head drops with the speculation) and passes no `RADIANCE_MOE_DRAFT_HEAD`;
+  - `RADIANCE_MOE_DENSE_FP8=0` builds no `radiance_fp8w`, drops `-dfp8` from the cache path, and still applies the gate fix;
+  - `RADIANCE_MOE_GATE_FIX=0` still applies both patches (the gate is a flag in `qwen2_moe.py`) with the flag off, and the cache
+    path has no `-gate`;
+  - both off: `patch_moe_densefp8.py` is not run, `radiance_moe_densefp8` is not installed;
+  - `MOE_FIXES=0` drops dense fp8, the gate fix and W4A8, and keeps the draft head and the GDN fix;
+  - `MOE_FIXES=0 RADIANCE_GDN_SCAN_FIX=0 RADIANCE_MOE_DRAFT_HEAD=off` leaves an empty chain.
+
+### Sections 4-6 defaults only (earlier run)
 
 - **Boot.** Every patch prints OK (`aiter a16w4`, `quark moe`, `unified_attention`, `radiance_r4d_attn`,
   `gdn scan fix bind`, `moe w4a8: knob + import` and `dispatch`). The log shows `exact chunk scan ON` from the
@@ -406,12 +677,16 @@ Limits:
 ## Running
 
 ```bash
-# MoE (one card): fixes on. Defaults: MTP-4, 16 sequences, 0.97, exact GDN scan, W4A8 prefill
+# MoE (one card): fixes on. Defaults: MTP-4, 16 sequences, 0.97, exact GDN scan, W4A8 prefill, int2 draft head,
+# fp8 dense layers, fused expert gate
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
 # the previous defaults (MTP-8, 8 sequences, 0.95), or switch the newer pieces off one at a time
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_GDN_SCAN_FIX=0 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8=0 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_HEAD=off ./serve-moe-mxfp4.sh   # or fp8 / int4
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DENSE_FP8=0 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_GATE_FIX=0 ./serve-moe-mxfp4.sh
 # W4A8 only from 2,049 tokens up
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8_MIN_TOKENS=2049 ./serve-moe-mxfp4.sh
 # stock vLLM for comparison
@@ -434,7 +709,7 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
   concurrency runs were measured), and on the `triton` mode end to end.
 - podman for `serve-moe-mxfp4.sh`. Its flags mirror `serve-mxfp4.sh`, but it has only been run with docker.
 - Sections 1-3 were measured at MTP-8 / 8 sequences / 0.95 and were not repeated at the new defaults, apart
-  from the end-to-end check in section 7.
+  from the end-to-end check in section 10.
 - The new capacity defaults: `GPU_UTIL=0.97` leaves about 1 GiB of the card free, and it was not tried with
   another process on the same GPU (a desktop session, for instance). `MAXSEQS=14` is untested. The
   depth-4 numbers use forced-length outputs; acceptance on real long answers was not re-measured.
@@ -448,6 +723,21 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
   tests (random initial state, multi-sequence batches) and by the 16.7k / 33.9k speed runs, not by a served
   per-head measurement. The dense launcher `serve-mxfp4.sh` does not build the module. Its 48/16 head layout
   is in the kernel tests and the patch applies to its `radiance_gdn.py`, but it was never served with it.
+- Draft head (`RADIANCE_MOE_DRAFT_HEAD`): acceptance was measured on a 20-prompt set of forced 256-token answers, not on
+  real long answers. The first-use guard runs on the first request, so a server that booted can still fail on it;
+  `RADIANCE_FAST_DRAFT=1` alone (without this patch) was not tested, and neither were both knobs together. The fp8 and
+  int4 modes ran only in the production-style bench, not through `serve-moe-mxfp4.sh` (the launcher's dry runs print the
+  right command for them). TP > 1 is rejected by the patch.
+- FP8 dense layers and fused gate: prefill chunks of 81 to 511 tokens (they go to `_scaled_mm`) were not measured; at
+  13 or more streams two layer shapes run about 10% slower at the kernel level (not measured end to end);
+  mixed prefill/decode batches were not measured; only Qwen3.5-35B-A3B-MXFP4 was served, with the int2 draft head on in
+  every arm, and no run compares all three of sections 7-9 on against all three off in one session (the chain is
+  117 / 139 / 154 tok/s across two sessions on the same fixed prompts). Greedy outputs differ from the bf16 layers at
+  near-ties on 18 of 20 prompts, and there is no perplexity or long-generation quality run beyond gsm8k (200, twice per
+  arm) and mmlu (localeval `--limit 5`, one run per arm; the gate-only arm has one gsm8k run and no mmlu). The first
+  prompt shapes after a cold start JIT the stock MoE kernels for 1-2 s.
+- Sections 7-9 were measured on a production-style launcher with AITER decode attention. Section 10 has this launcher's
+  own numbers, which are lower at long context for that reason.
 - Qwen3.6-35B-A3B compressed-tensors W4A16 checkpoints (e.g. `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`).
   On the 0.9.3 image vLLM picks a MoE backend that fails with `'_C' has no gptq_marlin_repack`, and
   its dense MXFP4 layers fall back to emulation. That needs a separate patch.
