@@ -27,6 +27,12 @@
 #                     chunks) run on an fp8-WMMA W4A8 grouped kernel (moe-w4a8/, patch_moe_w4a8.py); decode,
 #                     MTP verify and CUDA-graph calls stay on a16w4. ~+25% prefill. Rides on the a16w4 lane,
 #                     so it needs MOE_FIXES=1 and is ignored with MOE_FIXES=0. 0: a16w4 only.
+#   RADIANCE_MOE_DRAFT_HEAD=int2  off | fp8 | int4 | int2: the MTP drafter's draft passes score against a compressed copy
+#                     of lm_head (patch_moe_drafthead.py, moe-drafthead/); the verify pass keeps the bf16 head, so
+#                     accepted tokens are unchanged. int2 = the image's radiance_drafthead (int2 g128 + exact top-32
+#                     rerank), 0.13 GiB: single-stream decode +19% on identical outputs, KV -0.20 GiB. Applies only with
+#                     SPEC > 0 (there is no draft head otherwise). off = the stock bf16 head. Do not also set
+#                     RADIANCE_FAST_DRAFT=1: the image's own hook would re-arm the head last.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
@@ -64,11 +70,14 @@ GDNFIX=${RADIANCE_GDN_SCAN_FIX:-1}; W4A8=${RADIANCE_MOE_W4A8:-1}; W4A8_MIN=${RAD
 case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)" ;; esac
 case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDNFIX)" ;; esac
 case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;; esac
+DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}
+case "$DH" in off|fp8|int4|int2) ;; *) die "RADIANCE_MOE_DRAFT_HEAD must be off, fp8, int4 or int2 (got $DH)" ;; esac
 case "$W4A8_MIN" in ''|*[!0-9]*) [ -z "$W4A8_MIN" ] || die "RADIANCE_MOE_W4A8_MIN_TOKENS must be an integer (got $W4A8_MIN)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
 [ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
 [ "$MOE_FIXES" = 1 ] || W4A8=0   # W4A8 rides on the a16w4 lane that MOE_FIXES=1 enables
+[ "$SPEC" != 0 ] || DH=off       # the draft head only exists with speculation
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
 
@@ -147,9 +156,15 @@ if [ "$W4A8" = 1 ]; then
   FIX_ENV+=(-e RADIANCE_MOE_W4A8=1)
   [ -n "$W4A8_MIN" ] && FIX_ENV+=(-e RADIANCE_MOE_W4A8_MIN_TOKENS="$W4A8_MIN")
 fi
+if [ "$DH" != off ]; then
+  # draft-only compressed lm_head: the drafter's LogitsProcessor gets the copy at Qwen3_5MTP.load_weights, before KV
+  # sizing; the target's (verify) keeps bf16. int2 reuses the image's radiance_drafthead (checked, MOE-GFX1201.md).
+  pre_add "python3 patch_moe_drafthead.py"
+  FIX_ENV+=(-e RADIANCE_MOE_DRAFT_HEAD="$DH")
+fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
