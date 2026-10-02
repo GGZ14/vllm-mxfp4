@@ -59,6 +59,21 @@
 #                     to overlap under RADIANCE_MOE_ASYNC=1, which turns the dynamic draft off. Both knobs need MOE_FIXES=1
 #                     and SPEC > 0 (patch_moe_draftloop.py, moe-draftloop/, applied after pad-route; no compile-cache
 #                     change). 0 = the stock loop.
+#   RADIANCE_MOE_ASYNC=1  1: vLLM async scheduling. Step N+1's scheduling and input preparation run while step N's sampler and
+#                     MTP drafter are on the GPU, which hides ~2.2 ms per step of GPU-idle host glue, and every verify batch
+#                     replays the FULL graph. vLLM refuses --async-scheduling together with disable_padded_drafter_batch,
+#                     so this also turns the padded drafter batch on, and patch_moe_async.py turns the image's dynamic draft
+#                     (RADIANCE_DYNAMIC_DRAFT) off: its ragged drafts and per-pass host gate do not fit the GPU-resident
+#                     draft path, so MTP drafts a fixed SPEC tokens every step. Fixed-prompt decode +12.1%, single stream
+#                     +8%, 8 / 12 / 16 streams +8 / +3 / +2%. Applies only with SPEC > 0. The first start on a compile cache
+#                     that never held the padded drafter graph compiles it and sizes KV ~0.85 GiB smaller; restart once.
+#                     0 = sync scheduling, the unpadded drafter and the image's dynamic draft (the behavior before this knob).
+#   RADIANCE_MOE_DRAFT_WARM=16  N, 0..64: once the server answers, a background client in the container sends k concurrent
+#                     24-token requests for k = 1..N (warm_draftloop.py), so the drafter-loop graph of every batch size is
+#                     captured before users arrive. N=16: 6.7 s after ready, ~0.55 GiB allocated earlier (the memory lazy
+#                     capture takes after the first bursts; KV unchanged), first-burst TTFT at 8 / 12 / 16 streams
+#                     0.79 / 0.84 / 0.88 -> 0.42 / 0.68 / 0.67 s. Needs RADIANCE_MOE_DRAFT_GRAPH=1 and SPEC > 0, and is
+#                     ignored without them. 0 = capture lazily, inside the first burst at each new concurrency.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
@@ -101,12 +116,16 @@ case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDN
 case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;; esac
 DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}; DFP8=${RADIANCE_MOE_DENSE_FP8:-1}; GF=${RADIANCE_MOE_GATE_FIX:-1}
 PR=${RADIANCE_MOE_PAD_ROUTE:-1}; DG=${RADIANCE_MOE_DRAFT_GRAPH:-1}; DO=${RADIANCE_MOE_DRAFT_OVERLAP:-1}
+AS=${RADIANCE_MOE_ASYNC:-1}; DW=${RADIANCE_MOE_DRAFT_WARM:-16}
 case "$DH" in off|fp8|int4|int2) ;; *) die "RADIANCE_MOE_DRAFT_HEAD must be off, fp8, int4 or int2 (got $DH)" ;; esac
 case "$DFP8" in 0|1) ;; *) die "RADIANCE_MOE_DENSE_FP8 must be 0 or 1 (got $DFP8)" ;; esac
 case "$GF" in 0|1) ;; *) die "RADIANCE_MOE_GATE_FIX must be 0 or 1 (got $GF)" ;; esac
 case "$PR" in 0|1) ;; *) die "RADIANCE_MOE_PAD_ROUTE must be 0 or 1 (got $PR)" ;; esac
 case "$DG" in 0|1) ;; *) die "RADIANCE_MOE_DRAFT_GRAPH must be 0 or 1 (got $DG)" ;; esac
 case "$DO" in 0|1) ;; *) die "RADIANCE_MOE_DRAFT_OVERLAP must be 0 or 1 (got $DO)" ;; esac
+case "$AS" in 0|1) ;; *) die "RADIANCE_MOE_ASYNC must be 0 or 1 (got $AS)" ;; esac
+case "$DW" in ''|*[!0-9]*) die "RADIANCE_MOE_DRAFT_WARM must be an integer from 0 to 64 (got $DW)" ;; esac
+[ "$DW" -le 64 ] || die "RADIANCE_MOE_DRAFT_WARM must be an integer from 0 to 64 (got $DW)"
 case "$W4A8_MIN" in ''|*[!0-9]*) [ -z "$W4A8_MIN" ] || die "RADIANCE_MOE_W4A8_MIN_TOKENS must be an integer (got $W4A8_MIN)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
@@ -114,7 +133,8 @@ case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $
 [ "$MOE_FIXES" = 1 ] || W4A8=0   # W4A8 rides on the a16w4 lane that MOE_FIXES=1 enables
 [ "$MOE_FIXES" = 1 ] || { DFP8=0; GF=0; }   # fp8 dense layers and the fused gate were measured only on top of the MoE fixes
 [ "$MOE_FIXES" = 1 ] || { PR=0; DG=0; DO=0; }   # pad-route and the drafter-loop knobs were measured only on top of the MoE fixes
-[ "$SPEC" != 0 ] || { DH=off; DG=0; DO=0; }     # the draft head and the drafter loop only exist with speculation
+[ "$SPEC" != 0 ] || { DH=off; DG=0; DO=0; AS=0; }   # the draft head, the drafter loop and async spec decode only exist with speculation
+[ "$DG" = 1 ] || DW=0            # the warm-up captures the drafter-loop graphs, so it needs them
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
 
@@ -162,9 +182,12 @@ if [ "$PA" = r4d ] || [ "$GDNFIX" = 1 ]; then
   fi
   R4D_MNT=(-v "$(cd "$R4D_SRC" && pwd)":/r4dsrc:ro)
 fi
+# vLLM refuses --async-scheduling together with disable_padded_drafter_batch, so the two are one switch.
+UNPAD=true; ASYNC_FLAG=--no-async-scheduling
+[ "$AS" = 1 ] && { UNPAD=false; ASYNC_FLAG=--async-scheduling; }
 SPEC_ARGS=()
 if [ "$SPEC" != 0 ]; then
-  SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$BACKEND\",\"disable_padded_drafter_batch\":true}")
+  SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC,\"attention_backend\":\"$BACKEND\",\"disable_padded_drafter_batch\":$UNPAD}")
 fi
 PRE=""; pre_add() { PRE="${PRE:+$PRE && }$1"; }
 if [ "$MOE_FIXES" = 1 ]; then
@@ -220,9 +243,20 @@ if [ "$DG" = 1 ] || [ "$DO" = 1 ]; then
   pre_add "python3 patch_moe_draftloop.py"
   FIX_ENV+=(-e RADIANCE_MOE_DRAFT_GRAPH="$DG" -e RADIANCE_MOE_DRAFT_OVERLAP="$DO")
 fi
+if [ "$AS" = 1 ]; then
+  # async scheduling needs the padded drafter batch (the two flags above) and the image's dynamic draft off: its ragged
+  # drafts do not fit vLLM's GPU-resident [B, K] draft tensor. After the drafter-loop patch, which edits the same image file.
+  pre_add "python3 patch_moe_async.py"
+  FIX_ENV+=(-e RADIANCE_MOE_ASYNC=1)
+fi
+if [ "$DW" != 0 ]; then
+  # background client in the container: waits for /v1/models, then k concurrent short requests for k = 1..DW, so every
+  # drafter-loop graph is captured before the first users arrive. Never fails the serve.
+  pre_add "{ python3 warm_draftloop.py $PORT $DW ${SERVED_NAMES%% *} >&2 & }"
+fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF pad_route=$PR draft_graph=$DG draft_overlap=$DO hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF pad_route=$PR draft_graph=$DG draft_overlap=$DO async=$AS draft_warm=$DW hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
@@ -240,5 +274,5 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=
   --max-num-batched-tokens "$CHUNK" --kv-cache-dtype fp8 --attention-backend "$BACKEND" \
   --enable-prefix-caching --mamba-cache-mode align ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
   --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72]}' \
-  --no-async-scheduling --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  "$ASYNC_FLAG" --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --language-model-only --trust-remote-code "$@"
