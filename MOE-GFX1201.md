@@ -27,7 +27,7 @@ module-reading ones differ only in the path they read their module from), and th
 | Fused shared-expert gate | `patch_moe_densefp8.py`, `moe-densefp8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_GATE_FIX=1`) |
 | Padded-row routing (section 11) | `patch_moe_padroute.py`, `moe-padroute/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_PAD_ROUTE=1`, needs `MOE_FIXES=1`) |
 | Drafter-loop graph replay and overlapped gate (section 12) | `patch_moe_draftloop.py`, `moe-draftloop/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DRAFT_GRAPH=1`, `RADIANCE_MOE_DRAFT_OVERLAP=1`, need `MOE_FIXES=1` and `SPEC > 0`) |
-| Async scheduling and drafter-graph warm-up (section 13) | `patch_moe_async.py`, `warm_draftloop.py`, `moe-tests/smoke_async.py` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_ASYNC=1`, `RADIANCE_MOE_DRAFT_WARM=16`, only with `SPEC > 0`) |
+| Async scheduling and drafter-graph warm-up (section 13) | `patch_moe_async.py`, `warm_draftloop.py`, `moe-tests/smoke_async.py` | off by default; turn on with `RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16` (only with `SPEC > 0`) |
 
 ## 1. MXFP4 MoE experts on gfx1201
 
@@ -823,6 +823,10 @@ variable is 0: in the patched files the loop then runs the stock statements in t
 
 ## 13. Async scheduling and drafter-graph warm-up (`RADIANCE_MOE_ASYNC`, `RADIANCE_MOE_DRAFT_WARM`)
 
+Both knobs are **off by default** in `serve-moe-mxfp4.sh`. Production on one R9700 has run them since 2026-10-01 (numbers
+below), but this launcher with them on has only been checked by dry run. Turn them on together:
+`RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16`.
+
 Step glue is the largest remaining host stall. Timers on the engine, scheduler, runner and drafter functions, plus CUDA events at
 fixed step points, put the GPU-idle host time at about 2.2 ms of a 17.85 ms iteration on one stream (12%) and about 2.65 ms of
 37.6 ms at 8 streams (7%). One stream, ms: target input preparation 1.40 (attention metadata build 0.66, `_prepare_inputs` 0.42,
@@ -886,7 +890,7 @@ End to end, same session, fresh warm starts, trace off, production configuration
   identical (a traced async arm against the traced production arm: 11/20); the first divergences sit at top-2 margins of 0 to 0.375 (one where the arm's
   token is not the reference's second choice, at margin 0.25), with coherent text: the restart-floor class.
 
-**`RADIANCE_MOE_DRAFT_WARM=N`** (`warm_draftloop.py`, `N` = 16 by default) removes the first-burst capture of section 12. Once the
+**`RADIANCE_MOE_DRAFT_WARM=N`** (`warm_draftloop.py`; off by default, 16 recommended with async) removes the first-burst capture of section 12. Once the
 server answers `/v1/models`, a background client in the container sends k concurrent greedy 24-token requests for k = 1..N, so every
 k reaches at least three drafter loop passes and every key's graph is captured before users arrive. It logs one `[radiance.warm]`
 line per round and never fails the serve. N = 16 took 6.7 s after the server answered, with 16 keys captured and 0 fallbacks. It

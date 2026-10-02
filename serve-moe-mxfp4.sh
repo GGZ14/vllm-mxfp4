@@ -59,7 +59,8 @@
 #                     to overlap under RADIANCE_MOE_ASYNC=1, which turns the dynamic draft off. Both knobs need MOE_FIXES=1
 #                     and SPEC > 0 (patch_moe_draftloop.py, moe-draftloop/, applied after pad-route; no compile-cache
 #                     change). 0 = the stock loop.
-#   RADIANCE_MOE_ASYNC=1  1: vLLM async scheduling. Step N+1's scheduling and input preparation run while step N's sampler and
+#   RADIANCE_MOE_ASYNC=0  (off by default: run in production, but this launcher with it on is dry-run checked only;
+#                     turn on together with RADIANCE_MOE_DRAFT_WARM=16) 1: vLLM async scheduling. Step N+1's scheduling and input preparation run while step N's sampler and
 #                     MTP drafter are on the GPU, which hides ~2.2 ms per step of GPU-idle host glue, and every verify batch
 #                     replays the FULL graph. vLLM refuses --async-scheduling together with disable_padded_drafter_batch,
 #                     so this also turns the padded drafter batch on, and patch_moe_async.py turns the image's dynamic draft
@@ -68,7 +69,7 @@
 #                     +8%, 8 / 12 / 16 streams +8 / +3 / +2%. Applies only with SPEC > 0. The first start on a compile cache
 #                     that never held the padded drafter graph compiles it and sizes KV ~0.85 GiB smaller; restart once.
 #                     0 = sync scheduling, the unpadded drafter and the image's dynamic draft (the behavior before this knob).
-#   RADIANCE_MOE_DRAFT_WARM=16  N, 0..64: once the server answers, a background client in the container sends k concurrent
+#   RADIANCE_MOE_DRAFT_WARM=0  N, 0..64 (16 with async): once the server answers, a background client in the container sends k concurrent
 #                     24-token requests for k = 1..N (warm_draftloop.py), so the drafter-loop graph of every batch size is
 #                     captured before users arrive. N=16: 6.7 s after ready, ~0.55 GiB allocated earlier (the memory lazy
 #                     capture takes after the first bursts; KV unchanged), first-burst TTFT at 8 / 12 / 16 streams
@@ -116,7 +117,7 @@ case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDN
 case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;; esac
 DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}; DFP8=${RADIANCE_MOE_DENSE_FP8:-1}; GF=${RADIANCE_MOE_GATE_FIX:-1}
 PR=${RADIANCE_MOE_PAD_ROUTE:-1}; DG=${RADIANCE_MOE_DRAFT_GRAPH:-1}; DO=${RADIANCE_MOE_DRAFT_OVERLAP:-1}
-AS=${RADIANCE_MOE_ASYNC:-1}; DW=${RADIANCE_MOE_DRAFT_WARM:-16}
+AS=${RADIANCE_MOE_ASYNC:-0}; DW=${RADIANCE_MOE_DRAFT_WARM:-0}
 case "$DH" in off|fp8|int4|int2) ;; *) die "RADIANCE_MOE_DRAFT_HEAD must be off, fp8, int4 or int2 (got $DH)" ;; esac
 case "$DFP8" in 0|1) ;; *) die "RADIANCE_MOE_DENSE_FP8 must be 0 or 1 (got $DFP8)" ;; esac
 case "$GF" in 0|1) ;; *) die "RADIANCE_MOE_GATE_FIX must be 0 or 1 (got $GF)" ;; esac

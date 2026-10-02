@@ -392,7 +392,7 @@ gate. On a fixed 20-prompt set, single-stream decode went from 117 to 139 tok/s 
 Together the launcher prefills 14.9k / 12.6k / 10.6k tok/s at 4k / 16k / 34k and decodes 141 tok/s single-stream
 (490 / 632 aggregate at 8 / 12 streams, 1k prompts). In both tests the first start on an empty compile cache came up
 with less KV (5.62 against 6.55 GiB in the latest); a restart gets the full pool.
-Sections 11-13 of MOE-GFX1201.md add three more decode-side defaults, each with a switch (`RADIANCE_MOE_PAD_ROUTE`,
+Sections 11-13 of MOE-GFX1201.md add three more decode-side changes, each with a switch (11 and 12 on by default, 13 opt-in) (`RADIANCE_MOE_PAD_ROUTE`,
 `RADIANCE_MOE_DRAFT_GRAPH` / `RADIANCE_MOE_DRAFT_OVERLAP`, `RADIANCE_MOE_ASYNC` / `RADIANCE_MOE_DRAFT_WARM`): fixed-prompt
 tok/s +5.9%, +3.6% and +12.1%, each on top of the last, measured in production and not through this launcher. Async turns the
 image's dynamic draft off.
