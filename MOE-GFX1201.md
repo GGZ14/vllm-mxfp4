@@ -1,6 +1,6 @@
-# MXFP4 MoE on gfx1201: native experts, split-KV verify, prefill attention, MTP depth, exact GDN scan, W4A8 prefill, int2 draft head, fp8 dense layers, fused gate
+# MXFP4 MoE on gfx1201: native experts, split-KV verify, prefill attention, MTP depth, exact GDN scan, W4A8 prefill, int2 draft head, fp8 dense layers, fused gate, padded-row routing, drafter-loop graphs, async scheduling
 
-Nine independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
+Twelve independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
 All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the published image
 `stilldeadcode/vllm-radiance:0.9.3` (vLLM 0.27.1). Each is a single run unless noted.
 Sections 1-3 were measured with the launcher's old defaults (MTP-8, 8 sequences, GPU utilization 0.95).
@@ -8,6 +8,11 @@ Sections 4-9 were measured with the new ones (MTP-4, 16 sequences, 0.97), on a l
 decode attention on AITER's unified kernel, which is not part of this repo; section 10 repeats the key
 numbers with `serve-moe-mxfp4.sh` itself. Sections 7-9 were measured on top of sections 4-6 (exact scan and
 W4A8 on), and 8 and 9 on top of 7: the int2 draft head was on in every arm of their A/Bs.
+Sections 11-13 were measured one on top of the next, on top of all of that, on the same production-style launcher and on the
+image that `stilldeadcode/vllm-radiance:0.9.3` resolves to (digest `sha256:45694209...`, checked against Docker Hub on
+2026-10-01). **None of them was run through `serve-moe-mxfp4.sh`.** The production launcher applies the same patch files (the two
+module-reading ones differ only in the path they read their module from), and this launcher was checked with dry runs only
+(sections 11-13, Not tested).
 
 | Addition | Files | Default |
 |---|---|---|
@@ -20,6 +25,9 @@ W4A8 on), and 8 and 9 on top of 7: the int2 draft head was on in every arm of th
 | Draft-only int2 lm_head | `patch_moe_drafthead.py`, `moe-drafthead/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DRAFT_HEAD=int2`, only with `SPEC > 0`) |
 | FP8 dense layers | `patch_moe_densefp8.py`, `moe-densefp8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DENSE_FP8=1`) |
 | Fused shared-expert gate | `patch_moe_densefp8.py`, `moe-densefp8/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_GATE_FIX=1`) |
+| Padded-row routing (section 11) | `patch_moe_padroute.py`, `moe-padroute/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_PAD_ROUTE=1`, needs `MOE_FIXES=1`) |
+| Drafter-loop graph replay and overlapped gate (section 12) | `patch_moe_draftloop.py`, `moe-draftloop/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DRAFT_GRAPH=1`, `RADIANCE_MOE_DRAFT_OVERLAP=1`, need `MOE_FIXES=1` and `SPEC > 0`) |
+| Async scheduling and drafter-graph warm-up (section 13) | `patch_moe_async.py`, `warm_draftloop.py`, `moe-tests/smoke_async.py` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_ASYNC=1`, `RADIANCE_MOE_DRAFT_WARM=16`, only with `SPEC > 0`) |
 
 ## 1. MXFP4 MoE experts on gfx1201
 
@@ -586,7 +594,10 @@ installs either way, so it gets its own `-gate` compile-cache suffix.
 
 Two runs of `serve-moe-mxfp4.sh` on `amd/Qwen3.5-35B-A3B-MXFP4`, docker, a copy of this tree (no `.git`), libr4d
 v0.5.0 already checked out, localeval as in the sections above. The first ran with the defaults of sections 4-6,
-before sections 7-9 existed; the second has all nine on and is the launcher as it stands.
+before sections 7-9 existed; the second has all nine on and is the launcher as it stood before sections 11-13. Those three
+default on now and are in neither run. With `RADIANCE_MOE_PAD_ROUTE=0 RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0
+RADIANCE_MOE_ASYNC=0 RADIANCE_MOE_DRAFT_WARM=0` the launcher prints the command of the second run (the dry-run checks are in
+sections 11-13).
 
 ### All nine on
 
@@ -686,11 +697,237 @@ did not exist yet; the server was stopped and started again for the warm start.
   three runs, 4% and 3% under the production launcher's single-run 410.5 and 535.8, inside the spread of the
   three runs.
 
+## 11. Padded-row routing (`RADIANCE_MOE_PAD_ROUTE`)
+
+vLLM pads every CUDA-graph replay up to a captured size, which at MTP-4 means a multiple of 1 + 4 = 5 rows (section 8). One
+stream therefore verifies 2 to 5 real rows as 5, and every MTP draft pass after the first (one real row) also runs as 5. The
+padded rows hold stale hidden states, and the MoE router gives each of them its own top-8 experts, so the expert GEMMs read the
+weights of up to 8 extra experts per padded row and layer. A graphs-on trace against a no-graph trace at the same real row count
+puts that at 0.66 ms per step in the target's a16w4 experts and 0.83 ms in the drafter's bf16 experts: 1.49 ms, 7% of a 21.3 ms step.
+
+**`patch_moe_padroute.py`** copies `moe-padroute/radiance_moe_padroute.py` into site-packages and patches three vLLM files:
+- `fused_moe/runner/moe_runner.py`: right after the router GEMV in `MoERunner._forward_impl`, one tiny Triton kernel copies row
+  0's router logits into every padded row. It sits inside the opaque MoE op, so it is captured into the graphs. The padded rows
+  then pick row 0's experts, which are read anyway, and no extra weight bytes move. Real rows' logits are never written (checked at
+  load); vLLM discards the padded rows' outputs as before.
+- `v1/worker/gpu_model_runner.py` and `v1/spec_decode/llm_base_proposer.py`: `set_real(n_real, n_padded)` runs before the target
+  forward, the drafter's first pass and every loop pass. The real-row count has to reach the captured kernel as a device value (a
+  Python int would be baked into the graph at capture), so it goes into a persistent int32 buffer that holds a large value when the
+  forward is not padded. The kernel is then a no-op, and in unpadded eager forwards such as prefill chunks it is not launched.
+
+The fix changes no compiled graph, so there is no compile-cache suffix. It needs `MOE_FIXES=1`.
+
+Mechanism check (graphs-on trace with the knob, target a16w4 per step by real verify rows M, ms):
+
+| | M=2 | M=3 | M=4 | M=5 |
+|---|--:|--:|--:|--:|
+| before the fix, graphs on | 4.61 | 4.37 | 4.06 | 3.73 |
+| **with the fix, graphs on** | **2.24** | **2.71** | **3.23** | **3.61** |
+| no CUDA graphs (the reference) | 2.33 | 3.00 | 3.47 | 3.94 |
+
+The drafter's `fused_moe` per pass (passes 2-4) falls from 0.36 to 0.165 ms (no-graph: 0.088). The fix kernel itself runs 40 times
+per step for 0.045 ms in total; kernel busy time per step goes from 14.88 to 13.81 ms.
+
+End to end, same session, arms started fresh on a bench copy of the production launcher (`off` is the production configuration):
+
+| | off | **pad-route** |
+|---|--:|--:|
+| 20 fixed prompts x 256, tok/s (acceptance) | 155.4 / 153.5 / 156.3 / 157.8, mean 155.8 (3.27-3.31) | 164.5 / 165.5, mean **165.0** (3.312), **+5.9%** |
+| step | 21.2 ms | 20.1 ms |
+| 8 / 12 streams, aggregate tok/s, warm run | 500.1 / 632.9 | 538.8 / 662.7 (**+7.7% / +4.7%**) |
+| prefill TTFT 4k / 16k / 32k | 0.28 / 1.32 / 3.20 s | 0.28 / 1.33 / 3.19 s |
+| KV cache | 6.55 GiB | 6.54 GiB |
+| gsm8k 200, `--nonce`, thinking off | 0.375 / 0.400 | 0.400 / 0.395 (noise, 2 SE about 0.097) |
+| mmlu 5 per task | 0.832 | 0.835 (noise, 2 SE 0.062) |
+
+- In production: 8 streams 484.6 to 501-521 tok/s, 12 streams 628-644 to 673-679.
+- localeval's single-stream decode (1k prompts, 512 tokens) went from 130.1 to 145.0 tok/s, but that cell is content-dependent
+  (36% spread between reps), so the fixed-prompt set above is the number to use.
+- Greedy outputs flip at near-ties. Within one server process both arms repeat 20/20. Across restarts off against off gave 3/20
+  and 20/20 identical prompts, and pad-route against off gave 5/20; every first divergence is a near-tie (top-2 margin at most
+  0.25) and acceptance is unchanged (3.312 against 3.310), which rules out a real row taking row 0's routing. With one pad-route
+  start this cannot separate "the fix perturbs real rows at near-ties" (the expert kernels now see different per-expert row counts)
+  from "this start landed in another restart mode"; either way it is the restart-floor class of change.
+- A residual is left on the table: with 8 or fewer rows vLLM's Triton MoE assigns one block per token-expert pair, so 5 rows on row
+  0's 8 experts still read each expert 5 times (the last-level cache absorbs part). Skipping the padded pairs there would save about
+  0.27 ms per step more; it is not built.
+
+`RADIANCE_MOE_PAD_ROUTE=0` applies no patch and passes no variable. The patched sources are inert without the variable anyway: the
+flags are read at import and nothing is imported.
+
+## 12. Drafter-loop graph replay and overlapped gate (`RADIANCE_MOE_DRAFT_GRAPH`, `RADIANCE_MOE_DRAFT_OVERLAP`)
+
+With sections 7-11 in, one stream's step (about 19.6 ms) is kernels busy 13.8 ms (70%), dispatch gaps about 1.9 ms (10%, 1,344
+kernels) and CPU stalls of 3.3-3.8 ms (17-19%): the MTP drafter about 1.4 ms, step glue about 1.9 ms (section 13) and the target
+about 0.3 ms. (rocprofv3 adds about 1.7 µs at every kernel boundary, so the true dispatch gap is about 1.5 µs, the same for graph
+replay and eager launches.) vLLM 0.27.1 replays the verify under a FULL graph only for uniform batches, about 45% of steps, and runs
+the drafter piecewise always: per loop pass two graph pieces plus an eager attention segment (KV write, q fp8 quantization, AITER
+unified attention, reduce), each re-entered from Python, and with the image's dynamic draft every pass ends in a blocking D2H.
+The cheap knobs (AITER rmsnorm, `pass_config` fusions, cudagraph mode, dispatch environment variables) were each estimated below
+3% and not run.
+
+**`patch_moe_draftloop.py`** copies `moe-draftloop/radiance_moe_draftloop.py` into site-packages, patches the loop in
+`llm_base_proposer.py` and the image's dynamic-draft controller `radiance_draft.py`, and is applied after section 11's patch
+(both edit the same proposer):
+- `RADIANCE_MOE_DRAFT_GRAPH=1` captures each loop pass's whole drafter forward (the compiled pieces in NONE mode inside the capture,
+  plus the eager attention) as one graph per (real batch, padded batch) key. Loop passes are uniform, so every host-side decision in
+  the forward depends only on the key. `query_start_loc`, `block_table`, `slot_mapping` and the input buffers are read at fixed
+  addresses, and `seq_lens`, which is a per-step tensor, is copied into a persistent staging buffer before every replay.
+  **Every replay first compares the live metadata's tensor addresses and scalars with the captured ones and falls back to the
+  piecewise path on any difference.** A key is replayed only from its third use on: use 1 runs the normal path, use 2 runs the same
+  forward in NONE mode so that every kernel is compiled outside the capture, use 3 captures. A capture error turns the knob off for
+  the process and that pass runs the normal path. A draft can never change an output (the target verifies every token); a stale
+  input would show up as lower acceptance.
+- `RADIANCE_MOE_DRAFT_OVERLAP=1`: the dynamic-draft gate blocked on an 8-byte D2H right after each pass's draft head and only then
+  let the loop prepare the next pass. The copy now goes to pinned memory without blocking, and the decision is resolved after the next
+  pass's preparation, right before its forward (or in the draft postprocess). The same passes run; a pass the gate stops only wastes
+  its preparation.
+
+Neither changes a compiled graph: every arm loaded the same AOT artifacts, so there is no cache suffix. Both need `MOE_FIXES=1`
+and `SPEC > 0`.
+
+Trace with both on: the drafter's host stalls fall from 1.56 to 0.48 ms per step (0.43 to 0.15 ms per pass). End to end, 20 fixed
+prompts x 256, a bench copy of the production launcher with section 11 on in every arm, tok/s (acceptance):
+
+| arm | tok/s | |
+|---|--:|--:|
+| off, three starts | 163.0 (3.314) / 164.6 (3.331) / 164.7 (3.338), warm repeat 166.5 | mean 164.7 |
+| graph only | 167.3 (3.314) | +2.1% |
+| overlap only | 165.1 (3.288) | +0.8% |
+| **both** | 170.8 (3.331) / 169.7 (3.310), warm repeat 171.7 | mean **170.7, +3.6%** |
+
+Each knob alone is under the 3% bar this lane used; the pair clears it, because the overlap hides the preparation that the graph
+exposes. The same-session pair (off against both, two runs each) is 165.6 to 170.7 tok/s, +3.1%, about 20.2 to 19.4 ms per step.
+
+Fresh starts, same session, off against both:
+
+- localeval decode (1k prompts, 512 tokens, 3 reps): 154.2 (acceptance 2.694) to 151.6 (2.604), -1.7%, noise.
+- Concurrency 8 / 12, warm run: 517.4 / 653.7 to 521.8 / 691.6 tok/s (+0.9% / +5.8%). The first run gave 499.0 / 637.6 to
+  536.1 / 633.7, with the TTFT at 12 streams going from 0.63 to 1.45 s: the first burst at a new concurrency captures its graphs
+  inside a request (see Limits, and section 13's warm-up).
+- Prefill TTFT at 4k / 16k / 32k: 0.28 / 1.32 / 3.20 s to 0.28 / 1.33 / 3.19 s. KV 6.54 GiB in both.
+- gsm8k 200 (`--nonce`, thinking off): 0.395 to 0.400 and 0.390 to 0.380; mmlu 5 per task: 0.832 to 0.832; all noise.
+- Server log: 12 graph keys captured (B = 1..12), 0 fallbacks, no capture failure, no OOM.
+- Greedy equality: 20/20 within a process in both arms. Across restarts off against off gave 5/20 and 10/20, and both-on against
+  off 5/20, 20/20, 11/20 and 10/20; every first divergence is a near-tie.
+- In production: graphs captured for B = 1..16 with 0 fallbacks; 14 / 16 streams 707-709 / 688-756 tok/s.
+
+Limits:
+- The first burst at each new concurrency pays the capture (use 3 of its key) inside a user request: +0.8 s TTFT at 12 streams in
+  the run above. Section 13's warm-up removes that.
+- The drafter's first pass is not graphed (about 0.1-0.2 ms per step), and the key set grows with the concurrency.
+- Section 11 was on in every arm. `RADIANCE_MOE_DRAFT_GRAPH` or `_OVERLAP` without it was not run.
+
+With both knobs at 0 the patch is not applied and no variable is passed. With one of them on, the patch is applied and the other
+variable is 0: in the patched files the loop then runs the stock statements in the same order.
+
+## 13. Async scheduling and drafter-graph warm-up (`RADIANCE_MOE_ASYNC`, `RADIANCE_MOE_DRAFT_WARM`)
+
+Step glue is the largest remaining host stall. Timers on the engine, scheduler, runner and drafter functions, plus CUDA events at
+fixed step points, put the GPU-idle host time at about 2.2 ms of a 17.85 ms iteration on one stream (12%) and about 2.65 ms of
+37.6 ms at 8 streams (7%). One stream, ms: target input preparation 1.40 (attention metadata build 0.66, `_prepare_inputs` 0.42,
+the rest of `execute_model` 0.32, `_update_states` 0.06), drafter input preparation 0.40 (n-gram match prep for the dynamic draft
+0.19, `drafter.prepare_inputs` 0.12), engine 0.16, bookkeeping tail 0.10, draft postprocess 0.12. The scheduler, rejection sampling
+and the dynamic-draft decision are small, and detokenization runs in the API server process.
+
+**`RADIANCE_MOE_ASYNC=1`** is vLLM's own async scheduling: step N+1's scheduling, `_update_states`, `_prepare_inputs` and
+attention metadata are prepared and launched while step N's sampler and MTP drafter run on the GPU, and every verify batch (1 + K
+rows per request, always uniform) replays the FULL graph. In the launcher it is `--async-scheduling` with
+`disable_padded_drafter_batch` false: vLLM refuses async scheduling together with the unpadded drafter, so the two are one
+switch (`--no-async-scheduling` with `true` is what runs without the knob).
+
+What does not fit is the image's dynamic draft controller (`radiance_draft.py`, `RADIANCE_DYNAMIC_DRAFT`, on by default in the
+image). It returns ragged `list[list[int]]` drafts, and vLLM's async path keeps drafts on the GPU as one `[B, K]` tensor and asserts
+on anything else (`gpu_model_runner._prepare_input_ids`). It also gates every drafter pass on a host D2H, and builds its n-gram
+context from `token_ids_cpu`, which holds placeholders for the newest tokens under async scheduling. **`patch_moe_async.py`** makes
+`radiance_draft.install()` a no-op under the knob, so MTP drafts the stock fixed K and the target verifies all of them.
+`RADIANCE_MOE_DRAFT_OVERLAP` then has nothing left to overlap; `RADIANCE_MOE_DRAFT_GRAPH` keeps working (the loop passes stay
+uniform). Unchanged and working under async: MTP with the padded drafter and mamba align mode, R4D / AITER attention, section 11,
+the drafter-loop graphs (16 keys captured, 0 fallbacks), the int2 draft head, W4A8 and fp8 dense layers. The knob applies only
+with `SPEC > 0`.
+
+Traced decomposition, to see where the gain comes from (a trace costs about 3%; tok/s on the 20 fixed prompts, a 2048-token
+essay, 8 streams; acceptance):
+
+| | fixed prompts | essay | 8 streams | acceptance |
+|---|--:|--:|--:|--:|
+| production: sync, unpadded drafter, dynamic draft on | 165.4 | 154.6 | about 552 | 3.29 |
+| sync, unpadded, dynamic draft off | 174.5 | 159.9 | 552 | 3.45 |
+| sync, padded drafter, dynamic draft off | 177.4 | 153.4 | 558 | 3.44 |
+| **async, padded, dynamic draft off** | **194.2** | **177.0** | **569** | 3.48 |
+
+The async trace shows an iteration of 16.5 ms with the inter-step GPU gaps gone except 0.58 ms between steps; the host now waits
+11.9 ms per iteration on the previous step's accepted-count event, which is to say the step is GPU-bound.
+
+End to end, same session, fresh warm starts, trace off, production configuration against `RADIANCE_MOE_ASYNC=1`:
+
+| | off | **async** |
+|---|--:|--:|
+| 20 fixed prompts x 256, tok/s (acceptance) | 171.8 / 173.6, mean 172.7 (3.34) | 192.8 / 194.4, mean 193.6 (3.45), **+12.1%** |
+| localeval decode, 1k prompts, 512 tokens | 160.1 (2.75) | 173.4 (3.10), +8.3% |
+| 8 / 12 / 16 streams, warm run | 528.8 / 682.8 / 769.6 | 571.7 / 706.1 / 782.3 (**+8.1 / +3.4 / +1.7%**) |
+| 8 / 12 / 16 streams, first run | 522.9 / 686.8 / 750.8 | 535.7 / 703.8 / 790.1 |
+| TTFT at 8 / 12 / 16 streams, warm | 0.38 / 0.63 / 0.63 s | 0.41 / 0.68 / 0.68 s |
+| TTFT at 8 / 12 / 16 streams, first run | 0.42 / 0.64 / 0.63 s | 0.79 / 0.84 / 0.88 s |
+| prefill TTFT 4k / 16k / 32k | 0.28 / 1.32 / 3.18 s | 0.28 / 1.31 / 3.17 s |
+| gsm8k 200 (`--nonce`, thinking off) | 0.390 / 0.370 | 0.430 / 0.430 (noise, 2 SE about 0.098) |
+| mmlu 5 per task | 0.832 | 0.832 |
+| KV cache, warm | 6.54 GiB | 6.54 GiB |
+
+- In production: single stream 149-150 to 161-172 tok/s, 8 / 12 / 16 streams 549-566 / 710-729 / 776-783. The deploy smoke test
+  (`moe-tests/smoke_async.py`: a tool call alone and eight at once, guided JSON, temperature 0.7) passes every check.
+- The acceptance column rises because every step now verifies the full width (4.00 drafted tokens per step against 2.9-3.3), not
+  because drafts improved. On gsm8k the dynamic gate drafted 1.1-1.3 tokens per step at 93-94% acceptance; full width drafts 3.2
+  per step at 96-97%.
+- A separate arm with only the dynamic draft off (sync scheduling, unpadded drafter) was mixed against the same baseline: fixed
+  prompts +3.5%, decode -3.7%, concurrency +3.3 / +2.2 / -2.7%. It is the async part that pays.
+- No errors: 0 tracebacks, 0 ERROR lines, 16 drafter-loop graph keys captured with 0 fallbacks in both arms. Greedy equality is 20/20
+  within a process for off and for async, and 20/20 after three rounds of 12-stream client-abort churn. Across arms 5/20 are
+  identical (a traced async arm against the traced production arm: 11/20); the first divergences sit at top-2 margins of 0 to 0.375 (one where the arm's
+  token is not the reference's second choice, at margin 0.25), with coherent text: the restart-floor class.
+
+**`RADIANCE_MOE_DRAFT_WARM=N`** (`warm_draftloop.py`, `N` = 16 by default) removes the first-burst capture of section 12. Once the
+server answers `/v1/models`, a background client in the container sends k concurrent greedy 24-token requests for k = 1..N, so every
+k reaches at least three drafter loop passes and every key's graph is captured before users arrive. It logs one `[radiance.warm]`
+line per round and never fails the serve. N = 16 took 6.7 s after the server answered, with 16 keys captured and 0 fallbacks. It
+allocates about 0.55 GiB earlier than lazy capture would (the same memory the first bursts take later); the KV pool is sized before
+and stays 6.54 GiB. First-burst TTFT at 8 / 12 / 16 streams goes from 0.79 / 0.84 / 0.88 to 0.42 / 0.68 / 0.67 s, and the first run's
+throughput (568.5 / 719.0 / 779.6 tok/s) is at the warm-run level. It needs `RADIANCE_MOE_DRAFT_GRAPH=1` and `SPEC > 0`.
+
+Limits:
+- **The image's dynamic draft is off under async.** `RADIANCE_MOE_ASYNC=0` keeps it. The comparison above is on the 20 fixed prompts,
+  gsm8k, an essay and 1k-prompt concurrency; none of it is real agent or code traffic, where the n-gram part of the dynamic draft
+  could draft more than a fixed width does. Async gains shrink with concurrency (+1.7% at 16 streams). A GPU-resident n-gram tail and
+  vLLM's `num_speculative_tokens_per_batch_size` (a fixed K per batch size that async accepts) are the follow-ups.
+- The first async start on a compile cache that never held the padded drafter graph compiles it and sizes the KV pool at about
+  5.7 GiB instead of 6.54; restart once. There is no cache suffix, and the same cache serves `RADIANCE_MOE_ASYNC=0` and `=1`.
+- Without the warm-up (`RADIANCE_MOE_DRAFT_WARM=0`) the first burst at each new concurrency pays graph capture in its TTFT.
+
+`RADIANCE_MOE_ASYNC=0` brings back `--no-async-scheduling`, the unpadded drafter and the dynamic draft, applies no patch and passes no
+variable; the printed command is the one from before this knob. `RADIANCE_MOE_DRAFT_WARM=0` starts no background client, and the
+launcher ignores a non-zero value without `RADIANCE_MOE_DRAFT_GRAPH=1` or with `SPEC=0`.
+
+**Launcher wiring (dry run only).** `serve-moe-mxfp4.sh` was checked with `DRY_RUN=1` on a Mac: no container runtime, GPU, image or
+model, a stub checkpoint config and a stub libr4d directory, and the printed `podman` and `docker` commands compared with the previous
+revision's.
+- With `RADIANCE_MOE_PAD_ROUTE=0 RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0 RADIANCE_MOE_ASYNC=0 RADIANCE_MOE_DRAFT_WARM=0`
+  the command (patch chain, environment, speculative config, async flag, cache path) is byte-identical to the previous revision's,
+  for both runtimes. Only the `[serve-moe]` status line differs: it gains `pad_route=`, `draft_graph=`, `draft_overlap=`, `async=` and
+  `draft_warm=`. The non-zero default `RADIANCE_MOE_DRAFT_WARM=16` also drops out on its own when `RADIANCE_MOE_DRAFT_GRAPH=0`.
+- With the defaults the chain gains `python3 patch_moe_padroute.py && python3 patch_moe_draftloop.py && python3 patch_moe_async.py &&
+  { python3 warm_draftloop.py <port> 16 <served name> >&2 & }` after the fp8 / gate step, the container gets
+  `RADIANCE_MOE_PAD_ROUTE=1`, `RADIANCE_MOE_DRAFT_GRAPH=1`, `RADIANCE_MOE_DRAFT_OVERLAP=1` and `RADIANCE_MOE_ASYNC=1`, and the
+  server gets `--async-scheduling` and `"disable_padded_drafter_batch":false` in place of `--no-async-scheduling` and `true`.
+- `RADIANCE_MOE_ASYNC=0` alone restores those two; `RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0` leaves out the
+  drafter-loop patch and the warm-up; `SPEC=0` drops all of 12 and 13 but keeps pad-route; `MOE_FIXES=0` drops pad-route, the drafter
+  loop and the warm-up and keeps async. Bad values (`RADIANCE_MOE_ASYNC=2`, `RADIANCE_MOE_DRAFT_WARM=65`) stop with an error.
+- The patches were not applied to an image from here. Production applies the same files to the same image digest.
+
 ## Running
 
 ```bash
 # MoE (one card): fixes on. Defaults: MTP-4, 16 sequences, 0.97, exact GDN scan, W4A8 prefill, int2 draft head,
-# fp8 dense layers, fused expert gate
+# fp8 dense layers, fused expert gate, padded-row routing, drafter-loop graphs, async scheduling, drafter-graph warm-up
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
 # the previous defaults (MTP-8, 8 sequences, 0.95), or switch the newer pieces off one at a time
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-mxfp4.sh
@@ -699,6 +936,11 @@ SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8=0 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_HEAD=off ./serve-moe-mxfp4.sh   # or fp8 / int4
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DENSE_FP8=0 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_GATE_FIX=0 ./serve-moe-mxfp4.sh
+# sections 11-13, each off on its own
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_PAD_ROUTE=0 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_ASYNC=0 ./serve-moe-mxfp4.sh        # sync scheduling, the image's dynamic draft
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_WARM=0 ./serve-moe-mxfp4.sh   # capture the drafter graphs lazily
 # W4A8 only from 2,049 tokens up
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8_MIN_TOKENS=2049 ./serve-moe-mxfp4.sh
 # stock vLLM for comparison
@@ -707,6 +949,9 @@ SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 MOE_FIXES=0 ./serve-moe-mxfp4.sh
 # for the GDN scan fix; with MOE_PREFILL_ATTN=off RADIANCE_GDN_SCAN_FIX=0 nothing needs it.
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 MOE_PREFILL_ATTN=off ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 R4D_SRC=~/src/libr4d ./serve-moe-mxfp4.sh
+
+# smoke test of a running server (tool call x1 and x8, guided JSON, temperature 0.7); BASE_URL and MODEL are optional
+python3 moe-tests/smoke_async.py http://127.0.0.1:8080/v1 Qwen3.5-35B-A3B-MXFP4
 
 # kernel test for the split-KV patch (inside the image, after the patch)
 podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "$PWD":/w \
@@ -748,8 +993,29 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
   near-ties on 18 of 20 prompts, and there is no perplexity or long-generation quality run beyond gsm8k (200, twice per
   arm) and mmlu (localeval `--limit 5`, one run per arm; the gate-only arm has one gsm8k run and no mmlu). The first
   prompt shapes after a cold start JIT the stock MoE kernels for 1-2 s.
-- Sections 7-9 were measured on a production-style launcher with AITER decode attention. Section 10 has this launcher's
-  own numbers, which are lower at long context for that reason.
+- Sections 7-9 and 11-13 were measured on a production-style launcher with AITER decode attention. Section 10 has this
+  launcher's own numbers for 7-9, which are lower at long context for that reason; 11-13 have none.
+- **None of sections 11-13 was run through `serve-moe-mxfp4.sh` itself.** Production runs the identical patch files through its
+  own launcher, on the same image digest. The two module-reading patches (`patch_moe_padroute.py`, `patch_moe_draftloop.py`) differ
+  only in the path they read their module from; the other files are byte-identical. This launcher was checked by dry run only
+  (the printed command, patch chain, environment and cache path), with no container, GPU or image involved, so its default chain for
+  11-13 has never been booted in this form. Production's launcher defaults async and the warm-up off and turns them on through an
+  environment file; the defaults here (`RADIANCE_MOE_ASYNC=1`, `RADIANCE_MOE_DRAFT_WARM=16`) are what production runs.
+- Async scheduling against the image's dynamic draft (`RADIANCE_MOE_ASYNC`): async turns the dynamic draft off, and the comparison
+  was made on the 20 fixed prompts, gsm8k, an essay and 1k-prompt concurrency, not on agent or code traffic, where the dynamic draft's
+  n-gram part could draft more than a fixed width. Fixed-prompt, decode and 8-stream numbers are up, the 16-stream gain is +1.7%,
+  and a dynamic-draft-off arm without async was mixed (-3.7% decode). The acceptance rise under async comes from verifying the
+  full width, and acceptance on real long answers was not measured.
+- First-burst graph capture without the warm-up (`RADIANCE_MOE_DRAFT_WARM=0`, or concurrencies above N): the TTFT cost was measured
+  (0.63 to 1.45 s at 12 streams in section 12, 0.79 / 0.84 / 0.88 s at 8 / 12 / 16 in section 13), but the capture then happens inside
+  a request under load, and its 0.55 GiB come out of the roughly 1 GiB that `GPU_UTIL=0.97` leaves. Neither that nor the warm-up was
+  tried with another process on the GPU.
+- Combinations: each of 11-13 was measured on top of the earlier ones. `RADIANCE_MOE_DRAFT_GRAPH` / `_OVERLAP` with
+  `RADIANCE_MOE_PAD_ROUTE=0`, async with `RADIANCE_MOE_DRAFT_GRAPH=0`, and async at `SPEC` other than 4 or `MAXSEQS` other than 16
+  were not run. The first async start on a compile cache that never held the padded drafter graph is smaller (KV about 5.7 against
+  6.54 GiB, restart once); that was seen on the production-style launcher, not here.
+- Padded-row routing moves greedy outputs at near-ties (restart-floor class); quality is gsm8k and mmlu only, with no perplexity or
+  long-generation run. The patches anchor on vLLM 0.27.1 as shipped in the 0.9.3 image and fail at startup on a different layout.
 - Qwen3.6-35B-A3B compressed-tensors W4A16 checkpoints (e.g. `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`).
   On the 0.9.3 image vLLM picks a MoE backend that fails with `'_C' has no gptq_marlin_repack`, and
   its dense MXFP4 layers fall back to emulation. That needs a separate patch.
