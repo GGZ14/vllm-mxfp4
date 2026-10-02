@@ -47,6 +47,18 @@
 #                     (moe-padroute/) copies row 0's router logits into the padded rows right after the router GEMV, so they
 #                     reuse row 0's experts; real rows' logits are never written, outputs flip only at near-ties, like a
 #                     restart. Needs MOE_FIXES=1, ignored with MOE_FIXES=0. No compile-cache change. 0 = stock routing.
+#   RADIANCE_MOE_DRAFT_GRAPH=1  1: each MTP drafter loop pass (1 token per request) replays ONE captured graph per batch size
+#                     instead of two graph pieces plus an eager attention segment re-entered from Python. seq_lens is staged
+#                     into a fixed buffer, and every replay compares the live attention metadata's addresses with the
+#                     captured ones and falls back to the piecewise path on any difference (a capture error turns the knob
+#                     off for the process). 0 = piecewise.
+#   RADIANCE_MOE_DRAFT_OVERLAP=1  1: the image's dynamic-draft gate drains the GPU with a blocking D2H after every draft pass;
+#                     the copy goes to pinned memory without blocking and the gate decision is resolved after the next
+#                     pass's input preparation, right before its forward (the same passes run). Use both: drafter host
+#                     stalls 1.56 -> 0.48 ms per step, +3.6% single-stream together, +2.1% / +0.8% alone. Nothing is left
+#                     to overlap under RADIANCE_MOE_ASYNC=1, which turns the dynamic draft off. Both knobs need MOE_FIXES=1
+#                     and SPEC > 0 (patch_moe_draftloop.py, moe-draftloop/, applied after pad-route; no compile-cache
+#                     change). 0 = the stock loop.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
@@ -88,19 +100,21 @@ case "$PA" in off|r4d) ;; *) die "MOE_PREFILL_ATTN must be r4d or off (got $PA)"
 case "$GDNFIX" in 0|1) ;; *) die "RADIANCE_GDN_SCAN_FIX must be 0 or 1 (got $GDNFIX)" ;; esac
 case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;; esac
 DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}; DFP8=${RADIANCE_MOE_DENSE_FP8:-1}; GF=${RADIANCE_MOE_GATE_FIX:-1}
-PR=${RADIANCE_MOE_PAD_ROUTE:-1}
+PR=${RADIANCE_MOE_PAD_ROUTE:-1}; DG=${RADIANCE_MOE_DRAFT_GRAPH:-1}; DO=${RADIANCE_MOE_DRAFT_OVERLAP:-1}
 case "$DH" in off|fp8|int4|int2) ;; *) die "RADIANCE_MOE_DRAFT_HEAD must be off, fp8, int4 or int2 (got $DH)" ;; esac
 case "$DFP8" in 0|1) ;; *) die "RADIANCE_MOE_DENSE_FP8 must be 0 or 1 (got $DFP8)" ;; esac
 case "$GF" in 0|1) ;; *) die "RADIANCE_MOE_GATE_FIX must be 0 or 1 (got $GF)" ;; esac
 case "$PR" in 0|1) ;; *) die "RADIANCE_MOE_PAD_ROUTE must be 0 or 1 (got $PR)" ;; esac
+case "$DG" in 0|1) ;; *) die "RADIANCE_MOE_DRAFT_GRAPH must be 0 or 1 (got $DG)" ;; esac
+case "$DO" in 0|1) ;; *) die "RADIANCE_MOE_DRAFT_OVERLAP must be 0 or 1 (got $DO)" ;; esac
 case "$W4A8_MIN" in ''|*[!0-9]*) [ -z "$W4A8_MIN" ] || die "RADIANCE_MOE_W4A8_MIN_TOKENS must be an integer (got $W4A8_MIN)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
 [ "$MOE_FIXES" = 1 ] || PA=off   # measured only on top of the MoE fixes
 [ "$MOE_FIXES" = 1 ] || W4A8=0   # W4A8 rides on the a16w4 lane that MOE_FIXES=1 enables
 [ "$MOE_FIXES" = 1 ] || { DFP8=0; GF=0; }   # fp8 dense layers and the fused gate were measured only on top of the MoE fixes
-[ "$MOE_FIXES" = 1 ] || PR=0     # pad-route was measured only on top of the MoE fixes
-[ "$SPEC" != 0 ] || DH=off       # the draft head only exists with speculation
+[ "$MOE_FIXES" = 1 ] || { PR=0; DG=0; DO=0; }   # pad-route and the drafter-loop knobs were measured only on top of the MoE fixes
+[ "$SPEC" != 0 ] || { DH=off; DG=0; DO=0; }     # the draft head and the drafter loop only exist with speculation
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
 
@@ -200,9 +214,15 @@ if [ "$PR" = 1 ]; then
   pre_add "python3 patch_moe_padroute.py"
   FIX_ENV+=(-e RADIANCE_MOE_PAD_ROUTE=1)
 fi
+if [ "$DG" = 1 ] || [ "$DO" = 1 ]; then
+  # less host time in the MTP drafter loop: hooks each loop pass's forward in llm_base_proposer.py (graph replay, deferred
+  # gate decision) and the gate in the image's radiance_draft.py. After pad-route, which edits the same proposer.
+  pre_add "python3 patch_moe_draftloop.py"
+  FIX_ENV+=(-e RADIANCE_MOE_DRAFT_GRAPH="$DG" -e RADIANCE_MOE_DRAFT_OVERLAP="$DO")
+fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF pad_route=$PR hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF pad_route=$PR draft_graph=$DG draft_overlap=$DO hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
