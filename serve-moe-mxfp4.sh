@@ -75,6 +75,21 @@
 #                     capture takes after the first bursts; KV unchanged), first-burst TTFT at 8 / 12 / 16 streams
 #                     0.79 / 0.84 / 0.88 -> 0.42 / 0.68 / 0.67 s. Needs RADIANCE_MOE_DRAFT_GRAPH=1 and SPEC > 0, and is
 #                     ignored without them. 0 = capture lazily, inside the first burst at each new concurrency.
+#   RADIANCE_ADAPTIVE_CHUNK=0  0 | N, an integer above 4096 (4320 recommended): adaptive prefill chunk budget
+#                     (patch_adaptive_chunk.py, moe-adaptivechunk/). Align-mode attention blocks are 2,160 tokens and vLLM
+#                     floors every non-final prefill chunk to whole blocks, so the 4096 budget prefills a long prompt in
+#                     2,160-token steps. N starts vLLM with --max-num-batched-tokens N (it replaces CHUNK, which must stay
+#                     4096; own compile cache, suffix -acN), and the patch gives a step the full N only when one request is
+#                     alone in the scheduler with more than 4096 tokens left to prefill; every other step keeps the 4096
+#                     budget (today's chunks, room for arrivals and decodes). 4320 = 2 blocks: idle prefill +5.2% / +5.1%
+#                     at 16.7k / 33.9k tokens, flat at 4k. Off by default: it was validated only together with
+#                     RADIANCE_MOE_ASYNC=1 (in production since 2026-10-02, not through this launcher). Turn on with
+#                     RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16 RADIANCE_ADAPTIVE_CHUNK=4320. 0 = the plain CHUNK
+#                     budget, no patch, no variable.
+#   RADIANCE_ADAPTIVE_CHUNK_SYNC=1  0 | 1: under async scheduling, do not queue a big solo prefill step ahead of the one in
+#                     flight, so an arriving request waits for at most one big step before its own (without it the
+#                     arrival sweep averages 0.80 s against 0.53 s). The hook sits in async scheduling's batch queue, so it
+#                     does nothing without RADIANCE_MOE_ASYNC=1; it is passed on only when RADIANCE_ADAPTIVE_CHUNK is on.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
 #   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
@@ -84,10 +99,11 @@
 #                     measured at SPEC=8, MAXSEQS=8, GPU_UTIL=0.95.
 #   MAXLEN=65536  MAXSEQS=16  CHUNK=4096  GPU_UTIL=0.97  PORT=8080  NAME=radiance-moe  GPUS=0
 #   IMAGE=stilldeadcode/vllm-radiance:0.9.3   RUNTIME=podman|docker (auto)
-#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8][-dfp8][-gate]   compile cache; never share one across knobs
+#   CACHE=~/.radiance-cache-moe-<model>-f<fixes>[-pa<mode>][-gdn2][-w4a8][-dfp8][-gate][-ac<N>]   compile cache; never share one across knobs
 #                     (dense fp8 swaps the linears' apply, which vLLM's compile-cache key does not see: a bf16 cache would
 #                     replay the bf16 graph on the fp8 weights and die at the profile run. The gate knob is a runtime flag
-#                     in a source file that the patch edits either way, so it gets a suffix too rather than trusting the key)
+#                     in a source file that the patch edits either way, so it gets a suffix too rather than trusting the key;
+#                     the compile range follows --max-num-batched-tokens, which RADIANCE_ADAPTIVE_CHUNK changes)
 #   SERVED_NAMES=<basename of the model>   DRY_RUN=1 print the command   DETACH=1 run in background
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -118,6 +134,7 @@ case "$W4A8" in 0|1) ;; *) die "RADIANCE_MOE_W4A8 must be 0 or 1 (got $W4A8)" ;;
 DH=${RADIANCE_MOE_DRAFT_HEAD:-int2}; DFP8=${RADIANCE_MOE_DENSE_FP8:-1}; GF=${RADIANCE_MOE_GATE_FIX:-1}
 PR=${RADIANCE_MOE_PAD_ROUTE:-1}; DG=${RADIANCE_MOE_DRAFT_GRAPH:-1}; DO=${RADIANCE_MOE_DRAFT_OVERLAP:-1}
 AS=${RADIANCE_MOE_ASYNC:-0}; DW=${RADIANCE_MOE_DRAFT_WARM:-0}
+ACH=${RADIANCE_ADAPTIVE_CHUNK:-0}; ACS=${RADIANCE_ADAPTIVE_CHUNK_SYNC:-1}
 case "$DH" in off|fp8|int4|int2) ;; *) die "RADIANCE_MOE_DRAFT_HEAD must be off, fp8, int4 or int2 (got $DH)" ;; esac
 case "$DFP8" in 0|1) ;; *) die "RADIANCE_MOE_DENSE_FP8 must be 0 or 1 (got $DFP8)" ;; esac
 case "$GF" in 0|1) ;; *) die "RADIANCE_MOE_GATE_FIX must be 0 or 1 (got $GF)" ;; esac
@@ -127,6 +144,10 @@ case "$DO" in 0|1) ;; *) die "RADIANCE_MOE_DRAFT_OVERLAP must be 0 or 1 (got $DO
 case "$AS" in 0|1) ;; *) die "RADIANCE_MOE_ASYNC must be 0 or 1 (got $AS)" ;; esac
 case "$DW" in ''|*[!0-9]*) die "RADIANCE_MOE_DRAFT_WARM must be an integer from 0 to 64 (got $DW)" ;; esac
 [ "$DW" -le 64 ] || die "RADIANCE_MOE_DRAFT_WARM must be an integer from 0 to 64 (got $DW)"
+case "$ACH" in 0) ;; ''|*[!0-9]*) die "RADIANCE_ADAPTIVE_CHUNK must be 0 or a token budget above 4096 (got $ACH)" ;;
+  *) [ "$ACH" -gt 4096 ] || die "RADIANCE_ADAPTIVE_CHUNK must be 0 or a token budget above 4096 (got $ACH)" ;; esac
+case "$ACS" in 0|1) ;; *) die "RADIANCE_ADAPTIVE_CHUNK_SYNC must be 0 or 1 (got $ACS)" ;; esac
+[ "$ACH" = 0 ] || [ "$CHUNK" = 4096 ] || die "RADIANCE_ADAPTIVE_CHUNK sets --max-num-batched-tokens itself; leave CHUNK at 4096 (got $CHUNK)"
 case "$W4A8_MIN" in ''|*[!0-9]*) [ -z "$W4A8_MIN" ] || die "RADIANCE_MOE_W4A8_MIN_TOKENS must be an integer (got $W4A8_MIN)" ;; esac
 case "$SPEC" in ''|*[!0-9]*) die "SPEC must be a non-negative integer (got $SPEC)" ;; esac
 case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $MAXSEQS)" ;; esac
@@ -136,6 +157,7 @@ case "$MAXSEQS" in ''|*[!0-9]*|0) die "MAXSEQS must be a positive integer (got $
 [ "$MOE_FIXES" = 1 ] || { PR=0; DG=0; DO=0; }   # pad-route and the drafter-loop knobs were measured only on top of the MoE fixes
 [ "$SPEC" != 0 ] || { DH=off; DG=0; DO=0; AS=0; }   # the draft head, the drafter loop and async spec decode only exist with speculation
 [ "$DG" = 1 ] || DW=0            # the warm-up captures the drafter-loop graphs, so it needs them
+[ "$ACH" = 0 ] || CHUNK=$ACH    # the full budget; the patch caps every step but a solo long prefill at 4096
 R4D_REPO=${R4D_REPO:-https://codeberg.org/StillDeadcode/libr4d.git}; R4D_VERSION=${R4D_VERSION:-v0.5.0}
 R4D_SRC=${R4D_SRC:-$HOME/.radiance-libr4d-$R4D_VERSION}
 
@@ -151,6 +173,7 @@ CACHE_SUF="-f$MOE_FIXES"; [ "$PA" != off ] && CACHE_SUF="$CACHE_SUF-pa$PA"
 [ "$W4A8" = 1 ] && CACHE_SUF="$CACHE_SUF-w4a8"
 [ "$DFP8" = 1 ] && CACHE_SUF="$CACHE_SUF-dfp8"
 [ "$GF" = 1 ] && CACHE_SUF="$CACHE_SUF-gate"
+[ "$ACH" != 0 ] && CACHE_SUF="$CACHE_SUF-ac$ACH"
 CACHE=${CACHE:-$HOME/.radiance-cache-moe-$(echo "$MODEL_ID" | tr '/' '_')$CACHE_SUF}
 mkdir -p "$CACHE"/vllm "$CACHE"/inductor "$CACHE"/triton "$CACHE"/aiter
 
@@ -250,6 +273,12 @@ if [ "$AS" = 1 ]; then
   pre_add "python3 patch_moe_async.py"
   FIX_ENV+=(-e RADIANCE_MOE_ASYNC=1)
 fi
+if [ "$ACH" != 0 ]; then
+  # the full --max-num-batched-tokens only for a long prefill alone in the scheduler, 4096 otherwise: one hook in vLLM's
+  # Scheduler.schedule and, for SYNC, one in EngineCore.step_with_batch_queue. After the async patch; the warm-up stays last.
+  pre_add "python3 patch_adaptive_chunk.py"
+  FIX_ENV+=(-e RADIANCE_ADAPTIVE_CHUNK="$ACH" -e RADIANCE_ADAPTIVE_CHUNK_SYNC="$ACS")
+fi
 if [ "$DW" != 0 ]; then
   # background client in the container: waits for /v1/models, then k concurrent short requests for k = 1..DW, so every
   # drafter-loop graph is captured before the first users arrive. Never fails the serve.
@@ -257,7 +286,7 @@ if [ "$DW" != 0 ]; then
 fi
 
 HWQ_ENV=(); [ "$HWQ" != 0 ] && HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$HWQ")
-echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF pad_route=$PR draft_graph=$DG draft_overlap=$DO async=$AS draft_warm=$DW hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
+echo "[serve-moe] $MODEL_ID ($KIND) fixes=$MOE_FIXES prefill_attn=$PA backend=$BACKEND gdn_scan_fix=$GDNFIX moe_w4a8=$W4A8 draft_head=$DH dense_fp8=$DFP8 gate_fix=$GF pad_route=$PR draft_graph=$DG draft_overlap=$DO async=$AS draft_warm=$DW adaptive_chunk=$ACH achunk_sync=$ACS hw_queues=$HWQ spec=$SPEC max_seqs=$MAXSEQS gpu_util=$GPU_UTIL runtime=$RUNTIME cache=$CACHE"
 exec ${DRY_RUN:+echo} "$RUNTIME" run --rm "${RT_FLAGS[@]}" --name "$NAME" --ipc=host --network=host \
   --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
   -v "$MOUNT":"$MOUNT":ro -v "$CACHE":/cache -v "$SCRIPT_DIR":/patches:ro ${R4D_MNT[@]+"${R4D_MNT[@]}"} \
