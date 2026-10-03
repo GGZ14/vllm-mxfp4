@@ -1,6 +1,6 @@
-# MXFP4 MoE on gfx1201: native experts, split-KV verify, prefill attention, MTP depth, exact GDN scan, W4A8 prefill, int2 draft head, fp8 dense layers, fused gate, padded-row routing, drafter-loop graphs, async scheduling
+# MXFP4 MoE on gfx1201: native experts, split-KV verify, prefill attention, MTP depth, exact GDN scan, W4A8 prefill, int2 draft head, fp8 dense layers, fused gate, padded-row routing, drafter-loop graphs, async scheduling, adaptive prefill chunk
 
-Twelve independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
+Thirteen independent additions, each opt-in or scoped so the default Qwen3.8-27B serve is unchanged.
 All numbers are from one Radeon AI PRO R9700 (gfx1201, 32 GB, TP=1) on the published image
 `stilldeadcode/vllm-radiance:0.9.3` (vLLM 0.27.1). Each is a single run unless noted.
 Sections 1-3 were measured with the launcher's old defaults (MTP-8, 8 sequences, GPU utilization 0.95).
@@ -8,11 +8,11 @@ Sections 4-9 were measured with the new ones (MTP-4, 16 sequences, 0.97), on a l
 decode attention on AITER's unified kernel, which is not part of this repo; section 10 repeats the key
 numbers with `serve-moe-mxfp4.sh` itself. Sections 7-9 were measured on top of sections 4-6 (exact scan and
 W4A8 on), and 8 and 9 on top of 7: the int2 draft head was on in every arm of their A/Bs.
-Sections 11-13 were measured one on top of the next, on top of all of that, on the same production-style launcher and on the
+Sections 11-14 were measured one on top of the next, on top of all of that, on the same production-style launcher and on the
 image that `stilldeadcode/vllm-radiance:0.9.3` resolves to (digest `sha256:45694209...`, checked against Docker Hub on
-2026-10-01). **None of them was run through `serve-moe-mxfp4.sh`.** The production launcher applies the same patch files (the two
-module-reading ones differ only in the path they read their module from), and this launcher was checked with dry runs only
-(sections 11-13, Not tested).
+2026-10-01; section 14 was measured the next day on the same digest). **None of them was run through `serve-moe-mxfp4.sh`.** The
+production launcher applies the same patch files (the three module-reading ones differ only in the path they read their module from),
+and this launcher was checked with dry runs only (sections 11-14, Not tested).
 
 | Addition | Files | Default |
 |---|---|---|
@@ -28,6 +28,7 @@ module-reading ones differ only in the path they read their module from), and th
 | Padded-row routing (section 11) | `patch_moe_padroute.py`, `moe-padroute/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_PAD_ROUTE=1`, needs `MOE_FIXES=1`) |
 | Drafter-loop graph replay and overlapped gate (section 12) | `patch_moe_draftloop.py`, `moe-draftloop/` | on in `serve-moe-mxfp4.sh` (`RADIANCE_MOE_DRAFT_GRAPH=1`, `RADIANCE_MOE_DRAFT_OVERLAP=1`, need `MOE_FIXES=1` and `SPEC > 0`) |
 | Async scheduling and drafter-graph warm-up (section 13) | `patch_moe_async.py`, `warm_draftloop.py`, `moe-tests/smoke_async.py` | off by default; turn on with `RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16` (only with `SPEC > 0`) |
+| Adaptive prefill chunk budget (section 14) | `patch_adaptive_chunk.py`, `moe-adaptivechunk/` | off by default; turn on with `RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16 RADIANCE_ADAPTIVE_CHUNK=4320` (validated only with async) |
 
 ## 1. MXFP4 MoE experts on gfx1201
 
@@ -917,21 +918,153 @@ revision's.
 - With `RADIANCE_MOE_PAD_ROUTE=0 RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0 RADIANCE_MOE_ASYNC=0 RADIANCE_MOE_DRAFT_WARM=0`
   the command (patch chain, environment, speculative config, async flag, cache path) is byte-identical to the previous revision's,
   for both runtimes. Only the `[serve-moe]` status line differs: it gains `pad_route=`, `draft_graph=`, `draft_overlap=`, `async=` and
-  `draft_warm=`. The non-zero default `RADIANCE_MOE_DRAFT_WARM=16` also drops out on its own when `RADIANCE_MOE_DRAFT_GRAPH=0`.
-- With the defaults the chain gains `python3 patch_moe_padroute.py && python3 patch_moe_draftloop.py && python3 patch_moe_async.py &&
-  { python3 warm_draftloop.py <port> 16 <served name> >&2 & }` after the fp8 / gate step, the container gets
-  `RADIANCE_MOE_PAD_ROUTE=1`, `RADIANCE_MOE_DRAFT_GRAPH=1`, `RADIANCE_MOE_DRAFT_OVERLAP=1` and `RADIANCE_MOE_ASYNC=1`, and the
-  server gets `--async-scheduling` and `"disable_padded_drafter_batch":false` in place of `--no-async-scheduling` and `true`.
-- `RADIANCE_MOE_ASYNC=0` alone restores those two; `RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0` leaves out the
+  `draft_warm=`. The warm-up (`RADIANCE_MOE_DRAFT_WARM=16` when turned on) also drops out on its own when `RADIANCE_MOE_DRAFT_GRAPH=0`.
+- With the defaults the chain gains `python3 patch_moe_padroute.py && python3 patch_moe_draftloop.py` after the fp8 / gate step and the
+  container gets `RADIANCE_MOE_PAD_ROUTE=1`, `RADIANCE_MOE_DRAFT_GRAPH=1` and `RADIANCE_MOE_DRAFT_OVERLAP=1`. With
+  `RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16` it also gains `python3 patch_moe_async.py && { python3 warm_draftloop.py <port> 16
+  <served name> >&2 & }` and `RADIANCE_MOE_ASYNC=1`, and the server gets `--async-scheduling` and `"disable_padded_drafter_batch":false`
+  in place of `--no-async-scheduling` and `true`.
+- Without `RADIANCE_MOE_ASYNC=1` the server keeps those two; `RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0` leaves out the
   drafter-loop patch and the warm-up; `SPEC=0` drops all of 12 and 13 but keeps pad-route; `MOE_FIXES=0` drops pad-route, the drafter
   loop and the warm-up and keeps async. Bad values (`RADIANCE_MOE_ASYNC=2`, `RADIANCE_MOE_DRAFT_WARM=65`) stop with an error.
 - The patches were not applied to an image from here. Production applies the same files to the same image digest.
+
+## 14. Adaptive prefill chunk budget (`RADIANCE_ADAPTIVE_CHUNK`, `RADIANCE_ADAPTIVE_CHUNK_SYNC`)
+
+Both knobs are **off by default** in `serve-moe-mxfp4.sh`. Production on one R9700 has run `RADIANCE_ADAPTIVE_CHUNK=4320` since
+2026-10-02 21:13 (numbers below), but only together with async scheduling (section 13), which is itself opt-in here, and this
+launcher with it on has only been checked by dry run. Turn it on together with async:
+`RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16 RADIANCE_ADAPTIVE_CHUNK=4320` (`RADIANCE_ADAPTIVE_CHUNK_SYNC` defaults to 1).
+
+With `--mamba-cache-mode align` the attention block is 2,160 tokens, and vLLM floors every non-final prefill chunk to whole blocks
+(`Scheduler._mamba_block_aligned_split`). A 4096-token budget therefore prefills a long prompt in 2,160-token steps, one block, with
+the rest of the budget left for other requests. Each prefill step streams nearly all of the expert weights, so a step of two blocks
+(4,320 tokens) costs less per token. A plain `--max-num-batched-tokens 4320` does not work as a default: the long prefill then takes
+the whole budget on every step, and a short request that arrives meanwhile waits for the rest of the prefill (2.6 s against 0.5 s
+for a 32k prompt, measured before this section). This section keeps today's behavior for everything but one case.
+
+**`RADIANCE_ADAPTIVE_CHUNK=N`** (N an integer above 4096; 4320 = two blocks) starts vLLM with `--max-num-batched-tokens N` and
+**`patch_adaptive_chunk.py`** sets each step's budget at the top of `Scheduler.schedule()` from the scheduler's state alone: the full
+N only when exactly one request is in the scheduler (running, waiting or skipped) and it has more than 4096 tokens left to compute,
+otherwise 4096, which is today's behavior. A solo long prefill runs in 4,320-token chunks; as soon as another request is present, even
+a decoding one, the long prefill drops back to 2,160-token chunks and the rest of the 4096 budget goes to the others. A lone decoder
+or a lone short prompt never qualifies. vLLM's own rules still apply on top (the block-aligned split, `max_model_len`, the async
+`max_tokens` guard, MTP spec tokens), so chunk boundaries stay on block multiples and prefix-cache states land where they do today;
+only the number of blocks per solo step changes. The module checks at its first call that the scheduler's budget is N and logs a
+`[radiance.adaptive_chunk]` line at that point, on every switch between big and capped steps, and as a periodic stats line.
+
+**`RADIANCE_ADAPTIVE_CHUNK_SYNC=1`** matters under async scheduling. vLLM keeps a 2-deep batch queue there: step N+1 is scheduled
+while step N runs, and a request arriving meanwhile first runs in the step after the one already queued. With the policy alone both
+queued steps can be big solo steps, so an arrival waits for the rest of step N, all of step N+1 and then its own. SYNC adds a hook in
+`EngineCore.step_with_batch_queue`: while a step is in flight and the next one would be a big solo step, it does not schedule ahead
+and waits for the in-flight step first, so big solo steps run one deep and an arrival waits for at most one big step. The price is
+that the host work of each big step is no longer hidden behind the previous one (about 0.6% of prefill speed at 33.9k, none at 16.7k).
+The hook sits in async scheduling's batch queue and has nothing to do without `RADIANCE_MOE_ASYNC=1`.
+
+`patch_adaptive_chunk.py` copies `moe-adaptivechunk/radiance_adaptive_chunk.py` into site-packages and edits two vLLM files with
+`_patchlib.apply` (unique anchors, ast-checked, idempotent): `v1/core/sched/scheduler.py`
+(a module flag and the budget line) and `v1/engine/core.py` (the SYNC flag and the hold). It is inert unless
+`RADIANCE_ADAPTIVE_CHUNK` is a positive integer at runtime. The launcher gives the knob its own compile cache (suffix `-acN`)
+because the compile range follows `--max-num-batched-tokens`.
+
+Measured on the production-style launcher with `RADIANCE_MOE_ASYNC=1` and `RADIANCE_MOE_DRAFT_WARM=16` on, on the image digest of
+sections 11-13, `amd/Qwen3.5-35B-A3B-MXFP4`, one R9700, `GPU_MAX_HW_QUEUES=1`. One session, warm caches:
+knob off (budget 4096, two server starts) against 4320 with SYNC, 4320 without SYNC (two starts) and 6,480 with SYNC.
+
+Idle prefill, tok/s, median of 3 (4.09k / 16.7k / 33.9k tokens):
+
+| | 4.09k | 16.7k | 33.9k |
+|---|--:|--:|--:|
+| off, start 1 | 14,713 | 12,698 | 10,731 |
+| off, start 2 | 14,729 | 12,706 | 10,713 |
+| **4320, SYNC=1** | 14,719 | 13,359 | 11,272 |
+| change against the mean of the two off starts | +0.0% | **+5.2%** | **+5.1%** |
+| 4320, SYNC=0 | 14,722 | 13,346 | 11,337 |
+| 6,480, SYNC=1 (rejected, KV below) | 14,760 | 13,725 | 11,547 |
+
+Arrivals during a solo 32.8k-token prefill (8 short requests of 64 tokens at a chosen delay; the latest of their time-to-first-tokens,
+s). The first row is the single 0.3 s point, three trials each; the sweep is 25 delays, 0.05 to 2.45 s in steps of 0.1 s, one trial each:
+
+| | off | 4320, SYNC=0 | **4320, SYNC=1** |
+|---|--:|--:|--:|
+| at 0.3 s | 0.47 | 0.59 | **0.28** |
+| sweep mean | 0.559 | 0.803 | **0.533** |
+| sweep median | 0.563 | 0.780 | 0.525 |
+| sweep p90 | 0.695 | 1.075 | 0.710 |
+| sweep max | 0.805 | 1.177 | 0.826 |
+| worst single delay, change against off | | +0.539 | +0.138 |
+| 32.8k prompt's own TTFT at 0.3 s | 3.33-3.34 | 3.26 | 3.32-3.33 |
+
+With SYNC the sweep is level with the 4096 budget (mean -0.03 s, p90 +0.015 s, worst single delay +0.138 s, best -0.242 s); without it
+the sweep is +0.24 s on the mean and +0.38 s at p90, although the single 0.3 s point looks acceptable (+0.12 s), so SYNC=0 is not
+recommended under async. One timing is worse with SYNC: at 1.0 s the arrivals took 0.83-0.85 s against 0.52 s, in two trials. They
+land just after a big step has started and straddle the next step boundary, in two groups at 0.6 and 0.83 s; the 4096 budget has the
+same kind of tail at its smaller steps (its own 0.805 s at 2.35 s). Eight decode streams running when a 32k prompt arrives 5 s later
+are unaffected: the worst gap between their tokens during the prefill is 0.291-0.296 s with the knob off and 0.292-0.294 s on (0.04 s
+without a prefill), the long prompt's TTFT is 3.42-3.47 s in every arm, and the policy never takes a big step there, because the
+decoders keep the scheduler from being solo (42 capped steps, all of 2,160 tokens).
+
+In production, the same prefill speeds were 14,994 / 13,510 / 11,376 tok/s at 4k / 16.7k / 33.9k (they were 14,790 / 12,735 / 10,709
+before this change), and the first token of a 32k prompt came after 2.98 s (it was 3.17 s).
+
+Everything else, same session:
+- Decode, localeval 1k prompts, 512 tokens: single stream 174.9 against 175.6 tok/s off; 8 / 12 / 16 streams 577 / 747 / 776 against
+  570 / 733 / 768 (first run) and 576 / 726 / 782 against 553 / 704 / 750 (warm run). All noise: the policy takes no big steps while
+  streams run.
+- gsm8k 200 (`--nonce`, thinking off): 0.430 with the knob, 0.405 without (noise, 2 SE about 0.098). `moe-tests/smoke_async.py` passes
+  every check on the 4320 + SYNC server. 0 tracebacks and 0 ERROR lines in all seven bench server logs, 0 drafter-graph fallbacks
+  (50,368 replays).
+- Greedy outputs, 10 prompts of 16k and 10 of 32k tokens, temperature 0, 256 tokens, each prompt once per server start: against the
+  4096 budget 0 of 20 are identical, the first divergence at a median of token 30 and at a top-1 / top-2 margin of at most 0.25 in
+  20 of 20 (a restart of the same 4096 server is identical on 2 of 20, margins at most 0.125): the outputs flip at near-ties, the
+  restart-floor class of section 13. 4320 with SYNC against 4320 without it: 20 of 20 identical, SYNC changes timing only.
+- KV cache, warm: 6.54 GiB (385,191 tokens) with the knob off, 6.51 GiB (383,853 tokens, -0.35%) at 4320, 6.25 GiB (367,804 tokens,
+  -4.5%) at 6,480. 6,480 is over the roughly 2% KV cost this was held to and is not pursued; it would add +8.1% / +7.7% prefill at
+  16.7k / 33.9k.
+- Policy counters on the 4320 + SYNC server: the 20 solo prompts of the greedy test took 100 big steps, every one of 4,320 tokens,
+  and none was held back; the three trials of the 0.3 s arrival test took 3 big steps (one per trial, before the arrivals) and 36
+  capped steps of 2,160 tokens.
+
+Limits:
+- **Validated only with async scheduling on.** Every arm above ran with `RADIANCE_MOE_ASYNC=1` and `RADIANCE_MOE_DRAFT_WARM=16`; SYNC
+  exists because of async's batch queue. The plain policy under sync scheduling (SYNC has no effect there) was not run, which is why
+  the knob is off by default here.
+- It helps only an idle server with one long prompt (say, an agent loading a large context). With anyone else in the scheduler,
+  including a single decoding request, the chunks are today's.
+- 4,320 is two attention blocks of this checkpoint (2,160 tokens each). Another checkpoint, with another block size, needs another N, a
+  whole number of its blocks above 4096; no value other than 4320 (and 6,480, rejected on KV) was measured.
+- The first start on a compile cache that has never held `-ac4320` compiles cold and sizes the KV pool at about 5.7 GiB instead of
+  6.51; restart once.
+- The arrival numbers are one trial per delay on a synthetic test (8 short requests into one long prompt); the 1.0 s point above shows
+  the tail it can have.
+- Quality was checked with gsm8k and the greedy comparison only, with no perplexity or long-generation run.
+
+`RADIANCE_ADAPTIVE_CHUNK=0` (the default) keeps `--max-num-batched-tokens "$CHUNK"` (4096), applies no patch, passes no variable and
+uses the cache path without a suffix; the printed command is the one from before this knob. `RADIANCE_ADAPTIVE_CHUNK_SYNC` is
+validated either way and does nothing when the budget knob is 0. The budget knob replaces `CHUNK`, which must stay at its default 4096
+while it is on (the policy caps every other step at 4096).
+
+**Launcher wiring (dry run only).** `serve-moe-mxfp4.sh` was checked with `DRY_RUN=1` on a Mac, as in section 13: no container
+runtime, GPU, image or model, a stub checkpoint config and a stub libr4d directory, and the printed `podman` and `docker` commands
+compared with the previous revision's (2cb0d27).
+- With `RADIANCE_ADAPTIVE_CHUNK=0` the command is byte-identical to the previous revision's in all nine settings tried (defaults, docker,
+  async and warm-up on, `MOE_FIXES=0`, `SPEC=0`, `MOE_PREFILL_ATTN=off RADIANCE_GDN_SCAN_FIX=0`, `CHUNK=2048`, every section 11-13 knob
+  off, async with `SPEC=0`). Only the `[serve-moe]` status line differs: it gains `adaptive_chunk=` and `achunk_sync=`.
+- With `RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16 RADIANCE_ADAPTIVE_CHUNK=4320` the command differs from the same run without the
+  knob in four places: `--max-num-batched-tokens 4320` in place of 4096, the cache path gains `-ac4320`, `python3 patch_adaptive_chunk.py`
+  joins the chain after `patch_moe_async.py` and before the warm-up, and the container gets `RADIANCE_ADAPTIVE_CHUNK=4320` and
+  `RADIANCE_ADAPTIVE_CHUNK_SYNC=1`. `RADIANCE_ADAPTIVE_CHUNK_SYNC=0` changes the second variable.
+- Bad values stop with an error: `RADIANCE_ADAPTIVE_CHUNK=4096`, `1`, `abc`, `4320.5`, `RADIANCE_ADAPTIVE_CHUNK_SYNC=2`, and
+  `CHUNK=2048` with the knob on.
+- The patch was applied from here, on a Mac, to reference copies of the image's vLLM 0.27.1 `scheduler.py` and `engine/core.py`:
+  all four edits applied, a second run reported them already applied, and the edited files parse. It was not applied to a running
+  image; production applies the same files to the same image digest.
 
 ## Running
 
 ```bash
 # MoE (one card): fixes on. Defaults: MTP-4, 16 sequences, 0.97, exact GDN scan, W4A8 prefill, int2 draft head,
-# fp8 dense layers, fused expert gate, padded-row routing, drafter-loop graphs, async scheduling, drafter-graph warm-up
+# fp8 dense layers, fused expert gate, padded-row routing, drafter-loop graphs
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
 # the previous defaults (MTP-8, 8 sequences, 0.95), or switch the newer pieces off one at a time
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-mxfp4.sh
@@ -940,11 +1073,12 @@ SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8=0 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_HEAD=off ./serve-moe-mxfp4.sh   # or fp8 / int4
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DENSE_FP8=0 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_GATE_FIX=0 ./serve-moe-mxfp4.sh
-# sections 11-13, each off on its own
+# sections 11 and 12, each off on its own
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_PAD_ROUTE=0 ./serve-moe-mxfp4.sh
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_GRAPH=0 RADIANCE_MOE_DRAFT_OVERLAP=0 ./serve-moe-mxfp4.sh
-SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_ASYNC=0 ./serve-moe-mxfp4.sh        # sync scheduling, the image's dynamic draft
-SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_DRAFT_WARM=0 ./serve-moe-mxfp4.sh   # capture the drafter graphs lazily
+# sections 13 and 14 are off by default: async scheduling with the drafter-graph warm-up, and the adaptive prefill chunk on top
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16 RADIANCE_ADAPTIVE_CHUNK=4320 ./serve-moe-mxfp4.sh
 # W4A8 only from 2,049 tokens up
 SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 RADIANCE_MOE_W4A8_MIN_TOKENS=2049 ./serve-moe-mxfp4.sh
 # stock vLLM for comparison
@@ -997,14 +1131,27 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
   near-ties on 18 of 20 prompts, and there is no perplexity or long-generation quality run beyond gsm8k (200, twice per
   arm) and mmlu (localeval `--limit 5`, one run per arm; the gate-only arm has one gsm8k run and no mmlu). The first
   prompt shapes after a cold start JIT the stock MoE kernels for 1-2 s.
-- Sections 7-9 and 11-13 were measured on a production-style launcher with AITER decode attention. Section 10 has this
-  launcher's own numbers for 7-9, which are lower at long context for that reason; 11-13 have none.
-- **None of sections 11-13 was run through `serve-moe-mxfp4.sh` itself.** Production runs the identical patch files through its
-  own launcher, on the same image digest. The two module-reading patches (`patch_moe_padroute.py`, `patch_moe_draftloop.py`) differ
-  only in the path they read their module from; the other files are byte-identical. This launcher was checked by dry run only
-  (the printed command, patch chain, environment and cache path), with no container, GPU or image involved, so its default chain for
-  11-13 has never been booted in this form. Production's launcher defaults async and the warm-up off and turns them on through an
-  environment file; the defaults here (`RADIANCE_MOE_ASYNC=1`, `RADIANCE_MOE_DRAFT_WARM=16`) are what production runs.
+- Sections 7-9 and 11-14 were measured on a production-style launcher with AITER decode attention. Section 10 has this
+  launcher's own numbers for 7-9, which are lower at long context for that reason; 11-14 have none.
+- **None of sections 11-14 was run through `serve-moe-mxfp4.sh` itself.** Production runs the identical patch files through its
+  own launcher, on the same image digest. The three module-reading patches (`patch_moe_padroute.py`, `patch_moe_draftloop.py`,
+  `patch_adaptive_chunk.py`) differ only in the path they read their module from; the other files are byte-identical. This launcher
+  was checked by dry run only (the printed command, patch chain, environment and cache path), with no container, GPU or image
+  involved, so its chain for 11-14 (the default one for 11 and 12, the opt-in knobs on for 13 and 14) has never been booted in this
+  form. Production's launcher defaults async and the warm-up off and turns them on through an environment file, and so does this
+  one: `RADIANCE_MOE_ASYNC=1 RADIANCE_MOE_DRAFT_WARM=16` is what production runs. Production also runs the adaptive chunk
+  (`RADIANCE_ADAPTIVE_CHUNK=4320`) by default; here it is off.
+- Adaptive prefill chunk (`RADIANCE_ADAPTIVE_CHUNK`, section 14): it was **validated only with async scheduling on**
+  (`RADIANCE_MOE_ASYNC=1`, `RADIANCE_MOE_DRAFT_WARM=16`, the production configuration). **The plain policy without async, under sync
+  scheduling, is untested**; `RADIANCE_ADAPTIVE_CHUNK_SYNC` does nothing there. **It was never booted through
+  `serve-moe-mxfp4.sh`**: its `-acN` cache path, the patch step and the two variables were checked by dry run, and the patch was
+  applied to reference copies of the vLLM files, not to a running image. No value other than 4320 went through the arrival and
+  quality checks (6,480 was measured for prefill speed and KV and dropped), and 4320 rests on this checkpoint's 2,160-token
+  attention blocks. The arrival test is synthetic
+  (8 short requests into one 32.8k prompt, one trial per delay), the sweep has one timing about 0.3 s worse than the 4096 budget
+  (1.0 s), and nothing was run with mixed real traffic. Greedy outputs differ from the 4096 budget on all 20 long prompts, at
+  near-ties; quality is gsm8k and that comparison only. Under concurrent load the policy is off by design, so the gain applies to a
+  long prompt arriving at an idle server.
 - Async scheduling against the image's dynamic draft (`RADIANCE_MOE_ASYNC`): async turns the dynamic draft off, and the comparison
   was made on the 20 fixed prompts, gsm8k, an essay and 1k-prompt concurrency, not on agent or code traffic, where the dynamic draft's
   n-gram part could draft more than a fixed width. Fixed-prompt, decode and 8-stream numbers are up, the 16-stream gain is +1.7%,
@@ -1014,7 +1161,7 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups -v "
   (0.63 to 1.45 s at 12 streams in section 12, 0.79 / 0.84 / 0.88 s at 8 / 12 / 16 in section 13), but the capture then happens inside
   a request under load, and its 0.55 GiB come out of the roughly 1 GiB that `GPU_UTIL=0.97` leaves. Neither that nor the warm-up was
   tried with another process on the GPU.
-- Combinations: each of 11-13 was measured on top of the earlier ones. `RADIANCE_MOE_DRAFT_GRAPH` / `_OVERLAP` with
+- Combinations: each of 11-14 was measured on top of the earlier ones. `RADIANCE_MOE_DRAFT_GRAPH` / `_OVERLAP` with
   `RADIANCE_MOE_PAD_ROUTE=0`, async with `RADIANCE_MOE_DRAFT_GRAPH=0`, and async at `SPEC` other than 4 or `MAXSEQS` other than 16
   were not run. The first async start on a compile cache that never held the padded drafter graph is smaller (KV about 5.7 against
   6.54 GiB, restart once); that was seen on the production-style launcher, not here.

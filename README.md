@@ -396,6 +396,9 @@ Sections 11-13 of MOE-GFX1201.md add three more decode-side changes, each with a
 `RADIANCE_MOE_DRAFT_GRAPH` / `RADIANCE_MOE_DRAFT_OVERLAP`, `RADIANCE_MOE_ASYNC` / `RADIANCE_MOE_DRAFT_WARM`): fixed-prompt
 tok/s +5.9%, +3.6% and +12.1%, each on top of the last, measured in production and not through this launcher. Async turns the
 image's dynamic draft off.
+Section 14 adds one more opt-in switch, an adaptive prefill chunk budget (`RADIANCE_ADAPTIVE_CHUNK=4320`, validated together with
+`RADIANCE_MOE_ASYNC=1`): a long prompt alone on the server prefills in 4,320-token steps instead of 2,160, about +5% prefill at
+16k and 34k tokens, and every other step keeps today's chunks; measured in production and not through this launcher.
 Design, measurements and caveats are in [MOE-GFX1201.md](MOE-GFX1201.md).
 
 ```bash
@@ -1087,4 +1090,4 @@ specific to this fork rather than general to gfx1201, so the image build compile
 | [PERFORMANCE.md](PERFORMANCE.md) | The change-by-change optimization ledger, the 0.5.8 -> 0.7.4 provenance A/B, and the gated-delta-net NaN write-up |
 | [MXFP4-NOTES.md](MXFP4-NOTES.md) | Design notes, measurements and traps behind `serve-mxfp4.sh` |
 | [TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) | The TP=3 dummy-head padding design and its validation gates |
-| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts, int2 draft head, fp8 dense layers, fused gate, padded-row routing, drafter-loop graphs, async scheduling: design and measurements |
+| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts, int2 draft head, fp8 dense layers, fused gate, padded-row routing, drafter-loop graphs, async scheduling, adaptive prefill chunk: design and measurements |
