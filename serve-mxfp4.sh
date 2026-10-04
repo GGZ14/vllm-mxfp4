@@ -105,6 +105,9 @@ Everything is an environment variable; these are the ones worth knowing.
   EXTRA="--enforce-eager"   extra `vllm serve` flags (same as passing them as arguments)
   HIP_FORCE_DEV_KERNARG=1   ROCm runtime knobs passed through when set: kernargs in VRAM,
   HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
+  RADIANCE_HW_QUEUES=1      HIP compute queues per priority (GPU_MAX_HW_QUEUES). 1 keeps the async
+                            D2H copy stream on the model's queue; 0 = HIP default (4, may run
+                            ~23% slower for the process lifetime on ~1 in 5 starts, see below)
   MXFP4_CUMODE=1            compile the MXFP4 GEMM .hip with -mcumode (A/B; output-identical)
   VLLM_NO_USAGE_STATS=1     vLLM usage telemetry (default off here); 0 re-enables it
   DRY_RUN=1                 print the container command instead of running it
@@ -874,7 +877,7 @@ mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
 echo "[run] $RUNTIME $IMAGE | port $PORT | $SPEC_METHOD spec=$SPEC | model $CSNAP"
 echo "[run] gpus=$RAD_GPU_COUNT x $RAD_GPU_NAME ($RAD_GPU_MIB MiB) tp=$TP hip=$GPU_IDS sig=$RAD_GPU_SIG tp_pad=$TP_PAD"
-echo "[run] attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-none}($KV_SRC)"
+echo "[run] attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-none}($KV_SRC) hw_queues=${RADIANCE_HW_QUEUES:-1}"
 if [ "$KV_SRC" = profiled ] && [ "$GPU_UTIL" = "0.98" ]; then
   echo "[run] no KV pin measured for $RAD_GPU_SIG at seqs=${MAXSEQS:-8} chunk=$CHUNK -- vLLM will"
   echo "[run]   profile for itself (safe). ./calibrate-kv.sh measures one and typically reclaims"
@@ -885,7 +888,8 @@ echo "[run] chat-template=$CHAT_TEMPLATE"
 echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME stop $NAME"
 
 # docker has no --replace, so a container left behind by a previous run has to go first.
-if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
+# Not under DRY_RUN: with the default NAME that would remove the running server's container.
+if [ "$RUNTIME" != podman ] && [ -z "${DRY_RUN:-}" ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
 
 # DRY_RUN=1 prints the command instead of running it -- for checking what a set of environment
 # overrides actually produces, and for lifting the invocation into a unit file.
@@ -896,6 +900,18 @@ if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || tr
 # (2026-09-04, ~/mxfp4_work/rocm-lat): dispatch 2.15 us, launch+sync 17.5 us, 2.1-2.3 us per
 # hipGraph node, identical with dev-kernarg, busy-poll signals, MWAITX off, direct dispatch off.
 # HIP_FORCE_DEV_KERNARG / HSA_ENABLE_INTERRUPT / ROC_ACTIVE_WAIT_TIMEOUT below are those knobs.
+# RADIANCE_HW_QUEUES (-> GPU_MAX_HW_QUEUES, default 1 here, HIP's own default is 4): with 4, vLLM's
+# async output-copy stream gets its own HW queue, and it almost always holds a barrier waiting on the
+# model stream. The firmware sometimes puts that queue on the same MEC pipe as the model queue (about
+# 1 start in 5 on tatooine, 2026-09-26; it is fixed for the process lifetime). The pipe then time-slices
+# the two queues: every kernel that runs > ~10 us is followed by a ~12 us switch, which makes decode
+# steps 43-44 ms instead of 35 (-19% tok/s); the copy kernels never overlap the model stream. With one
+# queue the copy runs in order after its step (one small blit), and there is no second queue to share
+# a pipe with: 0 slow in 22 starts vs 1 in 19 here (4 in 30 incl. earlier runs). Cost: +0.07 ms/step
+# (35.11 vs 35.04, 1k-token request), identical step time under localeval load at 128-4k context, and
+# ~100 MiB more free VRAM (3 KFD queues instead of 6). 0 = do not pass GPU_MAX_HW_QUEUES (HIP default).
+RADIANCE_HW_QUEUES=${RADIANCE_HW_QUEUES:-1}
+HWQ_ENV=(); if [ "$RADIANCE_HW_QUEUES" != 0 ]; then HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$RADIANCE_HW_QUEUES"); fi
 # MXFP4_CUMODE=1 (-mcumode GEMM build): decode neutral (+0.4%), prefill -6% at 32k -- keep 0.
 # ROCR_VISIBLE_DEVICES carries the ABSOLUTE card ids and filters the runtime's device list;
 # HIP_VISIBLE_DEVICES (which vLLM copies into CUDA_VISIBLE_DEVICES) then indexes INTO that
@@ -960,6 +976,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   ${HIP_FORCE_DEV_KERNARG:+-e HIP_FORCE_DEV_KERNARG="$HIP_FORCE_DEV_KERNARG"} \
   ${HSA_ENABLE_INTERRUPT:+-e HSA_ENABLE_INTERRUPT="$HSA_ENABLE_INTERRUPT"} \
   ${ROC_ACTIVE_WAIT_TIMEOUT:+-e ROC_ACTIVE_WAIT_TIMEOUT="$ROC_ACTIVE_WAIT_TIMEOUT"} \
+  ${HWQ_ENV[@]+"${HWQ_ENV[@]}"} \
   -e MXFP4_CUMODE="${MXFP4_CUMODE:-0}" \
   -e RADIANCE_STEP_TRACE="${RADIANCE_STEP_TRACE:-0}" \
   -e RADIANCE_AR_OVERLAP_MIN_M="${RADIANCE_AR_OVERLAP_MIN_M:-2048}" \

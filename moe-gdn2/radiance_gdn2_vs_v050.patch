@@ -1,0 +1,344 @@
+--- a/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
++++ b/radiance_gdn2.hip
+@@ -1,3 +1,31 @@
++// radiance_gdn2: an EXACT gated-delta-net chunk scan for gfx1201 (libr4d #4 fix, radiance-gdn2/).
++//
++// Derived from libr4d v0.5.0 r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip (md5 3c1f87fbc9598b06c0b452f1f6edf09f,
++// tag v0.5.0 = e8de4bc). The kernel is templated on EXACT: EXACT=false is the upstream code path (built
++// here only so a microbenchmark compares like with like; bit-identical to libr4d 0.5.0's r4d.so in every
++// test), EXACT=true is the fix. Same ABI as the
++// upstream entry point, so radiance_gdn.py can swap it in behind a knob.
++//
++// Upstream carries the in-chunk decay on the chunk midpoint c = (G_first+G_last)/2:
++//     e^{G_i-G_j} = e^{G_i-c} * e^{c-G_j}   and   e^{G_last-G_t} = e^{G_last-c} * e^{c-G_t}
++// Each factor spans +-(G_first-G_last)/2 and is clamped at e^80, so every chunk whose span exceeds 160
++// is computed wrong (libr4d #4). EXACT=true never splits a factor that is <= 1:
++//     sA[i][j] = scale * e^{G_i-G_j} * P[i][j]            (j <= i, 0 above the diagonal)
++//         diagonal 16x16 tiles: elementwise e^{min(G_i-G_j,0)};
++//         below-diagonal tiles: e^{G_i-c_J} * e^{c_J-G_j}, c_J = G at the end of 16-token block J,
++//         both factors <= 1 because G_i <= c_J <= G_j (one exp per tile + a per-token column factor)
++//     D        = A @ W                                    (undecayed; feeds O += sA @ D)
++//     V's[t]   = e^{G_last-G_t} * (A @ W)[t]              (state path, 0 for t past the chunk end)
++//     S        = e^{G_last} * S + V's^T @ K
++// Every exponent is <= 0 (G is a chunk-local inclusive cumsum of g <= 0, so it is non-increasing), so
++// nothing can overflow, and underflow to 0 is the correct value to fp32 precision. This is the form
++// FLA's chunk_gated_delta_rule and libr4d's own kkt_solve use.
++// V's needs a second [v][token] bf16 tile and LDS is ~59.5 of 64 KB, so it goes into s.S, which is dead
++// between barrier (2) (last read of the bf16 state) and the per-chunk state writeback; that writeback
++// moves from before barrier (4) to after it (the next chunk reads s.S only after barrier (1)). No tile
++// buffer and no barrier are added; the only new LDS is the 256 B per-token cf array.
++//
++// Upstream's header, for the stock path:
+ // r4d_gdn: the gated-delta-net chunked scan, gfx1201 WMMA. Entry point
+ // r4d_gdn_chunk_scan_k128_v128_c64_bf16 -- head_k 128, head_v 128, chunk 64, bf16 in.
+ // Named for the algorithm rather than the serving phase: the chunked scan is what prefill and
+@@ -22,8 +50,11 @@
+ //   S  = lam*(e^c*S + V'^T@K)
+ // A is FLA's solve_tril output (decay already folded in), so no decay enters W or V'.
+ #include <hip/hip_runtime.h>
+-#include "r4d.h"
+-#include "r4d_gdn_wmma.h"
++#include <pybind11/pybind11.h>
++#include <cstdint>
++#include <stdexcept>
++#include <string>
++#include "r4d_gdn_wmma.h"   // from R4D_SRC (libr4d v0.5.0), shared WMMA fragment helpers
+ // TRIL: skip GEMM tiles above the diagonal (A from solve_tril is unit lower
+ // triangular, and sA is masked). 2.4% slower, and left off; the reason is
+ // structural rather than tuning: the waves rendezvous at a workgroup barrier, so only
+@@ -109,12 +140,18 @@
+ struct Smem {
+   unsigned short k[BT][KP];     // A: K   /  B: K^T for P=Q@K^T
+   unsigned short A[BT][AP];     // B-source for sA (written as [i][j])
+-  unsigned short S[BV][KP];     // B: state, V-major (matches FLA's [V,K] layout)
++  unsigned short S[BV][KP];     // B: state, V-major (matches FLA's [V,K] layout).
++                                // EXACT: between barrier (2) and the writeback after (4) it
++                                // holds V's as [v][token] (pitch KP) for the state update.
+   unsigned short W[BV][WP];     // B: W (transposed)
+   unsigned short D[BV][AP];     // staged V as [token][v]; then V' as [v][token].
+                                 // Both live inside one chunk and never overlap: V dies
+                                 // in the W update, V' is written after barrier (2).
+   float ge[BT], gv[BT], rs[BT], bt[BT];
++                                // EXACT: gv[t] = e^{G_last-G_t} (0 past the chunk end),
++                                //        rs[t] = G_t * log2(e) (0 past the chunk end)
++  float cf[BT];                 // EXACT: cf[t] = e^{c_J-G_t}, c_J = G at the end of t's 16-token
++                                // block (<= 1; the column factor of the below-diagonal sA tiles)
+ };
+ 
+ // LDSO: hold each LDS row pointer as one opaque 32-bit byte offset (see fragO).
+@@ -189,6 +226,19 @@
+ // error from 3.30e-03 (FLA parity) to 9.02e-03 / 1.17e-02, and the state error from
+ // 2.4e-03 to 5.1e-03 -- W/sA/V' feed the recurrence, so even BFR=2 pollutes the state.
+ // Left at 1.
++// GDN2_ABL: timing-only ablations of the EXACT path (nonzero values give WRONG results):
++// 1 = sA without the elementwise exp, 2 = no V's stores to s.S, 3 = writeback before barrier (4)
++// as upstream (races with the V's reads), 4 = 1+2+3.
++// GDN2_VSP: row pitch (shorts) of V's inside the s.S region. AP (68) is the D buffer's pitch, whose
++// [row=lo][4*hi] fragment pattern is bank-conflict-free; KP (132) is s.S's own pitch.
++#ifndef GDN2_VSP
++#define GDN2_VSP AP
++#endif
++#define VSROW(r) (&s.S[0][0] + (size_t)(r) * GDN2_VSP)
++// 5 = state update reads V' from s.D instead of V's (wrong numbers; prices the s.S read)
++#ifndef GDN2_ABL
++#define GDN2_ABL 0
++#endif
+ #ifndef BFR
+ #define BFR 1
+ #endif
+@@ -248,7 +298,8 @@
+   ((unsigned)((const char*)&(buf)[0][0] - (const char*)&s) + \
+    (unsigned)((((base) + lo) * (pitch) + 4 * hi) * 2))
+ 
+-__global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
++template <bool EXACT>
++__global__ __launch_bounds__(NTHR) void gdn2_chunk_scan_kernel(
+     const unsigned short* __restrict__ q, const unsigned short* __restrict__ k,
+     const unsigned short* __restrict__ v, const unsigned short* __restrict__ Amat,
+     const float* __restrict__ gcs, const float* __restrict__ beta,
+@@ -486,8 +537,21 @@
+       // value is measured, not assumed: WikiText-2 PPL over 208,539 tokens, no other mitigation --
+       // 70 -> 8.3841, 80 -> 8.3706, 83 -> 8.3728, reference 8.3335, stock 653586. Where both
+       // halves fit (every ordinary chunk) nothing changes.
+-      s.gv[tid] = ok ? __expf(fminf(cref - ggr, 80.0f)) : 0.f;
+-      s.rs[tid] = ok ? scale * __expf(fminf(ggr - cref, 80.0f)) : 0.f;
++      if (EXACT) {
++        // No split: the state-path weight e^{G_last-G_t} <= 1 in one factor (fminf only guards a
++        // non-monotone G); G_t*log2(e) for the sA factors; and the block column factor
++        // e^{c_J-G_t} <= 1, c_J read from the block's last lane (16-token blocks never straddle a
++        // wave). Past the chunk end ggr = 0, so every factor stays finite; those rows and columns
++        // are dropped downstream (see the clamp note above).
++        const float lg = ggr * 1.4426950408889634f;
++        const float cjl = __shfl(lg, lane | 15, 32);
++        s.gv[tid] = ok ? __expf(fminf(gl - ggr, 0.0f)) : 0.f;
++        s.rs[tid] = lg;
++        s.cf[tid] = ok ? __builtin_amdgcn_exp2f(fminf(cjl - lg, 0.0f)) : 0.f;
++      } else {
++        s.gv[tid] = ok ? __expf(fminf(cref - ggr, 80.0f)) : 0.f;
++        s.rs[tid] = ok ? scale * __expf(fminf(ggr - cref, 80.0f)) : 0.f;
++      }
+     }
+     BAR();                                                   // (1)
+ #if PFIN && PFV == 4
+@@ -659,6 +723,8 @@
+       }
+     }
+     // sA = rs * tril(P): one multiply per element, no exp
++    // EXACT: sA = scale * e^{min(G_i-G_j,0)} * tril(P), elementwise -- the factor is <= 1 for every
++    // j <= i, and the fminf keeps the masked j > i and the rows past the chunk end (G = 0) finite.
+     {
+       const int ii = mt * 16 + lo;            // now constant per lane: one rs load
+       const float r = s.rs[ii];
+@@ -666,8 +732,46 @@
+       for (int i = 0; i < NTV; ++i) {
+         const int j0 = (ntb + i) * 16 + 8 * hi;
+         float a[8];
++        if (EXACT) {
++          // Tile class is wave-uniform (i-tile mt, j-tile ntb+i), so these are scalar branches.
++          const int Iu = __builtin_amdgcn_readfirstlane(mt);
++          const int Ju = __builtin_amdgcn_readfirstlane(ntb + i);
++          if (Ju > Iu) {
++            // above the diagonal: j > i for every element
+ #pragma unroll
+-        for (int e = 0; e < 8; ++e) a[e] = (j0 + e <= ii) ? p[i][e] * r : 0.f;
++            for (int e = 0; e < 8; ++e) a[e] = 0.f;
++          } else if (Ju < Iu) {
++            // below the diagonal: j < i for every element, and G_i <= c_J <= G_j (c_J = G at the
++            // end of block J), so e^{G_i-G_j} = e^{G_i-c_J} * e^{c_J-G_j} with BOTH factors <= 1:
++            // one exp per tile per lane, the column factor precomputed per token. Underflow of
++            // either factor means the product is below 1e-38.
++            const float srf = scale * __builtin_amdgcn_exp2f(fminf(r - s.rs[Ju * 16 + 15], 0.0f));
++            const float4 c0 = *(const float4*)&s.cf[j0];
++            const float4 c1 = *(const float4*)&s.cf[j0 + 4];
++            const float cj[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
++#pragma unroll
++            for (int e = 0; e < 8; ++e) a[e] = (p[i][e] * srf) * cj[e];
++          } else {
++            // diagonal tile: elementwise e^{min(G_i-G_j,0)}. The mask is a select between two
++            // constants applied as a multiply -- written as `cond ? p*f(gj) : 0` the compiler sinks
++            // the arithmetic (and the bf16 rounding add) into eight divergent branches.
++            const float4 g0 = *(const float4*)&s.rs[j0];
++            const float4 g1 = *(const float4*)&s.rs[j0 + 4];
++            const float gj[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
++#pragma unroll
++            for (int e = 0; e < 8; ++e) {
++              const float w = (j0 + e <= ii) ? scale : 0.f;
++#if GDN2_ABL == 1 || GDN2_ABL == 4
++              a[e] = p[i][e] * (w * (r - gj[e]));
++#else
++              a[e] = p[i][e] * (w * __builtin_amdgcn_exp2f(fminf(r - gj[e], 0.0f)));
++#endif
++            }
++          }
++        } else {
++#pragma unroll
++          for (int e = 0; e < 8; ++e) a[e] = (j0 + e <= ii) ? p[i][e] * r : 0.f;
++        }
+         if (doP[i]) {
+           *(uint2*)&s.A[ii][j0]     = F2BF4I(a[0], a[1], a[2], a[3]);
+           *(uint2*)&s.A[ii][j0 + 4] = F2BF4I(a[4], a[5], a[6], a[7]);
+@@ -725,13 +829,33 @@
+       float gvv[8];
+ #pragma unroll
+       for (int e = 0; e < 8; ++e) gvv[e] = s.gv[mt * 16 + 8 * hi + e];
++      if (EXACT) {
++        // D = A@W undecayed for O += sA@D; V's = e^{G_last-G_t} * (A@W) into s.S for the state
++        // update. s.S is free here: barrier (2) proves every wave finished its U/O reads of the
++        // bf16 state, and the next write of it is the writeback after barrier (4). Nobody reads
++        // s.S in the V' loop, so writing it before barrier (3) is safe.
+ #pragma unroll
+-      for (int i = 0; i < NTV; ++i) {
+-        unsigned short* dp = &s.D[(ntb + i) * 16 + lo][mt * 16 + 8 * hi];
+-        *(uint2*)dp       = F2BF4I(d[i][0]*gvv[0], d[i][1]*gvv[1],
+-                                   d[i][2]*gvv[2], d[i][3]*gvv[3]);
+-        *(uint2*)(dp + 4) = F2BF4I(d[i][4]*gvv[4], d[i][5]*gvv[5],
+-                                   d[i][6]*gvv[6], d[i][7]*gvv[7]);
++        for (int i = 0; i < NTV; ++i) {
++          unsigned short* dp = &s.D[(ntb + i) * 16 + lo][mt * 16 + 8 * hi];
++          *(uint2*)dp       = F2BF4I(d[i][0], d[i][1], d[i][2], d[i][3]);
++          *(uint2*)(dp + 4) = F2BF4I(d[i][4], d[i][5], d[i][6], d[i][7]);
++#if GDN2_ABL != 2 && GDN2_ABL != 4
++          unsigned short* sp = VSROW((ntb + i) * 16 + lo) + mt * 16 + 8 * hi;
++          *(uint2*)sp       = F2BF4I(d[i][0]*gvv[0], d[i][1]*gvv[1],
++                                     d[i][2]*gvv[2], d[i][3]*gvv[3]);
++          *(uint2*)(sp + 4) = F2BF4I(d[i][4]*gvv[4], d[i][5]*gvv[5],
++                                     d[i][6]*gvv[6], d[i][7]*gvv[7]);
++#endif
++        }
++      } else {
++#pragma unroll
++        for (int i = 0; i < NTV; ++i) {
++          unsigned short* dp = &s.D[(ntb + i) * 16 + lo][mt * 16 + 8 * hi];
++          *(uint2*)dp       = F2BF4I(d[i][0]*gvv[0], d[i][1]*gvv[1],
++                                     d[i][2]*gvv[2], d[i][3]*gvv[3]);
++          *(uint2*)(dp + 4) = F2BF4I(d[i][4]*gvv[4], d[i][5]*gvv[5],
++                                     d[i][6]*gvv[6], d[i][7]*gvv[7]);
++        }
+       }
+     }
+     BAR();                                                   // (3)
+@@ -787,8 +911,9 @@
+     }
+ 
+     // ---- S = lam * (e^c * S + V'^T @ K)   (B needs K as [dim][token] -> strided fragT)
++    // EXACT: S = e^{G_last} * S + V's^T @ K, with V's (already carrying e^{G_last-G_t}) in s.S
+     {
+-      const float ec = __expf(cref), lam = __expf(gl - cref);
++      const float ec = EXACT ? __expf(gl) : __expf(cref), lam = __expf(gl - cref);
+ #pragma unroll
+       for (int t = 0; t < NST; ++t)
+ #pragma unroll
+@@ -796,13 +921,17 @@
+ #if LDSO2
+       unsigned ovn[SVT];
+ #pragma unroll
+-      for (int j = 0; j < SVT; ++j) { ovn[j] = ROWO(s.D, AP, (vt0 + j) * 16);
++      for (int j = 0; j < SVT; ++j) { ovn[j] = (EXACT && GDN2_ABL != 5)
++                                                     ? ROWO(s.S, GDN2_VSP, (vt0 + j) * 16)
++                                                     : ROWO(s.D, AP, (vt0 + j) * 16);
+                                       LDSOPAQUE(ovn[j]); }                 // V': n = v
+ #define pvnf(j, ko) fragO(sbase, ovn[j] + (ko) * 2u)
+ #else
+       const unsigned short* pvn[SVT];
+ #pragma unroll
+-      for (int j = 0; j < SVT; ++j) pvn[j] = rowP(&s.D[0][0], AP, (vt0 + j) * 16, lane);
++      for (int j = 0; j < SVT; ++j)
++        pvn[j] = (EXACT && GDN2_ABL != 5) ? rowP(&s.S[0][0], GDN2_VSP, (vt0 + j) * 16, lane)
++                                          : rowP(&s.D[0][0], AP, (vt0 + j) * 16, lane);
+ #define pvnf(j, ko) fragP(pvn[j] + (ko))
+ #endif
+ #pragma unroll
+@@ -837,15 +966,26 @@
+         __builtin_amdgcn_sched_group_barrier(0x008, NST * SS, SIDS);
+       }
+ #endif
++      if (!EXACT) {
+ #pragma unroll
+-      for (int t = 0; t < NST; ++t)
++        for (int t = 0; t < NST; ++t)
+ #pragma unroll
+-        for (int e = 0; e < 8; ++e) St[t][e] *= lam;
++          for (int e = 0; e < 8; ++e) St[t][e] *= lam;
++      }
+     }
+     // no barrier: s.S aliases nothing, and barrier (2) already proves every wave
+     // finished its U/O reads of s.S this chunk
++    // EXACT: s.S holds V's until every wave has finished its state update, so the writeback
++    // waits for barrier (4); the next chunk reads s.S only after its barrier (1). After the last
++    // chunk there is no reader, and the final state leaves from registers below.
++#if GDN2_ABL == 3 || GDN2_ABL == 4
+     SWRITE();
+     BAR();                                                   // (4)
++#else
++    if (!EXACT) { SWRITE(); }
++    BAR();                                                   // (4)
++    if (EXACT && ci + 1 < nchunk) { SWRITE(); }
++#endif
+   }
+ 
+   float* p = ht + ((size_t)(nq * H + hv) * VD) * KD;
+@@ -856,24 +996,53 @@
+   }
+ }
+ 
+-extern "C" int r4d_gdn_chunk_scan_k128_v128_c64_bf16(
+-    const void* q, const void* k, const void* v, const void* A, const void* g,
+-    const void* beta, const void* h0, void* o, void* ht, const void* cu,
+-    int N, int H, int Hg, int K, int V, int bt, float scale, void* stream)
++// Launch: the upstream entry point's body, templated. Returns -1 for a geometry this build does not
++// cover, else the hip error code, exactly like r4d_gdn_chunk_scan_k128_v128_c64_bf16.
++template <bool EXACT>
++static int gdn2_launch(const void* q, const void* k, const void* v, const void* A, const void* g,
++                       const void* beta, const void* h0, void* o, void* ht, const void* cu,
++                       int N, int H, int Hg, int K, int V, int bt, float scale, void* stream)
+ {
+   if (K != KD || V != VD || bt != BT) return -1;
+   dim3 grid(V / BV, H, N), blk(NTHR);
+-  r4d_gdn_chunk_scan_kernel<<<grid, blk, 0, (hipStream_t)stream>>>(
++  gdn2_chunk_scan_kernel<EXACT><<<grid, blk, 0, (hipStream_t)stream>>>(
+       (const unsigned short*)q, (const unsigned short*)k, (const unsigned short*)v,
+       (const unsigned short*)A, (const float*)g, (const float*)beta, (const float*)h0,
+       (unsigned short*)o, (float*)ht, (const int*)cu, H, Hg, scale);
+   return (int)hipGetLastError();
+ }
+ 
+-// The geometry baked into the kernel above, so a caller can test a model's GDN shape against it
+-// instead of hardcoding a copy of these three numbers.
+-extern "C" void r4d_gdn_dims(int* head_k, int* head_v, int* chunk) {
+-  if (head_k) *head_k = KD;
+-  if (head_v) *head_v = VD;
+-  if (chunk)  *chunk  = BT;
++// pybind surface: the same 18 arguments, types and errors as r4d.gdn_chunk_scan_k128_v128_c64_bf16
++// (r4d_module.hip), so radiance_gdn.py's _CHUNK_SCAN call works unchanged with either module.
++template <bool EXACT>
++static void gdn2_chunk_scan(int64_t q, int64_t k, int64_t v, int64_t A, int64_t g, int64_t beta,
++                            int64_t h0, int64_t o, int64_t ht, int64_t cu, int num_seqs,
++                            int num_v_heads, int num_k_heads, int head_k, int head_v, int chunk,
++                            double scale, int64_t stream) {
++  const char* name = EXACT ? "radiance_gdn2 gdn_chunk_scan_k128_v128_c64_bf16"
++                           : "radiance_gdn2 gdn_chunk_scan_stock_k128_v128_c64_bf16";
++  int rc = gdn2_launch<EXACT>(
++      (const void*)q, (const void*)k, (const void*)v, (const void*)A, (const void*)g,
++      (const void*)beta, (const void*)h0, (void*)o, (void*)ht, (const void*)cu, num_seqs,
++      num_v_heads, num_k_heads, head_k, head_v, chunk, (float)scale, (void*)stream);
++  if (rc == -1)
++    throw std::runtime_error(std::string(name) + ": this build is compiled for "
++                             "head_k/head_v/chunk 128/128/64");
++  if (rc != 0)
++    throw std::runtime_error(std::string(name) + ": hip launch error (code " +
++                             std::to_string(rc) + ")");
+ }
++
++PYBIND11_MODULE(radiance_gdn2, m) {
++  m.doc() = "Exact GDN chunk scan (libr4d #4 fix): libr4d v0.5.0's r4d_gdn_chunk_scan_k128_v128_c64_bf16 "
++            "without the midpoint decay split. Same ABI as r4d.gdn_chunk_scan_k128_v128_c64_bf16.";
++  m.def("gdn_chunk_scan_k128_v128_c64_bf16", &gdn2_chunk_scan<true>,
++        "exact chunk scan (the fix); r4d ABI");
++  m.def("gdn_chunk_scan_stock_k128_v128_c64_bf16", &gdn2_chunk_scan<false>,
++        "libr4d v0.5.0's scan, unchanged, from the same source and flags (for A/B only)");
++  m.attr("UPSTREAM") = "libr4d v0.5.0 r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip "
++                       "md5 3c1f87fbc9598b06c0b452f1f6edf09f";
++  m.attr("GDN_HEAD_K") = KD;
++  m.attr("GDN_HEAD_V") = VD;
++  m.attr("GDN_CHUNK") = BT;
++}
