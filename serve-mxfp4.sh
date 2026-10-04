@@ -888,7 +888,8 @@ echo "[run] chat-template=$CHAT_TEMPLATE"
 echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME stop $NAME"
 
 # docker has no --replace, so a container left behind by a previous run has to go first.
-if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
+# Not under DRY_RUN: with the default NAME that would remove the running server's container.
+if [ "$RUNTIME" != podman ] && [ -z "${DRY_RUN:-}" ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
 
 # DRY_RUN=1 prints the command instead of running it -- for checking what a set of environment
 # overrides actually produces, and for lifting the invocation into a unit file.
