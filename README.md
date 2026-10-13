@@ -365,6 +365,59 @@ The result is written to `~/.cache/radiance-mxfp4/kv-profiles.local.tsv`, which 
 shipped table and wins over it. Re-run after changing `MAXSEQS` or `CHUNK`: a pin is only valid at
 the shape it was measured at.
 
+### MXFP4 MoE models
+
+`serve-moe-mxfp4.sh` serves a Qwen3.5/3.6-35B-A3B-class MXFP4 MoE checkpoint on one card, with the
+gfx1201 MoE fixes on by default. Its experts move from vLLM's EMULATION backend to AITER's Triton a16w4
+lane, and speculative-decode verify attention uses the split-KV kernel. On `amd/Qwen3.5-35B-A3B-MXFP4`
+that takes single-stream decode from 17 to 81 tok/s (prose), and to 107 tok/s on code.
+Prefill attention runs on libr4d's prefill kernel, built at GQA 8 at container start
+(`MOE_PREFILL_ATTN=r4d`, the default; the launcher clones libr4d v0.5.0 once). TTFT goes from 11.1 s to
+1.8 s at 16k and from 42.5 s to 4.3 s at 32k.
+Three more defaults, each with a switch (`SPEC`/`MAXSEQS`/`GPU_UTIL`, `RADIANCE_GDN_SCAN_FIX`,
+`RADIANCE_MOE_W4A8`):
+- MTP-4 with 16 sequences at `GPU_UTIL=0.97`. In align mode each request pins `2 + SPEC` GDN state blocks, so
+  MTP-8 fit only 7 short requests; MTP-4 fits 15. 8 streams went from 302 to 456 tok/s aggregate.
+- An exact GDN chunk scan (libr4d issue #4: v0.5.0's scan is wrong where the in-chunk decay span exceeds 160,
+  about 7% of heads on real prompts). It is built at container start from a patch against the libr4d
+  checkout, so no libr4d source is stored here, and prefill speed is unchanged.
+- fp8-WMMA W4A8 expert GEMMs for prefill-sized calls (1,025 tokens and up): +25-28% prefill, decode unchanged.
+
+Three decode-side defaults cut the bytes each step reads, each with a switch (`RADIANCE_MOE_DRAFT_HEAD`,
+`RADIANCE_MOE_DENSE_FP8`, `RADIANCE_MOE_GATE_FIX`): an int2 copy of `lm_head` for the MTP draft passes only (the verify
+head stays bf16, outputs unchanged), fp8 copies of the bf16 dense layers (+1.06 GiB of KV), and a fused shared-expert
+gate. On a fixed 20-prompt set, single-stream decode went from 117 to 139 tok/s with the draft head and from 136 to
+154 tok/s with the other two on top (separate sessions).
+
+Together the launcher prefills 14.9k / 12.6k / 10.6k tok/s at 4k / 16k / 34k and decodes 141 tok/s single-stream
+(490 / 632 aggregate at 8 / 12 streams, 1k prompts). In both tests the first start on an empty compile cache came up
+with less KV (5.62 against 6.55 GiB in the latest); a restart gets the full pool.
+Sections 11-13 of MOE-GFX1201.md add three more decode-side changes, each with a switch (11 and 12 on by default, 13 opt-in) (`RADIANCE_MOE_PAD_ROUTE`,
+`RADIANCE_MOE_DRAFT_GRAPH` / `RADIANCE_MOE_DRAFT_OVERLAP`, `RADIANCE_MOE_ASYNC` / `RADIANCE_MOE_DRAFT_WARM`): fixed-prompt
+tok/s +5.9%, +3.6% and +12.1%, each on top of the last, measured in production and not through this launcher. Async turns the
+image's dynamic draft off.
+Section 14 adds one more opt-in switch, an adaptive prefill chunk budget (`RADIANCE_ADAPTIVE_CHUNK=4320`, validated together with
+`RADIANCE_MOE_ASYNC=1`): a long prompt alone on the server prefills in 4,320-token steps instead of 2,160, about +5% prefill at
+16k and 34k tokens, and every other step keeps today's chunks; measured in production and not through this launcher.
+Design, measurements and caveats are in [MOE-GFX1201.md](MOE-GFX1201.md).
+
+```bash
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 ./serve-moe-mxfp4.sh
+SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-mxfp4.sh   # the old defaults
+```
+
+### Slow starts: one HIP hardware queue
+
+With HIP's default of 4 hardware queues, vLLM's async output-copy stream gets a queue of its own.
+On some starts the firmware puts that queue on the same pipe as the model's queue, and for the life of
+the process every decode step runs at 43-44 ms instead of 35 (about 20% fewer tok/s on the 27B at
+TP=1). `serve-mxfp4.sh` now passes `GPU_MAX_HW_QUEUES=1` (`RADIANCE_HW_QUEUES`, default 1), which keeps
+the copy on the model's queue: 0 slow starts in 22, against 1 in 19 stock. After a llama.cpp HIP run,
+6 stock starts in a row came up slow on the same R9700. It costs nothing measurable: same KV pool,
++0.07 ms/step, ~100 MiB more free VRAM. `RADIANCE_HW_QUEUES=0` restores HIP's default.
+`serve-moe-mxfp4.sh` passes it too. It is tested at TP=1 only; re-check at TP>1, where RCCL adds
+streams of its own.
+
 ### Serving something other than MXFP4
 
 `docker-compose.yml` serves **Qwen3.8-27B-FP8** and is the path for the FP8 and Gemma checkpoints.
@@ -1037,3 +1090,4 @@ specific to this fork rather than general to gfx1201, so the image build compile
 | [PERFORMANCE.md](PERFORMANCE.md) | The change-by-change optimization ledger, the 0.5.8 -> 0.7.4 provenance A/B, and the gated-delta-net NaN write-up |
 | [MXFP4-NOTES.md](MXFP4-NOTES.md) | Design notes, measurements and traps behind `serve-mxfp4.sh` |
 | [TP3_PADDING_PLAN.md](TP3_PADDING_PLAN.md) | The TP=3 dummy-head padding design and its validation gates |
+| [MOE-GFX1201.md](MOE-GFX1201.md) | MXFP4 MoE experts on gfx1201, split-KV verify attention, prefill attention, MTP depth, the exact GDN scan, W4A8 prefill experts, int2 draft head, fp8 dense layers, fused gate, padded-row routing, drafter-loop graphs, async scheduling, adaptive prefill chunk: design and measurements |
