@@ -105,9 +105,9 @@ Everything is an environment variable; these are the ones worth knowing.
   EXTRA="--enforce-eager"   extra `vllm serve` flags (same as passing them as arguments)
   HIP_FORCE_DEV_KERNARG=1   ROCm runtime knobs passed through when set: kernargs in VRAM,
   HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
-  RADIANCE_HW_QUEUES=1      HIP compute queues per priority (GPU_MAX_HW_QUEUES). 1 keeps the async
-                            D2H copy stream on the model's queue; 0 = HIP default (4, may run
-                            ~23% slower for the process lifetime on ~1 in 5 starts, see below)
+  RADIANCE_HW_QUEUES=1      HIP compute queues per priority (GPU_MAX_HW_QUEUES); default 1.
+                            0 = omit the container override (check the image ENV before
+                            treating this as HIP's default; see README "Slow starts")
   MXFP4_CUMODE=1            compile the MXFP4 GEMM .hip with -mcumode (A/B; output-identical)
   VLLM_NO_USAGE_STATS=1     vLLM usage telemetry (default off here); 0 re-enables it
   DRY_RUN=1                 print the container command instead of running it
@@ -900,16 +900,14 @@ if [ "$RUNTIME" != podman ] && [ -z "${DRY_RUN:-}" ]; then "$RUNTIME" rm -f "$NA
 # (2026-09-04, ~/mxfp4_work/rocm-lat): dispatch 2.15 us, launch+sync 17.5 us, 2.1-2.3 us per
 # hipGraph node, identical with dev-kernarg, busy-poll signals, MWAITX off, direct dispatch off.
 # HIP_FORCE_DEV_KERNARG / HSA_ENABLE_INTERRUPT / ROC_ACTIVE_WAIT_TIMEOUT below are those knobs.
-# RADIANCE_HW_QUEUES (-> GPU_MAX_HW_QUEUES, default 1 here, HIP's own default is 4): with 4, vLLM's
-# async output-copy stream gets its own HW queue, and it almost always holds a barrier waiting on the
-# model stream. The firmware sometimes puts that queue on the same MEC pipe as the model queue (about
-# 1 start in 5 on tatooine, 2026-09-26; it is fixed for the process lifetime). The pipe then time-slices
-# the two queues: every kernel that runs > ~10 us is followed by a ~12 us switch, which makes decode
-# steps 43-44 ms instead of 35 (-19% tok/s); the copy kernels never overlap the model stream. With one
-# queue the copy runs in order after its step (one small blit), and there is no second queue to share
-# a pipe with: 0 slow in 22 starts vs 1 in 19 here (4 in 30 incl. earlier runs). Cost: +0.07 ms/step
-# (35.11 vs 35.04, 1k-token request), identical step time under localeval load at 128-4k context, and
-# ~100 MiB more free VRAM (3 KFD queues instead of 6). 0 = do not pass GPU_MAX_HW_QUEUES (HIP default).
+# RADIANCE_HW_QUEUES (-> GPU_MAX_HW_QUEUES, default 1 here): the measured TP=1 slow
+# traces show gaps after small kernels, without overlap from the async copy stream. Sharing
+# a firmware pipe with a waiting queue is an interpretation, not a measured firmware mapping.
+# Original TP=1 results: 0 slow in 22 starts with one queue vs 1 in 19 stock (4 in 30 incl.
+# earlier runs); +0.07 ms/step (35.11 vs 35.04), same KV pool, ~100 MiB more free VRAM.
+# Same-process eviction/remapping transitions have also been reported; queue limiting was not
+# tested against that trigger. Re-check TP/PP communication costs. See README "Slow starts".
+# 0 = omit the container override; an image-baked GPU_MAX_HW_QUEUES still applies.
 RADIANCE_HW_QUEUES=${RADIANCE_HW_QUEUES:-1}
 HWQ_ENV=(); if [ "$RADIANCE_HW_QUEUES" != 0 ]; then HWQ_ENV=(-e GPU_MAX_HW_QUEUES="$RADIANCE_HW_QUEUES"); fi
 # MXFP4_CUMODE=1 (-mcumode GEMM build): decode neutral (+0.4%), prefill -6% at 32k -- keep 0.

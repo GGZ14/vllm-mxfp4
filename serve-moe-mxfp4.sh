@@ -92,7 +92,7 @@
 #                     does nothing without RADIANCE_MOE_ASYNC=1; it is passed on only when RADIANCE_ADAPTIVE_CHUNK is on.
 #   R4D_SRC=~/.radiance-libr4d-<R4D_VERSION>  libr4d checkout for r4d and the GDN scan fix; cloned from
 #                     R4D_REPO at R4D_VERSION (v0.5.0, the tag the image's r4d.so is built from) when missing
-#   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = HIP default
+#   RADIANCE_HW_QUEUES=1  GPU_MAX_HW_QUEUES for the container (see serve-mxfp4.sh); 0 = omit override (check image ENV)
 #   SPEC=4            MTP draft tokens; 0 disables speculation. In align mode each request pins 2 + SPEC GDN
 #                     state blocks, so SPEC sets how many requests fit: SPEC=4 fits 15 short ones at
 #                     MAXSEQS=16 and GPU_UTIL=0.97, SPEC=8 fits 7. Sections 1-3 of MOE-GFX1201.md were

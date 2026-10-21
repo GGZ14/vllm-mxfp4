@@ -408,15 +408,40 @@ SNAP=~/models/Qwen3.5-35B-A3B-MXFP4 SPEC=8 MAXSEQS=8 GPU_UTIL=0.95 ./serve-moe-m
 
 ### Slow starts: one HIP hardware queue
 
-With HIP's default of 4 hardware queues, vLLM's async output-copy stream gets a queue of its own.
-On some starts the firmware puts that queue on the same pipe as the model's queue, and for the life of
-the process every decode step runs at 43-44 ms instead of 35 (about 20% fewer tok/s on the 27B at
-TP=1). `serve-mxfp4.sh` now passes `GPU_MAX_HW_QUEUES=1` (`RADIANCE_HW_QUEUES`, default 1), which keeps
-the copy on the model's queue: 0 slow starts in 22, against 1 in 19 stock. After a llama.cpp HIP run,
-6 stock starts in a row came up slow on the same R9700. It costs nothing measurable: same KV pool,
-+0.07 ms/step, ~100 MiB more free VRAM. `RADIANCE_HW_QUEUES=0` restores HIP's default.
-`serve-moe-mxfp4.sh` passes it too. It is tested at TP=1 only; re-check at TP>1, where RCCL adds
-streams of its own.
+On the measured R9700 / 27B / TP=1 setup, some starts ran every decode step at 43-44 ms
+instead of 35 (about 20% fewer tok/s). The slow traces showed 12-16 us gaps after small kernels,
+while the output-copy kernels did not overlap the model stream. Sharing a firmware pipe with a
+waiting side queue is an interpretation of those traces, not a directly measured firmware mapping
+or an established root cause.
+
+`serve-mxfp4.sh` passes `GPU_MAX_HW_QUEUES=1` (`RADIANCE_HW_QUEUES`, default 1). In the original
+TP=1 measurements this gave 0 slow starts in 22, against 1 in 19 stock. After a llama.cpp HIP run,
+6 stock starts in a row came up slow on the same R9700. The measured cost was +0.07 ms/step,
+with the same KV pool and about 100 MiB more free VRAM. These are results for that configuration,
+not a guarantee for every model, driver or parallel layout. `serve-moe-mxfp4.sh` passes the same knob.
+
+The state need not stay fixed for a process's lifetime. A [same-PID historical trace](https://github.com/ROCm/TheRock/issues/9228#issuecomment-6304004462)
+recorded host compaction, rising KFD eviction counters and changed compute-queue placement together
+with a decode drop from 18.44 to 4.33 steps/s. That trace did **not** test whether queue limiting
+prevents the transition, and it does not establish why the placement changes dispatch latency.
+The reported recovery is a diagnostic observation, not a production recovery procedure.
+
+For a controlled comparison:
+
+- `RADIANCE_HW_QUEUES=0` makes these two launchers omit the container environment override.
+  Check the **effective container environment** before calling that arm the HIP default: a custom
+  image can still bake in `GPU_MAX_HW_QUEUES`. This already [contaminated a published comparison](https://github.com/ROCm/TheRock/issues/9297#issuecomment-6212970350).
+  The launcher's `hw_queues=0` log reports the requested setting, not the image's inherited value.
+- Keep the image digest, model, TP/PP layout, request concurrency, prompt and generated-token counts,
+  and graph mode matched. Record kernel/driver, MES firmware and HIP versions, the engine PID,
+  effective queue-limit setting and active KFD queues. Measure per-step timing as well as end-to-end
+  throughput; a faster forward alone need not make the full request faster.
+- Re-check at TP>1 or PP>1, where communication uses additional streams. In a [PP=3 comparison](https://github.com/vllm-project/vllm/issues/58639),
+  queue limiting matched the main-stream option's R9700 forward time but gave lower end-to-end
+  decode throughput than that option. The
+  [framework-free pending-wait reproducer](https://github.com/ROCm/TheRock/issues/9297) separates
+  tiny-kernel dispatch from large-kernel timing; it is evidence about that workload, not a whole-model
+  correctness or performance test.
 
 ### Serving something other than MXFP4
 
